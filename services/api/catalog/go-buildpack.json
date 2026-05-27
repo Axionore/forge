@@ -1,0 +1,50 @@
+{
+  "id": "go-buildpack",
+  "name": "Go (Buildpack)",
+  "description": "Go applications built with Paketo Go Buildpack. Automatic dependency vendoring, small images. Ideal for CLI tools and microservices.",
+  "category": "language",
+  "icon": "code",
+  "docs_url": "https://paketo.io/docs/buildpacks/language-family-buildpacks/go/",
+  "variables": [
+    {
+      "name": "BP_GO_VERSION",
+      "label": "Go Version",
+      "type": "string",
+      "default": "1.21",
+      "secret": false,
+      "required": false
+    }
+  ],
+  "default_strategy": {
+    "type": "rolling",
+    "max_unavailable": 0,
+    "max_surge": 1,
+    "health_check_grace_period_secs": 20,
+    "rollback_on_failure": true,
+    "failure_threshold": 2
+  },
+  "spec": {
+    "build": {
+      "type": "buildpack",
+      "builder": "paketobuildpacks/builder-jammy-full",
+      "env": {
+        "BP_GO_VERSION": "$BP_GO_VERSION"
+      }
+    },
+    "containers": [
+      {
+        "name": "app",
+        "image": "go-buildpack-app:latest",
+        "ports": ["8080:8080"],
+        "restart_policy": "unless-stopped",
+        "healthcheck": {
+          "test": ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"],
+          "interval": "10s",
+          "timeout": "3s",
+          "retries": 3
+        }
+      }
+    ],
+    "networks": ["forge-default"]
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "id": "valkey",
+  "name": "Valkey 8 (Redis-compatible)",
+  "description": "Modern, community-driven Redis fork with full compatibility, persistence, and excellent performance. Drop-in replacement with auto password and appendonly by default.",
+  "category": "cache",
+  "icon": "cache",
+  "docs_url": "https://valkey.io/",
+  "variables": [
+    {
+      "name": "VALKEY_PASSWORD",
+      "label": "Valkey Password",
+      "type": "password",
+      "default": "",
+      "secret": true,
+      "generate": true,
+      "required": true
+    }
+  ],
+  "default_strategy": {
+    "type": "rolling",
+    "max_unavailable": 0,
+    "max_surge": 1,
+    "health_check_grace_period_secs": 20,
+    "rollback_on_failure": true,
+    "failure_threshold": 2
+  },
+  "spec": {
+    "containers": [
+      {
+        "name": "valkey",
+        "image": "valkey/valkey:8-alpine",
+        "env": [
+          ["VALKEY_PASSWORD", "$VALKEY_PASSWORD"]
+        ],
+        "cmd": ["valkey-server", "--requirepass", "$VALKEY_PASSWORD", "--appendonly", "yes", "--save", "60", "1"],
+        "ports": ["6379:6379"],
+        "volumes": ["/data:/data"],
+        "restart_policy": "unless-stopped",
+        "healthcheck": {
+          "test": ["CMD", "valkey-cli", "-a", "$VALKEY_PASSWORD", "ping"],
+          "interval": "10s",
+          "timeout": "3s",
+          "retries": 5
+        },
+        "resources": {
+          "memory_limit": 536870912,
+          "cpu_shares": 512
+        }
+      }
+    ],
+    "volumes": [
+      { "name": "valkey-data", "driver": "local" }
+    ],
+    "networks": ["forge-default"]
+  }
+}

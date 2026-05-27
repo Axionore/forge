@@ -1,0 +1,71 @@
+{
+  "id": "caddy",
+  "name": "Caddy 2 Reverse Proxy",
+  "description": "Modern, production-grade reverse proxy and static file server with automatic HTTPS via Let's Encrypt. Zero-config TLS, HTTP/3, and excellent defaults. Ideal as the public edge for any app or catalog service.",
+  "category": "gateway",
+  "icon": "gateway",
+  "docs_url": "https://caddyserver.com/docs/",
+  "variables": [
+    {
+      "name": "ACME_EMAIL",
+      "label": "ACME Contact Email (for Let's Encrypt)",
+      "type": "string",
+      "default": "",
+      "secret": false,
+      "required": false
+    },
+    {
+      "name": "UPSTREAM",
+      "label": "Default Upstream (host:port)",
+      "type": "string",
+      "default": "app:8080",
+      "secret": false,
+      "required": true
+    }
+  ],
+  "default_strategy": {
+    "type": "rolling",
+    "max_unavailable": 0,
+    "max_surge": 1,
+    "health_check_grace_period_secs": 15,
+    "rollback_on_failure": true,
+    "failure_threshold": 2
+  },
+  "spec": {
+    "containers": [
+      {
+        "name": "caddy",
+        "image": "caddy:2-alpine",
+        "env": [
+          ["ACME_EMAIL", "$ACME_EMAIL"],
+          ["UPSTREAM", "$UPSTREAM"]
+        ],
+        "ports": ["80:80", "443:443", "443:443/udp"],
+        "volumes": [
+          "caddy-data:/data",
+          "caddy-config:/config"
+        ],
+        "restart_policy": "unless-stopped",
+        "healthcheck": {
+          "test": ["CMD", "wget", "-q", "--spider", "http://localhost:80/healthz"],
+          "interval": "10s",
+          "timeout": "3s",
+          "retries": 3,
+          "start_period": "5s"
+        },
+        "resources": {
+          "memory_limit": 268435456,
+          "cpu_shares": 512
+        },
+        "labels": {
+          "forge.l7.enforce": "envoy_xds"
+        }
+      }
+    ],
+    "volumes": [
+      { "name": "caddy-data", "driver": "local" },
+      { "name": "caddy-config", "driver": "local" }
+    ],
+    "networks": ["forge-default"]
+  }
+}

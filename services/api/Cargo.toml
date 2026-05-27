@@ -1,0 +1,62 @@
+[package]
+name = "forge-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "forge-api"
+path = "src/main.rs"
+
+[dependencies]
+forge-core = { path = "../../crates/core" }
+forge-agent = { path = "../../crates/agent" }   # For SignedJob, Job, etc. during Slice 2 (will move to forge-core)
+
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate"] }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+
+ed25519-dalek.workspace = true
+ring.workspace = true
+age = { workspace = true }
+ssh-key = { workspace = true }
+rand = "0.8"
+hex = "0.4"
+
+# Prometheus exposition format (lightweight, no heavy client)
+prometheus = { version = "0.13", features = ["process"] }
+
+# For enrollment token hashing, etc.
+sha2 = "0.10"
+base64 = "0.22"
+
+# gRPC + xDS ADS server (true dynamic L7 for canary)
+tonic.workspace = true
+prost.workspace = true
+envoy-types.workspace = true
+tokio-stream = "0.1"
+
+# For generating self-signed CA + server certs for mTLS on the xDS ADS port (no external PKI required)
+rcgen = { version = "0.13", features = ["pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-acme.workspace = true
+tokio-rustls.workspace = true
+hyper-util.workspace = true
+rustls-pemfile.workspace = true
+
+[dev-dependencies]
+tokio-test = "0.4"

@@ -1,0 +1,62 @@
+[package]
+name = "forge-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "forge-agent"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["signal", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+# Cryptography for job verification + secret envelope decryption (age)
+ed25519-dalek = { workspace = true, features = ["rand_core", "pkcs8"] }
+age = { workspace = true }
+
+# Configuration
+figment = { version = "0.10", features = ["env", "toml"] }
+
+# Async traits
+async-trait = "0.1"
+
+# Only needed for placeholder key generation during early development
+rand = "0.8"
+
+# Used for SystemUpdate (self-update) binary download + SHA256 verification
+reqwest = { workspace = true, features = ["stream"] }
+sha2 = "0.10"
+tokio-util = { version = "0.7", features = ["io"] }
+
+# Docker support
+bollard = { workspace = true, optional = true }
+futures-util = "0.3"
+
+# Real control plane communication
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-native-roots"] }
+
+# For richer heartbeats
+hostname = "0.3"
+
+# For secure identity persistence (enrollment)
+toml = "0.8"
+
+# WireGuard mesh (optional, for secure agent overlay networking)
+defguard_wireguard_rs = { version = "0.4", optional = true }
+
+# Future: WireGuard, metrics, etc.
+# defguard_wireguard_rs = { workspace = true, optional = true }
+
+[features]
+default = []
+docker = ["dep:bollard"]
+wireguard = ["dep:defguard_wireguard_rs"]

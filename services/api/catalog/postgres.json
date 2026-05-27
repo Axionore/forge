@@ -1,0 +1,77 @@
+{
+  "id": "postgres",
+  "name": "PostgreSQL 16",
+  "description": "Production-grade PostgreSQL with healthchecks, persistent data volume, and secure defaults. Includes automatic strong password generation.",
+  "category": "database",
+  "icon": "database",
+  "docs_url": "https://www.postgresql.org/docs/16/",
+  "variables": [
+    {
+      "name": "POSTGRES_DB",
+      "label": "Database Name",
+      "type": "string",
+      "default": "app",
+      "secret": false,
+      "required": true
+    },
+    {
+      "name": "POSTGRES_USER",
+      "label": "Database User",
+      "type": "string",
+      "default": "app",
+      "secret": false,
+      "required": true
+    },
+    {
+      "name": "POSTGRES_PASSWORD",
+      "label": "Database Password",
+      "type": "password",
+      "default": "",
+      "secret": true,
+      "generate": true,
+      "required": true
+    }
+  ],
+  "default_strategy": {
+    "type": "rolling",
+    "max_unavailable": 0,
+    "max_surge": 1,
+    "health_check_grace_period_secs": 30,
+    "rollback_on_failure": true,
+    "failure_threshold": 3
+  },
+  "spec": {
+    "containers": [
+      {
+        "name": "postgres",
+        "image": "postgres:16-alpine",
+        "env": [
+          ["POSTGRES_DB", "$POSTGRES_DB"],
+          ["POSTGRES_USER", "$POSTGRES_USER"],
+          ["POSTGRES_PASSWORD", "$POSTGRES_PASSWORD"]
+        ],
+        "ports": ["5432:5432"],
+        "volumes": ["/var/lib/postgresql/data:/var/lib/postgresql/data"],
+        "restart_policy": "unless-stopped",
+        "healthcheck": {
+          "test": ["CMD-SHELL", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"],
+          "interval": "10s",
+          "timeout": "5s",
+          "retries": 5,
+          "start_period": "10s"
+        },
+        "resources": {
+          "memory_limit": 1073741824,
+          "cpu_shares": 1024
+        }
+      }
+    ],
+    "volumes": [
+      {
+        "name": "postgres-data",
+        "driver": "local"
+      }
+    ],
+    "networks": ["forge-default"]
+  }
+}

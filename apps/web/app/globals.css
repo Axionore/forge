@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+/* Forge Design Tokens - CSS-first Tailwind v4 */
+@theme {
+  --font-sans: "Inter Variable", system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+
+  /* Base colors - will be refined */
+  --color-background: oklch(0.98 0.005 260);
+  --color-foreground: oklch(0.15 0.02 260);
+
+  --color-primary: oklch(0.55 0.22 260);
+  --color-primary-foreground: oklch(0.98 0.005 260);
+
+  --color-muted: oklch(0.96 0.005 260);
+  --color-muted-foreground: oklch(0.45 0.02 260);
+
+  --color-destructive: oklch(0.55 0.22 25);
+  --color-destructive-foreground: oklch(0.98 0.005 260);
+
+  --color-border: oklch(0.90 0.005 260);
+  --color-input: oklch(0.92 0.005 260);
+  --color-ring: oklch(0.55 0.22 260);
+
+  /* Admin / operator surfaces */
+  --color-card: oklch(1 0 0);
+  --color-card-border: oklch(0.90 0.005 260);
+  --color-success: oklch(0.55 0.18 145);
+  --color-success-foreground: oklch(0.98 0.005 260);
+  --color-warning: oklch(0.75 0.18 85);
+  --color-warning-foreground: oklch(0.15 0.02 260);
+
+  /* Radix UI + shadcn-style primitives (Tailwind 4 CSS-first) */
+  --color-popover: oklch(1 0 0);
+  --color-popover-foreground: oklch(0.15 0.02 260);
+  --color-accent: oklch(0.96 0.005 260);
+  --color-accent-foreground: oklch(0.15 0.02 260);
+  --color-secondary: oklch(0.96 0.005 260);
+  --color-secondary-foreground: oklch(0.15 0.02 260);
+}

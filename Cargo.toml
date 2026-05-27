@@ -1,0 +1,90 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agent",
+    "crates/core",
+    "services/api",
+    # Future members (will be added as we build):
+    # "crates/providers/hetzner",
+    # "crates/providers/digitalocean",
+    # "crates/providers/ssh",
+    # "services/worker",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+authors = ["Forge Contributors"]
+repository = "https://github.com/forge-deploy/forge"
+
+[workspace.dependencies]
+# Async runtime & web
+tokio = { version = "1.45", features = ["full"] }
+axum = { version = "0.8", features = ["macros", "ws"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate"] }
+
+# Serialization & config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.28"
+
+# Utilities
+uuid = { version = "1.16", features = ["v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+bytes = "1.10"
+
+# Docker (for agent)
+bollard = { version = "0.18", features = ["rustls"] }
+
+# Hetzner
+hcloud = "0.25"
+
+# WireGuard
+defguard_wireguard_rs = "0.4"
+
+# Security
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+ring = "0.17"
+# age for self-hosted secret envelopes (X25519 + ChaCha20-Poly1305, no external KMS required for baseline).
+age = { version = "0.10", default-features = false, features = ["armor"] }
+# ssh-key for proper OpenSSH format key generation/storage (ed25519 recommended).
+ssh-key = { version = "0.6", features = ["ed25519", "alloc"] }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# gRPC + xDS (ADS) for true dynamic Envoy control plane (no sidecar restarts on canary steps)
+tonic = { version = "0.12", features = ["transport", "codegen", "tls"] }
+prost = "0.13"
+envoy-types = "0.7"
+tokio-stream = "0.1"
+
+# Let's Encrypt / ACME for free public certificates on the control plane endpoints
+rustls-acme = { version = "0.12", features = ["tokio"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1"] }
+rustls-pemfile = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"

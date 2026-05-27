@@ -1,0 +1,59 @@
+{
+  "id": "minio",
+  "name": "MinIO Object Storage",
+  "description": "S3-compatible object storage for files, backups, and assets. Includes console and secure root credentials.",
+  "category": "storage",
+  "icon": "storage",
+  "docs_url": "https://min.io/docs/",
+  "variables": [
+    {
+      "name": "MINIO_ROOT_USER",
+      "label": "Root User",
+      "type": "string",
+      "default": "minioadmin",
+      "secret": false
+    },
+    {
+      "name": "MINIO_ROOT_PASSWORD",
+      "label": "Root Password",
+      "type": "password",
+      "default": "",
+      "secret": true,
+      "generate": true
+    }
+  ],
+  "default_strategy": {
+    "type": "rolling",
+    "max_unavailable": 0,
+    "max_surge": 1,
+    "health_check_grace_period_secs": 30,
+    "rollback_on_failure": true,
+    "failure_threshold": 3
+  },
+  "spec": {
+    "containers": [
+      {
+        "name": "minio",
+        "image": "minio/minio:latest",
+        "env": [
+          ["MINIO_ROOT_USER", "$MINIO_ROOT_USER"],
+          ["MINIO_ROOT_PASSWORD", "$MINIO_ROOT_PASSWORD"]
+        ],
+        "cmd": ["server", "/data", "--console-address", ":9001"],
+        "ports": ["9000:9000", "9001:9001"],
+        "volumes": ["/data:/data"],
+        "restart_policy": "unless-stopped",
+        "healthcheck": {
+          "test": ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"],
+          "interval": "15s",
+          "timeout": "5s",
+          "retries": 5
+        }
+      }
+    ],
+    "volumes": [
+      { "name": "minio-data", "driver": "local" }
+    ],
+    "networks": ["forge-default"]
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "id": "node-buildpack",
+  "name": "Node.js (Buildpack)",
+  "description": "Node.js app built with Paketo Buildpacks. Supports package.json, yarn, npm. Zero Dockerfile required. Perfect for 12-factor Node services.",
+  "category": "language",
+  "icon": "code",
+  "docs_url": "https://paketo.io/docs/buildpacks/language-family-buildpacks/nodejs/",
+  "variables": [
+    {
+      "name": "BP_NODE_VERSION",
+      "label": "Node Version",
+      "type": "string",
+      "default": "18",
+      "secret": false,
+      "required": false
+    },
+    {
+      "name": "BP_LAUNCH_COMMAND",
+      "label": "Launch Command (optional override)",
+      "type": "string",
+      "default": "",
+      "secret": false,
+      "required": false
+    }
+  ],
+  "default_strategy": {
+    "type": "rolling",
+    "max_unavailable": 0,
+    "max_surge": 1,
+    "health_check_grace_period_secs": 30,
+    "rollback_on_failure": true,
+    "failure_threshold": 3
+  },
+  "spec": {
+    "build": {
+      "type": "buildpack",
+      "builder": "paketobuildpacks/builder-jammy-full",
+      "env": {
+        "BP_NODE_VERSION": "$BP_NODE_VERSION"
+      }
+    },
+    "containers": [
+      {
+        "name": "app",
+        "image": "node-buildpack-app:latest",
+        "ports": ["3000:3000"],
+        "env": [
+          ["NODE_ENV", "production"]
+        ],
+        "restart_policy": "unless-stopped",
+        "healthcheck": {
+          "test": ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"],
+          "interval": "10s",
+          "timeout": "5s",
+          "retries": 3
+        }
+      }
+    ],
+    "networks": ["forge-default"]
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "id": "redis",
+  "name": "Redis 7",
+  "description": "Fast in-memory cache / session store with persistence and healthchecks. Auto-generates secure password.",
+  "category": "cache",
+  "icon": "cache",
+  "docs_url": "https://redis.io/docs/",
+  "variables": [
+    {
+      "name": "REDIS_PASSWORD",
+      "label": "Redis Password",
+      "type": "password",
+      "default": "",
+      "secret": true,
+      "generate": true,
+      "required": true
+    }
+  ],
+  "default_strategy": {
+    "type": "rolling",
+    "max_unavailable": 0,
+    "max_surge": 1,
+    "health_check_grace_period_secs": 20,
+    "rollback_on_failure": true,
+    "failure_threshold": 2
+  },
+  "spec": {
+    "containers": [
+      {
+        "name": "redis",
+        "image": "redis:7-alpine",
+        "env": [
+          ["REDIS_PASSWORD", "$REDIS_PASSWORD"]
+        ],
+        "cmd": ["redis-server", "--requirepass", "$REDIS_PASSWORD", "--appendonly", "yes"],
+        "ports": ["6379:6379"],
+        "volumes": ["/data:/data"],
+        "restart_policy": "unless-stopped",
+        "healthcheck": {
+          "test": ["CMD", "redis-cli", "-a", "$REDIS_PASSWORD", "ping"],
+          "interval": "10s",
+          "timeout": "3s",
+          "retries": 5
+        }
+      }
+    ],
+    "volumes": [
+      { "name": "redis-data", "driver": "local" }
+    ],
+    "networks": ["forge-default"]
+  }
+}

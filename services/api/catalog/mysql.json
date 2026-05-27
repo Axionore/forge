@@ -1,0 +1,84 @@
+{
+  "id": "mysql",
+  "name": "MySQL 8.4",
+  "description": "Production MySQL with persistent storage, strong auto-generated root password, and healthchecks. Ready for app backends or catalog services needing relational SQL.",
+  "category": "database",
+  "icon": "database",
+  "docs_url": "https://dev.mysql.com/doc/refman/8.4/en/",
+  "variables": [
+    {
+      "name": "MYSQL_DATABASE",
+      "label": "Database Name",
+      "type": "string",
+      "default": "app",
+      "secret": false,
+      "required": true
+    },
+    {
+      "name": "MYSQL_USER",
+      "label": "Database User",
+      "type": "string",
+      "default": "app",
+      "secret": false,
+      "required": true
+    },
+    {
+      "name": "MYSQL_PASSWORD",
+      "label": "Database Password",
+      "type": "password",
+      "default": "",
+      "secret": true,
+      "generate": true,
+      "required": true
+    },
+    {
+      "name": "MYSQL_ROOT_PASSWORD",
+      "label": "Root Password",
+      "type": "password",
+      "default": "",
+      "secret": true,
+      "generate": true,
+      "required": true
+    }
+  ],
+  "default_strategy": {
+    "type": "rolling",
+    "max_unavailable": 0,
+    "max_surge": 1,
+    "health_check_grace_period_secs": 40,
+    "rollback_on_failure": true,
+    "failure_threshold": 3
+  },
+  "spec": {
+    "containers": [
+      {
+        "name": "mysql",
+        "image": "mysql:8.4",
+        "env": [
+          ["MYSQL_DATABASE", "$MYSQL_DATABASE"],
+          ["MYSQL_USER", "$MYSQL_USER"],
+          ["MYSQL_PASSWORD", "$MYSQL_PASSWORD"],
+          ["MYSQL_ROOT_PASSWORD", "$MYSQL_ROOT_PASSWORD"]
+        ],
+        "ports": ["3306:3306"],
+        "volumes": ["/var/lib/mysql:/var/lib/mysql"],
+        "restart_policy": "unless-stopped",
+        "healthcheck": {
+          "test": ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p$MYSQL_ROOT_PASSWORD"],
+          "interval": "15s",
+          "timeout": "5s",
+          "retries": 5,
+          "start_period": "20s"
+        },
+        "resources": {
+          "memory_limit": 1073741824,
+          "cpu_shares": 1024
+        }
+      }
+    ],
+    "volumes": [
+      { "name": "mysql-data", "driver": "local" }
+    ],
+    "networks": ["forge-default"]
+  }
+}

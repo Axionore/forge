@@ -1,0 +1,18 @@
+[package]
+name = "forge-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+# The rich DeploymentSpec / ContainerSpec live in the agent today.
+# In Phase 1 we treat forge-core as the future home. The agent will be updated
+# to depend on forge-core and re-export from here. For the first slices we
+# duplicate the minimal surface or use JSONB + manual mapping.
