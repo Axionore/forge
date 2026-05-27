@@ -90,7 +90,7 @@ fn default_docker_socket() -> String {
 }
 
 impl AgentConfig {
-    pub fn from_env_and_file(path: Option<&Path>) -> Result<Self, figment::Error> {
+    pub fn from_env_and_file(path: Option<&Path>) -> Result<Self, Box<figment::Error>> {
         let mut figment = Figment::new()
             .merge(Env::prefixed("FORGE_AGENT_").split("_"));
 
@@ -98,6 +98,6 @@ impl AgentConfig {
             figment = figment.merge(Toml::file(p));
         }
 
-        figment.extract()
+        figment.extract().map_err(Box::new)
     }
 }

@@ -201,15 +201,13 @@ impl ControlPlaneJobReceiver {
                         } else {
                             // Wait for auth ack
                             let mut authed = false;
-                            if let Some(Ok(msg)) = read.next().await {
-                                if let Message::Text(text) = msg {
-                                    if text.contains("\"status\":\"ok\"") || text.contains("authenticated") {
-                                        info!("Successfully authenticated with control plane");
-                                        authed = true;
+                            if let Some(Ok(Message::Text(text))) = read.next().await {
+                                if text.contains("\"status\":\"ok\"") || text.contains("authenticated") {
+                                    info!("Successfully authenticated with control plane");
+                                    authed = true;
 
-                                        if let Some(tx) = &readiness_tx {
-                                            let _ = tx.send_modify(|s| s.control_plane_connected = true);
-                                        }
+                                    if let Some(tx) = &readiness_tx {
+                                        tx.send_modify(|s| s.control_plane_connected = true);
                                     }
                                 }
                             }
@@ -272,7 +270,7 @@ impl ControlPlaneJobReceiver {
                                             if !first_hb_sent {
                                                 first_hb_sent = true;
                                                 if let Some(tx) = &readiness_tx {
-                                                    let _ = tx.send_modify(|s| s.first_heartbeat_sent = true);
+                                                    tx.send_modify(|s| s.first_heartbeat_sent = true);
                                                 }
                                             }
                                         }
@@ -290,7 +288,7 @@ impl ControlPlaneJobReceiver {
 
                                 // Lost this connection
                                 if let Some(tx) = &readiness_tx {
-                                    let _ = tx.send_modify(|s| s.control_plane_connected = false);
+                                    tx.send_modify(|s| s.control_plane_connected = false);
                                 }
                                 warn!("Lost control plane connection — will reconnect");
                             }

@@ -759,7 +759,7 @@ pub fn decrypt_secret(
     }
 
     let decryptor = age::Decryptor::new(cipher.payload.as_bytes())
-        .map_err(|e| anyhow::anyhow!("invalid age ciphertext: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("invalid age ciphertext: {e}"))?;
 
     // age 0.10 API (from the crate docs): match on Recipients variant, then call decrypt on the inner.
     let recipients_decryptor = match decryptor {
@@ -769,7 +769,7 @@ pub fn decrypt_secret(
 
     let mut reader = recipients_decryptor
         .decrypt(std::iter::once(identity as &dyn age::Identity))
-        .map_err(|e| anyhow::anyhow!("age decryption failed (wrong key or tampered data?): {}", e))?;
+        .map_err(|e| anyhow::anyhow!("age decryption failed (wrong key or tampered data?): {e}"))?;
 
     let mut plaintext = vec![];
     std::io::Read::read_to_end(&mut reader, &mut plaintext)?;

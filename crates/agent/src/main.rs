@@ -113,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
     let mut receiver: Box<dyn forge_agent::receiver::JobReceiver> = if use_mock {
         info!("Using mock receiver (FORGE_AGENT_USE_MOCK_RECEIVER=true)");
         // For mock we simulate readiness so handover testing still works.
-        let _ = readiness_tx.send_modify(|state| {
+        readiness_tx.send_modify(|state| {
             state.control_plane_connected = true;
             state.first_heartbeat_sent = true;
         });
@@ -131,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => {
                 error!(error = %e, "Failed to connect to control plane — falling back to mock receiver");
                 // For mock fallback we still simulate readiness.
-                let _ = readiness_tx.send_modify(|state| {
+                readiness_tx.send_modify(|state| {
                     state.control_plane_connected = true;
                     state.first_heartbeat_sent = true;
                 });
@@ -150,10 +150,11 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             // Wait until the agent has connected to the control plane and sent its first heartbeat.
             // This makes the handover signal much more meaningful and realistic.
-            if let Err(_) = readiness
+            if readiness
                 .clone()
                 .wait_for(|state| state.control_plane_connected && state.first_heartbeat_sent)
                 .await
+                .is_err()
             {
                 warn!("Readiness channel closed before agent became ready for handover");
                 return;

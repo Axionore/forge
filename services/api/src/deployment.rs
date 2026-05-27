@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use sqlx::PgPool;
 use thiserror::Error;
+use tracing::warn;
 use uuid::Uuid;
 
 use forge_agent::job::JobResult;

@@ -253,7 +253,7 @@ pub async fn enroll_if_needed(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Enrollment failed ({}): {}", status, text);
+        anyhow::bail!("Enrollment failed ({status}): {text}");
     }
 
     #[derive(serde::Deserialize)]

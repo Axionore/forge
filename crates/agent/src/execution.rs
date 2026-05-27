@@ -52,7 +52,7 @@ pub async fn execute_job(
         Job::PruneNetworks { .. } => ("prune_networks".to_string(), "prune_networks".to_string()),
         Job::ContainerAttach { target, .. } => (target.clone(), "container_attach".to_string()),
         Job::Backup { deployment_id, target_container: _target_container, db_type, .. } => {
-            (deployment_id.to_string(), format!("backup_{}", db_type))
+            (deployment_id.to_string(), format!("backup_{db_type}"))
         }
     };
 
@@ -1270,9 +1270,7 @@ async fn execute_system_update(
 
     if actual_sha256 != expected_sha256.to_lowercase() {
         return Err(crate::AgentError::Internal(anyhow::anyhow!(
-            "SHA256 mismatch for new agent binary! expected={}, actual={}",
-            expected_sha256,
-            actual_sha256
+            "SHA256 mismatch for new agent binary! expected={expected_sha256}, actual={actual_sha256}"
         )));
     }
 
@@ -1338,7 +1336,7 @@ async fn execute_system_update(
     let child = cmd.spawn().map_err(|e| {
         // Rollback on spawn failure
         let _ = std::fs::rename(&backup_path, &current_exe);
-        crate::AgentError::Internal(anyhow::anyhow!("Failed to spawn new agent: {}", e))
+        crate::AgentError::Internal(anyhow::anyhow!("Failed to spawn new agent: {e}"))
     })?;
 
     let new_pid = child.id();
@@ -1397,9 +1395,9 @@ async fn execute_system_update(
             info!("Previous binary restored");
         }
 
-        return Err(crate::AgentError::Internal(anyhow::anyhow!(
+        Err(crate::AgentError::Internal(anyhow::anyhow!(
             "Self-update handover failed"
-        )));
+        )))
     }
 }
 
@@ -1460,6 +1458,7 @@ async fn execute_stop(target: crate::job::ResourceTarget, _docker: Option<&Docke
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_command(
     _docker: Option<&DockerClient>,
     _target_container: Option<String>,
@@ -2152,6 +2151,7 @@ async fn execute_prune_networks(_docker: Option<&DockerClient>, _filters: Vec<(S
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_container_attach(
     _docker: Option<&DockerClient>,
     target: String,
@@ -2215,6 +2215,7 @@ async fn execute_container_attach(
 }
 
 /// Real container logs with full advanced options (follow, tail, timestamps, since/until, stdout/stderr).
+#[allow(clippy::too_many_arguments)]
 async fn execute_container_logs(
     _docker: Option<&DockerClient>,
     target: String,
