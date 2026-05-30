@@ -181,10 +181,11 @@ async fn main() {
     // Shared pool
     let pool = Arc::new(pool);
 
-    // Control plane long-term signing key (for signing jobs sent to agents).
-    // In production this should come from a secure store / KMS.
-    // For now we generate one on startup (agents enrolled against a previous key will need re-enroll).
-    let signing_key = Arc::new(ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng));
+    // Control plane long-term signing key (signs every job sent to agents AND is the
+    // verifying key handed to agents at enrollment). ONE key, loaded from a secret at
+    // startup and persisted so it survives restarts — otherwise every restart rotates
+    // the root of trust and all prior agent enrollments break (OWASP A08/A04).
+    let signing_key = Arc::new(load_or_create_signing_key());
     let public_key = signing_key.verifying_key();
     info!(
         public_key = %hex::encode(public_key.as_bytes()),
@@ -214,7 +215,9 @@ async fn main() {
     let xds_mtls_authority =
         Arc::new(crate::xds::XdsMtlsAuthority::new().expect("xDS mTLS CA generation failed"));
 
-    let enrollment_service = Arc::new(EnrollmentService::new((*pool).clone()));
+    // Inject the SAME signing key Arc into EnrollmentService so the verifying key it
+    // returns to agents matches the key that signs their jobs in agent_ws.
+    let enrollment_service = Arc::new(EnrollmentService::new((*pool).clone(), signing_key.clone()));
 
     let state = AppState {
         enrollment_service,
@@ -517,6 +520,84 @@ async fn main() {
     let listener = TcpListener::bind(addr).await.unwrap();
     info!(%addr, "Control plane plain HTTP listener started on 3000");
     axum::serve(listener, app).await.unwrap();
+}
+
+/// Resolve the ONE control-plane Ed25519 signing key, in priority order:
+///
+/// 1. `FORGE_CP_SIGNING_KEY` — base64-encoded 32-byte ed25519 seed (the production
+///    path; inject via your secret manager / KMS). Never logged.
+/// 2. A persisted seed file at `$FORGE_STATE_DIR/cp-signing-key` (default
+///    `/var/lib/forge/cp-signing-key`), created `0600` if absent.
+///
+/// Persisting (vs. generating ephemerally) is mandatory: the verifying key is handed
+/// to agents at enrollment, so a per-restart key would invalidate every enrollment and
+/// make signed jobs unverifiable (OWASP A08/A04). When we have to generate-and-persist
+/// we log a loud warning so operators know to provision a managed secret instead.
+fn load_or_create_signing_key() -> ed25519_dalek::SigningKey {
+    use base64::Engine as _;
+
+    if let Ok(b64) = std::env::var("FORGE_CP_SIGNING_KEY") {
+        let seed = base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .expect("FORGE_CP_SIGNING_KEY must be valid base64");
+        let seed: [u8; 32] = seed
+            .as_slice()
+            .try_into()
+            .expect("FORGE_CP_SIGNING_KEY must decode to exactly 32 bytes (ed25519 seed)");
+        info!("Loaded control-plane signing key from FORGE_CP_SIGNING_KEY");
+        return ed25519_dalek::SigningKey::from_bytes(&seed);
+    }
+
+    let state_dir =
+        std::env::var("FORGE_STATE_DIR").unwrap_or_else(|_| "/var/lib/forge".to_string());
+    let key_path = std::path::Path::new(&state_dir).join("cp-signing-key");
+
+    if let Ok(seed) = std::fs::read(&key_path) {
+        let seed: [u8; 32] = seed.as_slice().try_into().unwrap_or_else(|_| {
+            panic!(
+                "persisted signing key at {} is not a 32-byte ed25519 seed; refusing to start",
+                key_path.display()
+            )
+        });
+        info!(path = %key_path.display(), "Loaded persisted control-plane signing key");
+        return ed25519_dalek::SigningKey::from_bytes(&seed);
+    }
+
+    // Generate once and persist. Never log the seed.
+    let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    if let Some(parent) = key_path.parent() {
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|e| panic!("failed to create state dir {}: {e}", parent.display()));
+    }
+    persist_signing_key_seed(&key_path, &key.to_bytes()).unwrap_or_else(|e| {
+        panic!(
+            "failed to persist signing key at {}: {e}",
+            key_path.display()
+        )
+    });
+    warn!(
+        path = %key_path.display(),
+        "No FORGE_CP_SIGNING_KEY set — generated an ephemeral-on-disk control-plane signing key and persisted it (0600). \
+         For production, provision FORGE_CP_SIGNING_KEY from a secret manager / KMS so the key is managed and rotatable."
+    );
+    key
+}
+
+/// Write the 32-byte seed to `path` with `0600` permissions (owner read/write only).
+fn persist_signing_key_seed(path: &std::path::Path, seed: &[u8; 32]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(seed)?;
+    f.flush()?;
+    Ok(())
 }
 
 async fn health() -> impl IntoResponse {
@@ -2474,12 +2555,17 @@ async fn git_webhook_handler(
     State(state): State<AppState>,
     Path(source_id): Path<Uuid>,
     headers: axum::http::HeaderMap,
-    Json(payload): Json<serde_json::Value>,
+    // Raw body bytes — required so HMAC verification runs over the exact wire bytes the
+    // provider signed, not a re-serialized JSON value (which would never match).
+    body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let signature = headers
         .get("X-Hub-Signature-256")
         .or(headers.get("X-Gitlab-Token"))
         .and_then(|v| v.to_str().ok());
+
+    let payload: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::BadRequest("invalid webhook payload".into()))?;
 
     // Determine provider heuristically from payload (or we could look it up)
     let provider = if payload.get("repository").is_some() || payload.get("pull_request").is_some() {
@@ -2492,11 +2578,15 @@ async fn git_webhook_handler(
 
     let result = state
         .deployment_service
-        .handle_git_webhook(source_id, provider, signature, payload)
+        .handle_git_webhook(source_id, provider, signature, &body, payload)
         .await
-        .map_err(|e| {
-            warn!(error = %e, "git_webhook_handler failed");
-            ApiError::BadRequest("Webhook processing failed".into())
+        .map_err(|e| match e {
+            // Fail closed: a missing/invalid signature is a 401, never a 2xx.
+            deployment::DeploymentError::Unauthorized => ApiError::Unauthorized,
+            other => {
+                warn!(error = %other, "git_webhook_handler failed");
+                ApiError::BadRequest("Webhook processing failed".into())
+            }
         })?;
 
     // Quick fix for e2e testability (item 6): if a preview deployment was created, immediately dispatch

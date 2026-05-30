@@ -59,6 +59,9 @@ pub enum DeploymentError {
     /// we never leak which permission was missing to the caller (OWASP A01/A09).
     #[error("forbidden")]
     Forbidden,
+    /// Webhook signature missing or invalid. Maps to HTTP 401. Fail closed (OWASP A08).
+    #[error("unauthorized")]
+    Unauthorized,
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
 }
@@ -2426,15 +2429,24 @@ impl DeploymentService {
     }
 
     /// Handle an incoming webhook from a Git provider.
-    /// Validates signature using the stored webhook secret (in config).
-    /// For push/PR events, creates or updates a deployment (preview for PRs).
+    ///
+    /// Verifies authenticity over the RAW request body using the stored webhook secret
+    /// before doing any work, and FAILS CLOSED (rejects) on a missing or invalid
+    /// signature whenever a secret is configured (OWASP A08, CWE-345):
+    ///
+    /// - GitHub style: `X-Hub-Signature-256: sha256=<hex>` → HMAC-SHA256 of the raw
+    ///   body, constant-time compared via `ring::hmac::verify`.
+    /// - GitLab style: `X-Gitlab-Token: <secret>` → constant-time shared-secret compare.
+    ///
+    /// `raw_body` MUST be the exact bytes received on the wire (not a re-serialized
+    /// `serde_json::Value`) or the HMAC will not match. `payload` is the parsed view
+    /// used only after the signature has been verified.
     pub async fn handle_git_webhook(
         &self,
         source_id: Uuid,
-        // `provider` is part of the route contract but not yet branched on here
-        // (push/PR parsing is provider-agnostic for the GitHub/GitLab shapes handled).
-        _provider: &str,
+        provider: &str,
         signature: Option<&str>,
+        raw_body: &[u8],
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, DeploymentError> {
         // Load source to get secret for validation
@@ -2458,22 +2470,17 @@ impl DeploymentService {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        // Improved basic signature validation for real GitHub/GitLab webhooks (Tier 1 e2e testing support).
-        // GitHub: header is "sha256=<hex>", we strip prefix and do best-effort check.
-        // For production, replace with proper ring::hmac constant-time compare.
+        // Cryptographic, fail-closed signature verification.
         if !secret.is_empty() {
-            if let Some(sig) = signature {
-                let sig_clean = sig.strip_prefix("sha256=").unwrap_or(sig).trim();
-                if !sig_clean.contains(secret) && !sig_clean.ends_with(secret) {
-                    // Note: this is still weak string match for demo; real HMAC needed for prod.
-                    // For testing with real repos, you can temporarily set a simple secret or enhance validation.
-                    warn!(
-                        "Webhook signature present but basic check inconclusive for source {}",
-                        source_id
-                    );
-                    // Do not hard fail in v1 to allow e2e testing; log only.
-                }
+            if !verify_git_webhook_signature(provider, secret, signature, raw_body) {
+                warn!(%source_id, "Rejected git webhook: missing or invalid signature");
+                return Err(DeploymentError::Unauthorized);
             }
+        } else {
+            // No secret configured on the source. Document the residual risk: such a
+            // source accepts unauthenticated webhooks and should only exist for local
+            // dev/internal tooling. We log it so it is visible in audit.
+            warn!(%source_id, "Git source has no webhook secret configured — accepting unauthenticated webhook (dev only)");
         }
 
         // Parse common GitHub / GitLab style payloads for PR/push
@@ -2638,6 +2645,185 @@ impl DeploymentService {
             "preview_name": preview_name,
             "note": "Real preview deployment created and linked to git source. It will be reconciled when an agent connects."
         }))
+    }
+}
+
+/// Verify a Git provider webhook signature against the RAW request body, constant-time.
+///
+/// Returns `true` only when the request is authentic. Any missing header, malformed
+/// signature, or mismatch returns `false` so the caller can fail closed (OWASP A08).
+///
+/// - GitHub / generic HMAC: `signature` is `sha256=<hex>` (the `X-Hub-Signature-256`
+///   header). We HMAC-SHA256 the raw body with `secret` and `ring::hmac::verify` against
+///   the decoded tag (constant time).
+/// - GitLab: `signature` is the raw `X-Gitlab-Token` shared secret; compared to the
+///   stored secret in constant time.
+fn verify_git_webhook_signature(
+    provider: &str,
+    secret: &str,
+    signature: Option<&str>,
+    raw_body: &[u8],
+) -> bool {
+    let Some(sig) = signature else {
+        return false;
+    };
+
+    // GitLab uses a plain shared-secret token (X-Gitlab-Token) rather than an HMAC of
+    // the body. Compare the presented token to the stored secret in constant time.
+    if provider.eq_ignore_ascii_case("gitlab") && !sig.starts_with("sha256=") {
+        return constant_time_eq(sig.as_bytes(), secret.as_bytes());
+    }
+
+    // GitHub / generic: HMAC-SHA256 over the raw body, hex-encoded, `sha256=` prefix.
+    let sig_clean = sig.strip_prefix("sha256=").unwrap_or(sig).trim();
+    let Ok(sig_bytes) = hex::decode(sig_clean) else {
+        return false;
+    };
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    ring::hmac::verify(&key, raw_body, &sig_bytes).is_ok()
+}
+
+/// Constant-time byte-slice equality (length-aware, no early return on content).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+#[cfg(test)]
+mod webhook_signature_tests {
+    //! Git webhook HMAC verification (OWASP A08 / CWE-345). These prove the handler
+    //! is cryptographic and FAILS CLOSED: a valid HMAC over the raw body passes, while
+    //! a tampered body, wrong secret, or missing signature is rejected.
+    use super::*;
+    use ring::hmac;
+    use sqlx::PgPool;
+
+    /// GitHub-style `sha256=<hex>` HMAC of `body` with `secret`.
+    fn github_sig(secret: &str, body: &[u8]) -> String {
+        let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+        format!("sha256={}", hex::encode(hmac::sign(&key, body).as_ref()))
+    }
+
+    #[test]
+    fn github_valid_signature_passes() {
+        let body = br#"{"repository":{"full_name":"acme/app"},"after":"abc123"}"#;
+        let sig = github_sig("s3cr3t", body);
+        assert!(verify_git_webhook_signature(
+            "github",
+            "s3cr3t",
+            Some(&sig),
+            body
+        ));
+    }
+
+    #[test]
+    fn github_tampered_body_is_rejected() {
+        let body = br#"{"repository":{"full_name":"acme/app"},"after":"abc123"}"#;
+        let sig = github_sig("s3cr3t", body);
+        let tampered = br#"{"repository":{"full_name":"acme/app"},"after":"deadbeef"}"#;
+        assert!(!verify_git_webhook_signature(
+            "github",
+            "s3cr3t",
+            Some(&sig),
+            tampered
+        ));
+    }
+
+    #[test]
+    fn github_wrong_secret_is_rejected() {
+        let body = br#"{"x":1}"#;
+        let sig = github_sig("right-secret", body);
+        assert!(!verify_git_webhook_signature(
+            "github",
+            "wrong-secret",
+            Some(&sig),
+            body
+        ));
+    }
+
+    #[test]
+    fn missing_signature_is_rejected() {
+        let body = br#"{"x":1}"#;
+        assert!(!verify_git_webhook_signature(
+            "github", "s3cr3t", None, body
+        ));
+    }
+
+    #[test]
+    fn malformed_hex_signature_is_rejected() {
+        let body = br#"{"x":1}"#;
+        assert!(!verify_git_webhook_signature(
+            "github",
+            "s3cr3t",
+            Some("sha256=not-hex"),
+            body
+        ));
+    }
+
+    #[test]
+    fn gitlab_token_match_passes_mismatch_fails() {
+        let body = br#"{"object_kind":"push"}"#;
+        assert!(verify_git_webhook_signature(
+            "gitlab",
+            "shared-token",
+            Some("shared-token"),
+            body
+        ));
+        assert!(!verify_git_webhook_signature(
+            "gitlab",
+            "shared-token",
+            Some("guessed-token"),
+            body
+        ));
+    }
+
+    #[sqlx::test]
+    async fn handle_git_webhook_fails_closed_on_bad_signature(pool: PgPool) {
+        let rbac = std::sync::Arc::new(crate::rbac::RbacService::new(pool.clone()));
+        let svc = DeploymentService::new(pool.clone(), rbac);
+
+        let source_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO git_sources (id, name, provider, config, enabled) VALUES ($1, $2, $3, $4, true)",
+        )
+        .bind(source_id)
+        .bind("acme")
+        .bind("github")
+        .bind(serde_json::json!({ "webhook_secret": "topsecret" }))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let body = br#"{"repository":{"full_name":"acme/app"},"after":"abc123"}"#;
+        let payload: serde_json::Value = serde_json::from_slice(body).unwrap();
+
+        // Missing signature → rejected.
+        let err = svc
+            .handle_git_webhook(source_id, "github", None, body, payload.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DeploymentError::Unauthorized));
+
+        // Wrong signature → rejected.
+        let bad = github_sig("not-the-secret", body);
+        let err = svc
+            .handle_git_webhook(source_id, "github", Some(&bad), body, payload.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DeploymentError::Unauthorized));
+
+        // Valid signature → accepted (returns a JSON result, not an auth error).
+        let good = github_sig("topsecret", body);
+        let ok = svc
+            .handle_git_webhook(source_id, "github", Some(&good), body, payload)
+            .await;
+        assert!(ok.is_ok(), "valid HMAC over the raw body must be accepted");
     }
 }
 

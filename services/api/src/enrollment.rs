@@ -1,10 +1,11 @@
 //! Agent enrollment and key distribution logic.
 
 use base64::Engine;
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use sqlx::PgPool;
+use std::sync::Arc;
 
 use thiserror::Error;
 use tracing::info;
@@ -108,20 +109,18 @@ pub enum EnrollmentError {
 
 pub struct EnrollmentService {
     pool: PgPool,
-    // In production this would be loaded from KMS/HSM/TPM.
-    control_plane_signing_key: VerifyingKey,
+    /// The ONE control-plane Ed25519 signing key. Shared (same `Arc`) with `AppState`
+    /// so the verifying key handed to agents at enrollment matches the key that signs
+    /// their jobs. Loaded once at startup from a secret (env or persisted file) — see
+    /// `crate::load_or_create_signing_key`. We only ever expose the verifying key here.
+    control_plane_signing_key: Arc<SigningKey>,
 }
 
 impl EnrollmentService {
-    pub fn new(pool: PgPool) -> Self {
-        // For development we generate an ephemeral key.
-        // In real deployments this must come from a secure store.
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let verifying_key = signing_key.verifying_key();
-
+    pub fn new(pool: PgPool, control_plane_signing_key: Arc<SigningKey>) -> Self {
         Self {
             pool,
-            control_plane_signing_key: verifying_key,
+            control_plane_signing_key,
         }
     }
 
@@ -170,16 +169,21 @@ impl EnrollmentService {
                 .await?;
         }
 
-        // 3. Create agent
+        // 3. Issue the agent's long-lived WS auth credential.
+        // High-entropy CSPRNG token (256-bit, URL-safe base64). Only its SHA-256 is
+        // ever persisted; the raw value is returned to the agent exactly once below.
         let agent_id = Uuid::now_v7();
+        let agent_token = generate_secure_token(32);
+        let agent_token_hash = sha2::Sha256::digest(agent_token.as_bytes()).to_vec();
 
         sqlx::query(
-            "INSERT INTO agents (id, hostname, public_key, age_recipient, enrolled_at) VALUES ($1, $2, $3, $4, NOW())"
+            "INSERT INTO agents (id, hostname, public_key, age_recipient, agent_token_hash, enrolled_at) VALUES ($1, $2, $3, $4, $5, NOW())"
         )
         .bind(agent_id)
         .bind(&req.hostname)
         .bind(&req.agent_public_key)
         .bind(&req.age_recipient)
+        .bind(&agent_token_hash)
         .execute(&self.pool)
         .await
         .map_err(|e| EnrollmentError::Internal(e.into()))?;
@@ -195,12 +199,6 @@ impl EnrollmentService {
             .await
             .map_err(|e| EnrollmentError::Internal(e.into()))?;
         }
-
-        // 5. Issue agent credentials (for now a simple token; real impl would use JWTs)
-        let agent_token = format!("agent-{agent_id}");
-
-        // In real system we would hash and store the token.
-        // For now we return it directly (dev only).
 
         // 6. Build WireGuard config response if applicable
         let wireguard_config = if req.wireguard_public_key.is_some() {
@@ -222,7 +220,11 @@ impl EnrollmentService {
         // the xds module (declared only in the bin main.rs). This is the complete wiring.
         Ok(EnrollmentResponse {
             agent_id,
-            control_plane_public_key: self.control_plane_signing_key.as_bytes().to_vec(),
+            control_plane_public_key: self
+                .control_plane_signing_key
+                .verifying_key()
+                .as_bytes()
+                .to_vec(),
             agent_token,
             wireguard_config,
             metadata: serde_json::json!({ "message": "Enrollment successful" }),
@@ -404,4 +406,112 @@ fn generate_secure_token(len: usize) -> String {
     let mut bytes = vec![0u8; len];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+#[cfg(test)]
+mod enrollment_tests {
+    //! Enrollment security (OWASP A07/A04 + A08/A04). These prove:
+    //! - the agent token is high-entropy CSPRNG (not `agent-<id>`), only its SHA-256
+    //!   is persisted, and the returned raw token authenticates against that hash
+    //!   (the enroll → WS-auth round-trip);
+    //! - the verifying key handed to the agent matches the ONE live signing key, so a
+    //!   job signed by that key verifies against the enrollment-returned public key.
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey, Verifier};
+    use sqlx::PgPool;
+    use std::sync::Arc;
+
+    fn req_for(pubkey: &[u8], token: &str) -> EnrollmentRequest {
+        EnrollmentRequest {
+            enrollment_token: token.to_string(),
+            agent_public_key: pubkey.to_vec(),
+            hostname: Some("node-1".into()),
+            cloud_attestation: None,
+            tpm_attestation: None,
+            wireguard_public_key: None,
+            age_recipient: None,
+        }
+    }
+
+    #[sqlx::test]
+    async fn token_is_random_hashed_and_authenticates(pool: PgPool) {
+        let signing_key = Arc::new(SigningKey::generate(&mut rand::rngs::OsRng));
+        let svc = EnrollmentService::new(pool.clone(), signing_key.clone());
+
+        let created = svc
+            .create_enrollment_token(Some("test".into()), None, Some(1))
+            .await
+            .unwrap();
+
+        let agent_pubkey = SigningKey::generate(&mut rand::rngs::OsRng)
+            .verifying_key()
+            .to_bytes()
+            .to_vec();
+        let resp = svc
+            .enroll(req_for(&agent_pubkey, &created.raw_token))
+            .await
+            .unwrap();
+
+        // Not the old guessable format.
+        assert!(
+            !resp.agent_token.starts_with("agent-"),
+            "token must not be the predictable agent-<id> form"
+        );
+        assert!(resp.agent_token.len() >= 32, "token must be high-entropy");
+
+        // Only the SHA-256 of the token is persisted, and it matches the raw value
+        // returned — this is exactly what agent_ws WS auth checks.
+        let stored: Vec<u8> =
+            sqlx::query_scalar("SELECT agent_token_hash FROM agents WHERE id = $1")
+                .bind(resp.agent_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let expected = sha2::Sha256::digest(resp.agent_token.as_bytes()).to_vec();
+        assert_eq!(stored, expected, "stored hash matches SHA-256 of raw token");
+
+        // A different token must NOT match the stored hash.
+        let wrong = sha2::Sha256::digest(b"agent-guess").to_vec();
+        assert_ne!(stored, wrong);
+    }
+
+    #[sqlx::test]
+    async fn returned_pubkey_verifies_jobs_signed_by_live_key(pool: PgPool) {
+        // The ONE signing key injected here is the same Arc AppState hands to agent_ws,
+        // which signs every job. The enrollment response must expose its verifying key.
+        let signing_key = Arc::new(SigningKey::generate(&mut rand::rngs::OsRng));
+        let svc = EnrollmentService::new(pool.clone(), signing_key.clone());
+
+        let created = svc
+            .create_enrollment_token(None, None, Some(1))
+            .await
+            .unwrap();
+        let agent_pubkey = SigningKey::generate(&mut rand::rngs::OsRng)
+            .verifying_key()
+            .to_bytes()
+            .to_vec();
+        let resp = svc
+            .enroll(req_for(&agent_pubkey, &created.raw_token))
+            .await
+            .unwrap();
+
+        let cp_pubkey: [u8; 32] = resp
+            .control_plane_public_key
+            .as_slice()
+            .try_into()
+            .expect("cp pubkey is 32 bytes");
+        let verifying = ed25519_dalek::VerifyingKey::from_bytes(&cp_pubkey).unwrap();
+
+        // Sign an arbitrary job payload with the live key (what agent_ws::JobSigner does).
+        let payload = b"job:deploy:nginx:1";
+        let sig = signing_key.sign(payload);
+
+        verifying
+            .verify(payload, &sig)
+            .expect("job signed by the live key MUST verify against the enrollment pubkey");
+
+        // Sanity: a signature from an unrelated key must NOT verify.
+        let other = SigningKey::generate(&mut rand::rngs::OsRng).sign(payload);
+        assert!(verifying.verify(payload, &other).is_err());
+    }
 }

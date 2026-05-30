@@ -12,9 +12,14 @@ Severity: 🔴 critical (blocks production) · 🟠 high · 🟡 medium · ✅ n
 Three 🔴 findings break the platform's core trust model (signed jobs + agent identity). They are
 pre-existing (not introduced by the rollback change) but must be fixed before any GA claim.
 
+> **Update 2026-05-30 — all three 🔴 findings RESOLVED.** See the per-finding "Resolved" notes
+> below. Verified: `cargo clippy --all-targets --workspace -- -D warnings` clean and
+> `cargo test --workspace` green (forge-api suite: rbac 4 + rollback 4 + webhook 7 + enrollment 2 =
+> 17 tests, plus forge-agent 4 — 0 failures). The 🟠 A01 per-action RBAC item remains open.
+
 ---
 
-## 🔴 A08/A04 — Control-plane signing key is ephemeral AND duplicated (job-integrity broken)
+## ✅🔴 A08/A04 — Control-plane signing key is ephemeral AND duplicated (job-integrity broken) — RESOLVED
 
 - `services/api/src/main.rs:183` — `state.signing_key = SigningKey::generate(OsRng)` (fresh per process).
 - `services/api/src/enrollment.rs:117` — `EnrollmentService` generates a **second, independent**
@@ -30,7 +35,17 @@ the API and `EnrollmentService` (inject the same `Arc<SigningKey>` into `Enrollm
 Persist it so it survives restarts. Add a test that an enrolled agent's stored CP pubkey verifies a
 job signed by the live key.
 
-## 🔴 A07/A04 — Agent tokens are predictable and never persisted
+**✅ Resolved (2026-05-30).** `main.rs::load_or_create_signing_key` now resolves ONE key in priority
+order: (1) `FORGE_CP_SIGNING_KEY` (base64 32-byte ed25519 seed, from a secret manager/KMS), else
+(2) a persisted seed at `$FORGE_STATE_DIR/cp-signing-key` (default `/var/lib/forge/cp-signing-key`),
+created `0600` if absent with a loud warning that an ephemeral-on-disk key was generated. The seed is
+never logged (only the public key is). The same `Arc<SigningKey>` is injected into both `AppState` and
+`EnrollmentService::new(pool, key)`; `EnrollmentResponse.control_plane_public_key` is now that key's
+`verifying_key()`. Test `enrollment::enrollment_tests::returned_pubkey_verifies_jobs_signed_by_live_key`
+proves a job signed by the live key verifies against the enrollment-returned pubkey (and that an
+unrelated key does not).
+
+## ✅🔴 A07/A04 — Agent tokens are predictable and never persisted — RESOLVED
 
 - `services/api/src/enrollment.rs:198` — `let agent_token = format!("agent-{}", agent_id);` — the
   long-lived WS auth token is just `"agent-" + <enrollment-returned UUID>` → **guessable**, not
@@ -43,7 +58,16 @@ job signed by the live key.
 `rbac.rs:290`), store only its SHA-256 in `agents.agent_token_hash` during enrollment, return the
 raw value once. Constant-time compare on WS auth.
 
-## 🔴 A08 — Git webhook signature check is non-cryptographic and fails open
+**✅ Resolved (2026-05-30).** `enrollment.rs::enroll` now issues `generate_secure_token(32)` (256-bit
+CSPRNG, URL-safe base64), persists only `sha2::Sha256` of it into `agents.agent_token_hash` in the
+`INSERT INTO agents`, and returns the raw token exactly once in `EnrollmentResponse.agent_token`. The
+guessable `agent-<id>` form is gone. `agent_ws.rs` WS auth already hashes the presented token and looks
+it up by `agent_token_hash` (an attacker must produce a preimage of a stored SHA-256). Test
+`enrollment::enrollment_tests::token_is_random_hashed_and_authenticates` proves the round-trip: token
+is not `agent-`-prefixed, the stored hash equals SHA-256(raw token), and a different token does not
+match.
+
+## ✅🔴 A08 — Git webhook signature check is non-cryptographic and fails open — RESOLVED
 
 - `services/api/src/deployment.rs:~2112` (`handle_git_webhook`) — validation is
   `sig_clean.contains(secret) || sig_clean.ends_with(secret)` with a comment "Do not hard fail in
@@ -53,6 +77,16 @@ raw value once. Constant-time compare on WS auth.
 **Fix:** compute HMAC-SHA256 over the raw body with the stored secret and `ring::hmac::verify`
 (constant-time); reject (401) on mismatch or missing signature. Validate against the **raw** request
 body, not parsed JSON.
+
+**✅ Resolved (2026-05-30).** `git_webhook_handler` now takes `axum::body::Bytes` (raw wire bytes) and
+threads them into `handle_git_webhook`, which calls `verify_git_webhook_signature` BEFORE any work.
+GitHub (`X-Hub-Signature-256: sha256=<hex>`) is verified via `ring::hmac::verify` (constant-time)
+HMAC-SHA256 over the raw body; GitLab (`X-Gitlab-Token`) is a constant-time shared-secret compare. It
+**fails closed**: missing/invalid signature with a configured secret returns `DeploymentError::Unauthorized`
+→ HTTP 401. Sources with no secret are accepted only with an explicit audit warning (dev-only). Tests
+in `deployment::webhook_signature_tests` cover valid HMAC pass, tampered body, wrong secret, missing
+signature, malformed hex, GitLab match/mismatch, and an end-to-end `handle_git_webhook` fail-closed
+check against real Postgres.
 
 ---
 
@@ -91,7 +125,7 @@ of the 0016 Services/RBAC surface require the crate to compile + `cargo`/audit t
 
 ### Remediation order
 
-1. Single persisted signing key shared API↔Enrollment (🔴, unblocks the trust model).
-2. CSPRNG + hashed agent token, persisted on enrollment (🔴).
-3. HMAC-SHA256 constant-time webhook verification, fail closed (🔴).
-4. Per-action RBAC on mutating handlers (🟠, after 0016 lands).
+1. ✅ Single persisted signing key shared API↔Enrollment (🔴, unblocks the trust model).
+2. ✅ CSPRNG + hashed agent token, persisted on enrollment (🔴).
+3. ✅ HMAC-SHA256 constant-time webhook verification, fail closed (🔴).
+4. Per-action RBAC on mutating handlers (🟠, after 0016 lands). — still open.
