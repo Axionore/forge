@@ -98,6 +98,8 @@ pub struct WireGuardPeer {
 pub enum EnrollmentError {
     #[error("invalid or already used enrollment token")]
     InvalidToken,
+    // Returned once hardware/binary attestation verification is enforced at enrollment.
+    #[allow(dead_code)]
     #[error("attestation verification failed: {0}")]
     AttestationFailed(String),
     #[error("internal error")]
@@ -123,7 +125,10 @@ impl EnrollmentService {
         }
     }
 
-    pub async fn enroll(&self, req: EnrollmentRequest) -> Result<EnrollmentResponse, EnrollmentError> {
+    pub async fn enroll(
+        &self,
+        req: EnrollmentRequest,
+    ) -> Result<EnrollmentResponse, EnrollmentError> {
         // 1. Validate + consume enrollment token (atomic, supports multi-use + revocation)
         let token_hash = sha2::Sha256::digest(req.enrollment_token.as_bytes()).to_vec();
         let now = chrono::Utc::now();
@@ -144,7 +149,7 @@ impl EnrollmentService {
               AND (expires_at IS NULL OR expires_at > $2)
               AND (max_uses = 0 OR uses_count < max_uses)
             RETURNING description, uses_count, max_uses
-            "#
+            "#,
         )
         .bind(&token_hash)
         .bind(now)
@@ -161,7 +166,8 @@ impl EnrollmentService {
             self.verify_cloud_attestation(cloud).await?;
         }
         if let Some(tpm) = &req.tpm_attestation {
-            self.verify_tpm_attestation(tpm, &req.agent_public_key).await?;
+            self.verify_tpm_attestation(tpm, &req.agent_public_key)
+                .await?;
         }
 
         // 3. Create agent
@@ -191,7 +197,7 @@ impl EnrollmentService {
         }
 
         // 5. Issue agent credentials (for now a simple token; real impl would use JWTs)
-        let agent_token = format!("agent-{}", agent_id);
+        let agent_token = format!("agent-{agent_id}");
 
         // In real system we would hash and store the token.
         // For now we return it directly (dev only).
@@ -228,7 +234,10 @@ impl EnrollmentService {
 
     // --- Attestation verification (to be implemented with real libraries) ---
 
-    async fn verify_cloud_attestation(&self, att: &CloudAttestation) -> Result<(), EnrollmentError> {
+    async fn verify_cloud_attestation(
+        &self,
+        att: &CloudAttestation,
+    ) -> Result<(), EnrollmentError> {
         info!(provider = %att.provider, "Cloud attestation received — verification not yet implemented with real SDKs");
         // TODO: Integrate AWS SDK, GCP, Azure, Hetzner for document validation + signature.
         Ok(())
@@ -261,7 +270,7 @@ impl EnrollmentService {
             .filter(|d| *d > 0)
             .map(|d| chrono::Utc::now() + chrono::Duration::days(d as i64));
 
-        let max_uses = max_uses.unwrap_or(1).max(1).min(10_000);
+        let max_uses = max_uses.unwrap_or(1).clamp(1, 10_000);
 
         sqlx::query!(
             r#"
@@ -286,7 +295,10 @@ impl EnrollmentService {
     }
 
     /// Revokes an enrollment token (prevents any future use). Idempotent.
-    pub async fn revoke_enrollment_token(&self, token_hash_prefix: &str) -> Result<(), EnrollmentError> {
+    pub async fn revoke_enrollment_token(
+        &self,
+        token_hash_prefix: &str,
+    ) -> Result<(), EnrollmentError> {
         // We match on hex prefix for operator UX (they only ever see prefixes in UI)
         let prefix = token_hash_prefix.trim().to_lowercase();
         if prefix.len() < 4 {
@@ -339,14 +351,19 @@ impl EnrollmentService {
                     "revoked".to_string()
                 } else if r.used_at.is_some() || (r.max_uses > 0 && r.uses_count >= r.max_uses) {
                     "used".to_string()
-                } else if r.expires_at.map_or(false, |e| e < now) {
+                } else if r.expires_at.is_some_and(|e| e < now) {
                     "expired".to_string()
                 } else {
                     "active".to_string()
                 };
 
                 TokenSummary {
-                    token_hash_prefix: r.token_hash_hex.chars().take(8).collect(),
+                    token_hash_prefix: r
+                        .token_hash_hex
+                        .unwrap_or_default()
+                        .chars()
+                        .take(8)
+                        .collect(),
                     description: r.description,
                     created_at: r.created_at,
                     expires_at: r.expires_at,

@@ -1,7 +1,7 @@
 //! Deployment and Application management for Phase 1.
 //!
-//! Slice 1 scope: Basic CRUD that persists state. No job dispatch yet.
-//! Follows the same patterns as enrollment.rs for consistency.
+//! Core CRUD + dispatch for image-based deployments (Phase 1).
+//! Job dispatch to connected agents via the WS registry is wired.
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -11,15 +11,54 @@ use thiserror::Error;
 use tracing::warn;
 use uuid::Uuid;
 
-use forge_agent::job::JobResult;
+use forge_agent::job::{JobResult, SignedJob};
 use forge_core::{Application, Deployment, DeploymentStatus};
+
+use crate::rbac::RbacService;
+
+/// A light managed service (DB / cache / object store) backing one or more
+/// applications. Mirrors the `services` table from migration 0016. Secret material
+/// (connection strings, credentials) lives only in age-encrypted refs in `spec` or
+/// in `connection_secret_id` — never plaintext in this struct or table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Service {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub application_id: Option<Uuid>,
+    pub name: String,
+    pub engine: String,
+    pub version: Option<String>,
+    #[serde(default)]
+    pub spec: serde_json::Value,
+    pub status: String,
+    pub connection_secret_id: Option<Uuid>,
+    #[serde(default)]
+    pub backup_schedule: Option<serde_json::Value>,
+    pub created_by_principal_id: Option<Uuid>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+/// Engines accepted by the `services.engine` CHECK constraint (migration 0016).
+/// Validated in `create_service` so we return a clean 422 instead of a DB 23514.
+const SERVICE_ENGINES: [&str; 6] = ["postgres", "mysql", "mongo", "redis", "valkey", "minio"];
 
 #[derive(Debug, Error)]
 pub enum DeploymentError {
     #[error("application not found")]
     ApplicationNotFound,
+    #[error("deployment not found")]
+    DeploymentNotFound,
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// The acting principal is authenticated but not authorized for this action
+    /// (RBAC default-deny). Maps to HTTP 403 in the handler. Carries no detail so
+    /// we never leak which permission was missing to the caller (OWASP A01/A09).
+    #[error("forbidden")]
+    Forbidden,
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
 }
@@ -54,7 +93,89 @@ pub struct CatalogVariable {
     pub required: bool,
 }
 
-fn default_string() -> String { "string".to_string() }
+fn default_string() -> String {
+    "string".to_string()
+}
+
+/// Map the persisted `deployments.status` text to the typed enum.
+/// Single source of truth — every read path routes through this instead of
+/// duplicating the match (the drift between those copies was the Phase 2 bug).
+fn status_from_str(s: &str) -> DeploymentStatus {
+    match s {
+        "in_progress" => DeploymentStatus::InProgress,
+        "healthy" => DeploymentStatus::Healthy,
+        "unhealthy" => DeploymentStatus::Unhealthy,
+        "failed" => DeploymentStatus::Failed,
+        "rolled_back" => DeploymentStatus::RolledBack,
+        _ => DeploymentStatus::Pending,
+    }
+}
+
+/// Build a `Deployment` from a full row, mapping the real `strategy`,
+/// `previous_spec`, and `rollout_state` columns (NULL `rollout_state` defaults
+/// to `{}`). Every query that returns deployments MUST select this column set
+/// and use this builder so the heartbeat engine sees real persisted state.
+#[allow(clippy::too_many_arguments)]
+fn build_deployment(
+    id: Uuid,
+    application_id: Uuid,
+    version: i32,
+    spec: serde_json::Value,
+    status: &str,
+    strategy: Option<serde_json::Value>,
+    previous_spec: Option<serde_json::Value>,
+    rollout_state: Option<serde_json::Value>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> Deployment {
+    Deployment {
+        id,
+        application_id,
+        version,
+        spec,
+        status: status_from_str(status),
+        strategy: strategy
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default(),
+        previous_spec,
+        rollout_state: rollout_state.unwrap_or_else(|| serde_json::json!({})),
+        created_at,
+        updated_at,
+    }
+}
+
+/// Build an `Application` from a full row (migration 0016 extended the table with
+/// project_id/kind/spec/status/audit columns; nullable JSONB defaults to `{}`).
+#[allow(clippy::too_many_arguments)]
+fn build_application(
+    id: Uuid,
+    name: String,
+    description: Option<String>,
+    project_id: Option<Uuid>,
+    kind: Option<String>,
+    spec: Option<serde_json::Value>,
+    status: Option<String>,
+    created_by_principal_id: Option<Uuid>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+    metadata: Option<serde_json::Value>,
+) -> Application {
+    Application {
+        id,
+        name,
+        description,
+        project_id,
+        kind,
+        spec: spec.unwrap_or_else(|| serde_json::json!({})),
+        status,
+        created_by_principal_id,
+        created_at,
+        updated_at,
+        deleted_at,
+        metadata: metadata.unwrap_or_else(|| serde_json::json!({})),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogTemplate {
@@ -71,11 +192,39 @@ pub struct CatalogTemplate {
 
 pub struct DeploymentService {
     pool: PgPool,
+    /// Shared RBAC engine. Mutation paths that carry a real `principal_id` route
+    /// through `enforce` for a default-deny permission check; the bootstrap
+    /// admin-token path passes `None` and is allowed (it is already gated by the
+    /// constant-time `FORGE_ADMIN_TOKEN` check at the HTTP boundary).
+    rbac: std::sync::Arc<RbacService>,
 }
 
 impl DeploymentService {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, rbac: std::sync::Arc<RbacService>) -> Self {
+        Self { pool, rbac }
+    }
+
+    /// Default-deny authorization gate for mutating actions.
+    ///
+    /// - `None` principal → bootstrap admin-token path (already authenticated by the
+    ///   constant-time `FORGE_ADMIN_TOKEN` check in `main.rs`): allowed.
+    /// - `Some(pid)` → must hold `action` via one of its roles, else `Forbidden`.
+    ///
+    /// Fails closed: any RBAC lookup error is treated as a denial. Never logs the
+    /// action result with token material (OWASP A01/A09).
+    async fn enforce(
+        &self,
+        principal_id: Option<Uuid>,
+        action: &str,
+    ) -> Result<(), DeploymentError> {
+        let Some(pid) = principal_id else {
+            return Ok(());
+        };
+        match self.rbac.principal_can(pid, action).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(DeploymentError::Forbidden),
+            Err(_) => Err(DeploymentError::Forbidden),
+        }
     }
 
     // --- Applications ---
@@ -84,7 +233,11 @@ impl DeploymentService {
         &self,
         name: &str,
         description: Option<&str>,
+        created_by_principal_id: Option<Uuid>,
     ) -> Result<Application, DeploymentError> {
+        self.enforce(created_by_principal_id, "applications:create")
+            .await?;
+
         if name.trim().is_empty() || name.len() > 128 {
             return Err(DeploymentError::InvalidInput(
                 "name must be 1-128 characters".into(),
@@ -96,33 +249,31 @@ impl DeploymentService {
 
         sqlx::query!(
             r#"
-            INSERT INTO applications (id, name, description, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO applications (id, name, description, created_by_principal_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $5)
             "#,
             id,
             name.trim(),
             description,
-            now,
+            created_by_principal_id,
             now
         )
         .execute(&self.pool)
         .await
         .map_err(|e| DeploymentError::Internal(e.into()))?;
 
-        Ok(Application {
-            id,
-            name: name.trim().to_string(),
-            description: description.map(|s| s.to_string()),
-            created_at: now,
-            updated_at: now,
-        })
+        // Return the persisted row so the caller sees the real 0016 column defaults
+        // (status='pending', spec/metadata='{}') rather than hand-maintained guesses.
+        self.get_application(id).await
     }
 
     pub async fn list_applications(&self) -> Result<Vec<Application>, DeploymentError> {
         let rows = sqlx::query!(
             r#"
-            SELECT id, name, description, created_at, updated_at
+            SELECT id, name, description, project_id, kind, spec, status,
+                   created_by_principal_id, created_at, updated_at, deleted_at, metadata
             FROM applications
+            WHERE deleted_at IS NULL
             ORDER BY created_at DESC
             LIMIT 100
             "#
@@ -133,12 +284,21 @@ impl DeploymentService {
 
         Ok(rows
             .into_iter()
-            .map(|r| Application {
-                id: r.id,
-                name: r.name,
-                description: r.description,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
+            .map(|r| {
+                build_application(
+                    r.id,
+                    r.name,
+                    r.description,
+                    r.project_id,
+                    r.kind,
+                    r.spec,
+                    r.status,
+                    r.created_by_principal_id,
+                    r.created_at,
+                    r.updated_at,
+                    r.deleted_at,
+                    r.metadata,
+                )
             })
             .collect())
     }
@@ -146,7 +306,8 @@ impl DeploymentService {
     pub async fn get_application(&self, id: Uuid) -> Result<Application, DeploymentError> {
         let row = sqlx::query!(
             r#"
-            SELECT id, name, description, created_at, updated_at
+            SELECT id, name, description, project_id, kind, spec, status,
+                   created_by_principal_id, created_at, updated_at, deleted_at, metadata
             FROM applications
             WHERE id = $1
             "#,
@@ -157,18 +318,319 @@ impl DeploymentService {
         .map_err(|e| DeploymentError::Internal(e.into()))?;
 
         match row {
-            Some(r) => Ok(Application {
-                id: r.id,
-                name: r.name,
-                description: r.description,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-            }),
+            Some(r) => Ok(build_application(
+                r.id,
+                r.name,
+                r.description,
+                r.project_id,
+                r.kind,
+                r.spec,
+                r.status,
+                r.created_by_principal_id,
+                r.created_at,
+                r.updated_at,
+                r.deleted_at,
+                r.metadata,
+            )),
             None => Err(DeploymentError::ApplicationNotFound),
         }
     }
 
-    // --- Deployments (Phase 1: store desired state only) ---
+    // --- Services (Phase 0 light managed resources; migration 0016) ---
+
+    /// Build a `Service` from a full `services` row.
+    #[allow(clippy::too_many_arguments)]
+    fn build_service(
+        id: Uuid,
+        project_id: Uuid,
+        application_id: Option<Uuid>,
+        name: String,
+        engine: String,
+        version: Option<String>,
+        spec: serde_json::Value,
+        status: String,
+        connection_secret_id: Option<Uuid>,
+        backup_schedule: Option<serde_json::Value>,
+        created_by_principal_id: Option<Uuid>,
+        created_at: chrono::DateTime<chrono::Utc>,
+        updated_at: chrono::DateTime<chrono::Utc>,
+        deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+        metadata: serde_json::Value,
+    ) -> Service {
+        Service {
+            id,
+            project_id,
+            application_id,
+            name,
+            engine,
+            version,
+            spec,
+            status,
+            connection_secret_id,
+            backup_schedule,
+            created_by_principal_id,
+            created_at,
+            updated_at,
+            deleted_at,
+            metadata,
+        }
+    }
+
+    pub async fn create_service(
+        &self,
+        project_id: Uuid,
+        name: &str,
+        engine: &str,
+        spec: serde_json::Value,
+        created_by_principal_id: Option<Uuid>,
+    ) -> Result<Service, DeploymentError> {
+        self.enforce(created_by_principal_id, "services:create")
+            .await?;
+
+        if name.trim().is_empty() || name.len() > 128 {
+            return Err(DeploymentError::InvalidInput(
+                "name must be 1-128 characters".into(),
+            ));
+        }
+        if !SERVICE_ENGINES.contains(&engine) {
+            return Err(DeploymentError::InvalidInput(format!(
+                "engine must be one of: {}",
+                SERVICE_ENGINES.join(", ")
+            )));
+        }
+        // Reject plaintext-looking spec to keep secrets in the age path only (A09).
+        if !spec.is_object() && !spec.is_null() {
+            return Err(DeploymentError::InvalidInput(
+                "spec must be a JSON object".into(),
+            ));
+        }
+        let spec = if spec.is_null() {
+            serde_json::json!({})
+        } else {
+            spec
+        };
+
+        let id = Uuid::now_v7();
+
+        let row = sqlx::query!(
+            r#"
+            INSERT INTO services (id, project_id, name, engine, spec, created_by_principal_id)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, project_id, application_id, name, engine, version, spec, status,
+                      connection_secret_id, backup_schedule, created_by_principal_id,
+                      created_at, updated_at, deleted_at, metadata
+            "#,
+            id,
+            project_id,
+            name.trim(),
+            engine,
+            spec,
+            created_by_principal_id
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| match e {
+            // FK violation on project_id → caller passed a non-existent project.
+            sqlx::Error::Database(ref db) if db.code().as_deref() == Some("23503") => {
+                DeploymentError::InvalidInput("project_id does not exist".into())
+            }
+            other => DeploymentError::Internal(other.into()),
+        })?;
+
+        Ok(Self::build_service(
+            row.id,
+            row.project_id,
+            row.application_id,
+            row.name,
+            row.engine,
+            row.version,
+            row.spec,
+            row.status,
+            row.connection_secret_id,
+            row.backup_schedule,
+            row.created_by_principal_id,
+            row.created_at,
+            row.updated_at,
+            row.deleted_at,
+            row.metadata,
+        ))
+    }
+
+    pub async fn list_services(&self) -> Result<Vec<Service>, DeploymentError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, project_id, application_id, name, engine, version, spec, status,
+                   connection_secret_id, backup_schedule, created_by_principal_id,
+                   created_at, updated_at, deleted_at, metadata
+            FROM services
+            WHERE deleted_at IS NULL
+            ORDER BY created_at DESC
+            LIMIT 200
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                Self::build_service(
+                    r.id,
+                    r.project_id,
+                    r.application_id,
+                    r.name,
+                    r.engine,
+                    r.version,
+                    r.spec,
+                    r.status,
+                    r.connection_secret_id,
+                    r.backup_schedule,
+                    r.created_by_principal_id,
+                    r.created_at,
+                    r.updated_at,
+                    r.deleted_at,
+                    r.metadata,
+                )
+            })
+            .collect())
+    }
+
+    pub async fn get_service(&self, id: Uuid) -> Result<Service, DeploymentError> {
+        let row = sqlx::query!(
+            r#"
+            SELECT id, project_id, application_id, name, engine, version, spec, status,
+                   connection_secret_id, backup_schedule, created_by_principal_id,
+                   created_at, updated_at, deleted_at, metadata
+            FROM services
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+            id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        match row {
+            Some(r) => Ok(Self::build_service(
+                r.id,
+                r.project_id,
+                r.application_id,
+                r.name,
+                r.engine,
+                r.version,
+                r.spec,
+                r.status,
+                r.connection_secret_id,
+                r.backup_schedule,
+                r.created_by_principal_id,
+                r.created_at,
+                r.updated_at,
+                r.deleted_at,
+                r.metadata,
+            )),
+            // Reuse ApplicationNotFound's 4xx mapping for "service not found".
+            None => Err(DeploymentError::ApplicationNotFound),
+        }
+    }
+
+    // --- Hetzner provider credentials (migration 0017; CP-decryptable age envelopes) ---
+
+    /// Create a Hetzner Cloud API credential, encrypting the token at rest to the
+    /// control-plane age `recipient` (the CP must decrypt it later to call Hetzner).
+    /// The plaintext token is returned exactly once so the UI can show it then forget
+    /// it; the persisted column only ever holds the age envelope. Never logged.
+    pub async fn create_hetzner_credential(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        token: &str,
+        recipient: &str,
+    ) -> Result<serde_json::Value, DeploymentError> {
+        if name.trim().is_empty() || name.len() > 128 {
+            return Err(DeploymentError::InvalidInput(
+                "name must be 1-128 characters".into(),
+            ));
+        }
+        if token.trim().is_empty() {
+            return Err(DeploymentError::InvalidInput("token is required".into()));
+        }
+
+        // Encrypt to the single control-plane recipient using the shared age helper,
+        // so the envelope shape matches secrets / rotate_hetzner_credential exactly.
+        let ciphertext = forge_agent::job::encrypt_secret_for_recipients(
+            token.as_bytes(),
+            std::slice::from_ref(&recipient.to_string()),
+        )
+        .map_err(|e| DeploymentError::Internal(anyhow::anyhow!("token encryption failed: {e}")))?;
+
+        let encrypted_token =
+            serde_json::to_value(&ciphertext).map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        let id = Uuid::now_v7();
+
+        sqlx::query!(
+            r#"
+            INSERT INTO hetzner_credentials (id, name, description, encrypted_token)
+            VALUES ($1, $2, $3, $4)
+            "#,
+            id,
+            name.trim(),
+            description,
+            encrypted_token
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(ref db) if db.is_unique_violation() => {
+                DeploymentError::InvalidInput("a credential with that name already exists".into())
+            }
+            other => DeploymentError::Internal(other.into()),
+        })?;
+
+        // One-time plaintext reveal; the stored column stays encrypted.
+        Ok(serde_json::json!({
+            "id": id,
+            "name": name.trim(),
+            "description": description,
+            "plaintext": token,
+            "note": "Token shown once. It is stored age-encrypted to the control-plane recipient."
+        }))
+    }
+
+    /// List Hetzner credentials WITHOUT any token material (encrypted blob omitted).
+    pub async fn list_hetzner_credentials(
+        &self,
+    ) -> Result<Vec<serde_json::Value>, DeploymentError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, name, description, created_by, enabled, created_at, updated_at
+            FROM hetzner_credentials
+            ORDER BY created_at DESC
+            LIMIT 200
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "name": r.name,
+                    "description": r.description,
+                    "created_by": r.created_by,
+                    "enabled": r.enabled,
+                    "created_at": r.created_at.to_rfc3339(),
+                    "updated_at": r.updated_at.to_rfc3339()
+                })
+            })
+            .collect())
+    }
+
+    // --- Deployments (Phase 1: persist + dispatch to agents) ---
 
     pub async fn create_deployment(
         &self,
@@ -201,23 +663,54 @@ impl DeploymentService {
 
         let next_version = version_row.max_version.unwrap_or(0) + 1;
 
+        // Snapshot the immediately-preceding version's spec BEFORE inserting the new
+        // row, so phased strategies (auto-rollback) and the manual rollback endpoint
+        // can restore a real prior version instead of null. This is the core fix.
+        let previous_spec: Option<serde_json::Value> = sqlx::query_scalar!(
+            "SELECT spec FROM deployments WHERE application_id = $1 ORDER BY version DESC LIMIT 1",
+            application_id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
         let id = Uuid::now_v7();
         let now = Utc::now();
         let status = "pending";
 
-        // Insert deployment
+        // Initialize rollout state based on strategy for phased execution.
+        let rollout_state = match &strategy {
+            forge_core::DeploymentStrategy::Rolling(cfg) => serde_json::json!({
+                "phase": "initial",
+                "current_replicas": 0,
+                "target_replicas": 1, // will be expanded in reconciliation
+                "failure_count": 0,
+                "last_health_gate_passed_at": null,
+                "config": cfg
+            }),
+            _ => serde_json::json!({ "phase": "full", "config": strategy }),
+        };
+
+        // Bind JSONB columns as serde_json::Value (DeploymentStrategy is not a sqlx type).
+        let strategy_json =
+            serde_json::to_value(&strategy).map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        // Insert deployment — now persisting previous_spec + rollout_state so the
+        // heartbeat engine and rollback path actually have the data they read back.
         sqlx::query!(
             r#"
-            INSERT INTO deployments (id, application_id, version, spec, status, strategy, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            INSERT INTO deployments
+                (id, application_id, version, spec, status, strategy, previous_spec, rollout_state, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
             "#,
             id,
             application_id,
             next_version,
             spec,
             status,
-            strategy,
-            now,
+            strategy_json,
+            previous_spec,
+            rollout_state,
             now
         )
         .execute(&self.pool)
@@ -240,19 +733,6 @@ impl DeploymentService {
             .map_err(|e| DeploymentError::Internal(e.into()))?;
         }
 
-        // Initialize rollout state based on strategy for phased execution
-        let rollout_state = match &strategy {
-            forge_core::DeploymentStrategy::Rolling(cfg) => serde_json::json!({
-                "phase": "initial",
-                "current_replicas": 0,
-                "target_replicas": 1, // will be expanded in reconciliation
-                "failure_count": 0,
-                "last_health_gate_passed_at": null,
-                "config": cfg
-            }),
-            _ => serde_json::json!({ "phase": "full", "config": strategy })
-        };
-
         Ok(Deployment {
             id,
             application_id,
@@ -260,7 +740,7 @@ impl DeploymentService {
             spec,
             status: DeploymentStatus::Pending,
             strategy,
-            previous_spec: None, // will be set on first real update for rollback
+            previous_spec,
             rollout_state,
             created_at: now,
             updated_at: now,
@@ -273,7 +753,7 @@ impl DeploymentService {
     ) -> Result<Vec<Deployment>, DeploymentError> {
         let rows = sqlx::query!(
             r#"
-            SELECT id, application_id, version, spec, status, strategy, created_at, updated_at
+            SELECT id, application_id, version, spec, status, strategy, previous_spec, rollout_state, created_at, updated_at
             FROM deployments
             WHERE application_id = $1
             ORDER BY version DESC
@@ -285,35 +765,23 @@ impl DeploymentService {
         .await
         .map_err(|e| DeploymentError::Internal(e.into()))?;
 
-        let mut deployments = Vec::new();
-        for r in rows {
-            let status = match r.status.as_str() {
-                "pending" => DeploymentStatus::Pending,
-                "in_progress" => DeploymentStatus::InProgress,
-                "healthy" => DeploymentStatus::Healthy,
-                "unhealthy" => DeploymentStatus::Unhealthy,
-                "failed" => DeploymentStatus::Failed,
-                "rolled_back" => DeploymentStatus::RolledBack,
-                _ => DeploymentStatus::Pending,
-            };
-
-            let strategy: forge_core::DeploymentStrategy = r.strategy
-                .map(|v| serde_json::from_value(v).unwrap_or_default())
-                .unwrap_or_default();
-
-            deployments.push(Deployment {
-                id: r.id,
-                application_id: r.application_id,
-                version: r.version,
-                spec: r.spec,
-                status,
-                strategy,
-                previous_spec: None,
-                rollout_state: serde_json::json!({}),
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-            });
-        }
+        let deployments = rows
+            .into_iter()
+            .map(|r| {
+                build_deployment(
+                    r.id,
+                    r.application_id,
+                    r.version,
+                    r.spec,
+                    &r.status,
+                    Some(r.strategy),
+                    r.previous_spec,
+                    r.rollout_state,
+                    r.created_at,
+                    r.updated_at,
+                )
+            })
+            .collect();
 
         Ok(deployments)
     }
@@ -365,6 +833,10 @@ impl DeploymentService {
         // Insert the full result
         let result_id = Uuid::now_v7();
 
+        // The agent's `JobResultDetails` is a serde enum; persist it as JSONB.
+        let details_json = serde_json::to_value(&result.details)
+            .map_err(|e| DeploymentError::Internal(e.into()))?;
+
         sqlx::query!(
             r#"
             INSERT INTO job_results (
@@ -380,9 +852,23 @@ impl DeploymentService {
             result.success,
             result.error,
             // started_at and finished_at are i64 timestamps in the agent model
-            if result.started_at > 0 { Some(chrono::DateTime::<chrono::Utc>::from_timestamp(result.started_at, 0).unwrap_or_default()) } else { None },
-            if result.finished_at > 0 { Some(chrono::DateTime::<chrono::Utc>::from_timestamp(result.finished_at, 0).unwrap_or_default()) } else { None },
-            result.details,
+            if result.started_at > 0 {
+                Some(
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(result.started_at, 0)
+                        .unwrap_or_default(),
+                )
+            } else {
+                None
+            },
+            if result.finished_at > 0 {
+                Some(
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(result.finished_at, 0)
+                        .unwrap_or_default(),
+                )
+            } else {
+                None
+            },
+            details_json,
         )
         .execute(&self.pool)
         .await
@@ -411,18 +897,27 @@ impl DeploymentService {
                 if let Some(metrics_obj) = details_json.get("metrics").and_then(|v| v.as_object()) {
                     for (k, v) in metrics_obj {
                         if let Some(val) = v.as_f64() {
-                            let lbls = details_json.get("metric_labels").cloned().unwrap_or(serde_json::json!({}));
-                            let _ = self.record_metric(Some(dep_id), agent_id, k, val, lbls).await;
+                            let lbls = details_json
+                                .get("metric_labels")
+                                .cloned()
+                                .unwrap_or(serde_json::json!({}));
+                            let _ = self
+                                .record_metric(Some(dep_id), agent_id, k, val, lbls)
+                                .await;
                         }
                     }
                 }
                 if let Some(err) = details_json.get("http_error_rate").and_then(|v| v.as_f64()) {
                     let lbls = details_json.get("labels").cloned().unwrap_or_default();
-                    let _ = self.record_metric(Some(dep_id), agent_id, "http_error_rate", err, lbls).await;
+                    let _ = self
+                        .record_metric(Some(dep_id), agent_id, "http_error_rate", err, lbls)
+                        .await;
                 }
                 if let Some(p99) = details_json.get("p99_latency_ms").and_then(|v| v.as_f64()) {
                     let lbls = details_json.get("labels").cloned().unwrap_or_default();
-                    let _ = self.record_metric(Some(dep_id), agent_id, "p99_latency_ms", p99, lbls).await;
+                    let _ = self
+                        .record_metric(Some(dep_id), agent_id, "p99_latency_ms", p99, lbls)
+                        .await;
                 }
             }
         }
@@ -468,7 +963,8 @@ impl DeploymentService {
                 error: r.error,
                 started_at: r.started_at,
                 finished_at: r.finished_at,
-                details: r.details,
+                // `job_results.details` is nullable; surface a stable empty object.
+                details: r.details.unwrap_or_else(|| serde_json::json!({})),
                 received_at: r.received_at,
             })
             .collect();
@@ -483,7 +979,7 @@ impl DeploymentService {
     ) -> Result<Option<Deployment>, DeploymentError> {
         let row = sqlx::query!(
             r#"
-            SELECT id, application_id, version, spec, status, created_at, updated_at
+            SELECT id, application_id, version, spec, status, strategy, previous_spec, rollout_state, created_at, updated_at
             FROM deployments
             WHERE id = $1
             "#,
@@ -494,36 +990,190 @@ impl DeploymentService {
         .map_err(|e| DeploymentError::Internal(e.into()))?;
 
         match row {
-            Some(r) => {
-                let status = match r.status.as_str() {
-                    "pending" => DeploymentStatus::Pending,
-                    "in_progress" => DeploymentStatus::InProgress,
-                    "healthy" => DeploymentStatus::Healthy,
-                    "unhealthy" => DeploymentStatus::Unhealthy,
-                    "failed" => DeploymentStatus::Failed,
-                    "rolled_back" => DeploymentStatus::RolledBack,
-                    _ => DeploymentStatus::Pending,
-                };
-
-                let strategy: forge_core::DeploymentStrategy = r.strategy
-                    .map(|v| serde_json::from_value(v).unwrap_or_default())
-                    .unwrap_or_default();
-
-                Ok(Some(Deployment {
-                    id: r.id,
-                    application_id: r.application_id,
-                    version: r.version,
-                    spec: r.spec,
-                    status,
-                    strategy,
-                    previous_spec: None,
-                    rollout_state: serde_json::json!({}),
-                    created_at: r.created_at,
-                    updated_at: r.updated_at,
-                }))
-            }
+            Some(r) => Ok(Some(build_deployment(
+                r.id,
+                r.application_id,
+                r.version,
+                r.spec,
+                &r.status,
+                Some(r.strategy),
+                r.previous_spec,
+                r.rollout_state,
+                r.created_at,
+                r.updated_at,
+            ))),
             None => Ok(None),
         }
+    }
+
+    /// Fetch the agent targets for a deployment (manual rollback/promote need these
+    /// because, unlike create, they have no request body carrying targets).
+    pub async fn get_targets_for_deployment(
+        &self,
+        deployment_id: Uuid,
+    ) -> Result<Vec<forge_core::DeploymentTarget>, DeploymentError> {
+        let rows = sqlx::query!(
+            "SELECT agent_id, replicas FROM deployment_targets WHERE deployment_id = $1",
+            deployment_id
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| forge_core::DeploymentTarget {
+                agent_id: r.agent_id,
+                replicas: r.replicas as u32,
+            })
+            .collect())
+    }
+
+    /// Manual rollback: create a NEW deployment that restores the immediately
+    /// preceding version's spec, and mark the rolled-back-from deployment as
+    /// `RolledBack`. The new deployment snapshots its own `previous_spec`
+    /// (= the rolled-back-from spec, so redo is possible) via `create_deployment`.
+    /// Returns the new deployment so the caller can dispatch it.
+    pub async fn rollback_deployment(
+        &self,
+        deployment_id: Uuid,
+    ) -> Result<Deployment, DeploymentError> {
+        let current = self
+            .get_deployment(deployment_id)
+            .await?
+            .ok_or(DeploymentError::DeploymentNotFound)?;
+
+        let previous_spec = current.previous_spec.clone().ok_or_else(|| {
+            DeploymentError::InvalidInput("no previous version to roll back to".into())
+        })?;
+
+        let targets = self.get_targets_for_deployment(deployment_id).await?;
+
+        let new_dep = self
+            .create_deployment(
+                current.application_id,
+                previous_spec,
+                current.strategy,
+                targets,
+            )
+            .await?;
+
+        self.update_deployment_status(deployment_id, DeploymentStatus::RolledBack)
+            .await?;
+
+        Ok(new_dep)
+    }
+
+    /// Manual promote: for Canary, jump traffic to 100% and mark `Healthy`; for
+    /// Rolling/BlueGreen this is a simple "mark stable". Returns the refreshed
+    /// deployment so the caller can dispatch a full-weight L7 update.
+    pub async fn promote_deployment(
+        &self,
+        deployment_id: Uuid,
+    ) -> Result<Deployment, DeploymentError> {
+        let dep = self
+            .get_deployment(deployment_id)
+            .await?
+            .ok_or(DeploymentError::DeploymentNotFound)?;
+
+        if matches!(dep.strategy, forge_core::DeploymentStrategy::Canary(_)) {
+            let mut rs = dep.rollout_state.clone();
+            rs["current_traffic_percent"] = serde_json::json!(100);
+            rs["phase"] = serde_json::json!("promoted");
+            sqlx::query!(
+                "UPDATE deployments SET rollout_state = $1, status = 'healthy', updated_at = NOW() WHERE id = $2",
+                rs,
+                deployment_id
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DeploymentError::Internal(e.into()))?;
+        } else {
+            self.update_deployment_status(deployment_id, DeploymentStatus::Healthy)
+                .await?;
+        }
+
+        self.get_deployment(deployment_id)
+            .await?
+            .ok_or(DeploymentError::DeploymentNotFound)
+    }
+
+    /// Redeploy: re-ship the current desired state as a new version. Reuses
+    /// `create_deployment` so versioning, previous_spec snapshotting, and target
+    /// fan-out all flow through one path (Slice D criterion 6).
+    pub async fn redeploy_deployment(
+        &self,
+        deployment_id: Uuid,
+    ) -> Result<Deployment, DeploymentError> {
+        let current = self
+            .get_deployment(deployment_id)
+            .await?
+            .ok_or(DeploymentError::DeploymentNotFound)?;
+        let targets = self.get_targets_for_deployment(deployment_id).await?;
+        self.create_deployment(
+            current.application_id,
+            current.spec,
+            current.strategy,
+            targets,
+        )
+        .await
+    }
+
+    /// Queue a signed job for an agent that is currently offline.
+    /// This is the durable "pending dispatch" queue (Slice B).
+    pub async fn queue_pending_dispatch(
+        &self,
+        deployment_id: Uuid,
+        agent_id: Uuid,
+        signed_job: &SignedJob,
+    ) -> Result<(), DeploymentError> {
+        let id = Uuid::now_v7();
+        let job_json =
+            serde_json::to_value(signed_job).map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO pending_dispatches (id, deployment_id, agent_id, signed_job, created_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT DO NOTHING
+            "#,
+            id,
+            deployment_id,
+            agent_id,
+            job_json
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        Ok(())
+    }
+
+    /// Drain and return pending dispatches for an agent (used on reconnect + heartbeat).
+    /// Deletes them after returning so they are only delivered once per drain.
+    pub async fn drain_pending_dispatches_for_agent(
+        &self,
+        agent_id: Uuid,
+    ) -> Result<Vec<(Uuid, SignedJob)>, DeploymentError> {
+        let rows = sqlx::query!(
+            r#"
+            DELETE FROM pending_dispatches
+            WHERE agent_id = $1
+            RETURNING deployment_id, signed_job
+            "#,
+            agent_id
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            if let Ok(job) = serde_json::from_value::<SignedJob>(row.signed_job) {
+                result.push((row.deployment_id, job));
+            }
+        }
+        Ok(result)
     }
 
     /// Find deployments that are in a non-terminal state for a specific agent.
@@ -534,7 +1184,7 @@ impl DeploymentService {
     ) -> Result<Vec<Deployment>, DeploymentError> {
         let rows = sqlx::query!(
             r#"
-            SELECT d.id, d.application_id, d.version, d.spec, d.status, d.created_at, d.updated_at
+            SELECT d.id, d.application_id, d.version, d.spec, d.status, d.strategy, d.previous_spec, d.rollout_state, d.created_at, d.updated_at
             FROM deployments d
             JOIN deployment_targets dt ON dt.deployment_id = d.id
             WHERE dt.agent_id = $1
@@ -547,34 +1197,23 @@ impl DeploymentService {
         .await
         .map_err(|e| DeploymentError::Internal(e.into()))?;
 
-        let mut deployments = Vec::new();
-        for r in rows {
-            let status = match r.status.as_str() {
-                "pending" => DeploymentStatus::Pending,
-                "in_progress" => DeploymentStatus::InProgress,
-                "healthy" => DeploymentStatus::Healthy,
-                "unhealthy" => DeploymentStatus::Unhealthy,
-                "failed" => DeploymentStatus::Failed,
-                "rolled_back" => DeploymentStatus::RolledBack,
-                _ => DeploymentStatus::Pending,
-            };
-
-            let strategy: forge_core::DeploymentStrategy = r.strategy
-                .map(|v| serde_json::from_value(v).unwrap_or_default())
-                .unwrap_or_default();
-            deployments.push(Deployment {
-                id: r.id,
-                application_id: r.application_id,
-                version: r.version,
-                spec: r.spec,
-                status,
-                strategy,
-                previous_spec: None,
-                rollout_state: serde_json::json!({}),
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-            });
-        }
+        let deployments = rows
+            .into_iter()
+            .map(|r| {
+                build_deployment(
+                    r.id,
+                    r.application_id,
+                    r.version,
+                    r.spec,
+                    &r.status,
+                    Some(r.strategy),
+                    r.previous_spec,
+                    r.rollout_state,
+                    r.created_at,
+                    r.updated_at,
+                )
+            })
+            .collect();
         Ok(deployments)
     }
 
@@ -613,7 +1252,7 @@ impl DeploymentService {
     ) -> Result<Option<Deployment>, DeploymentError> {
         let row = sqlx::query!(
             r#"
-            SELECT d.id, d.application_id, d.version, d.spec, d.status, d.strategy, d.rollout_state, d.created_at, d.updated_at
+            SELECT d.id, d.application_id, d.version, d.spec, d.status, d.strategy, d.previous_spec, d.rollout_state, d.created_at, d.updated_at
             FROM deployments d
             JOIN applications a ON d.application_id = a.id
             WHERE a.name = $1
@@ -626,36 +1265,20 @@ impl DeploymentService {
         .await
         .map_err(|e| DeploymentError::Internal(e.into()))?;
 
-        if let Some(r) = row {
-            let status = match r.status.as_str() {
-                "pending" => DeploymentStatus::Pending,
-                "in_progress" => DeploymentStatus::InProgress,
-                "healthy" => DeploymentStatus::Healthy,
-                "unhealthy" => DeploymentStatus::Unhealthy,
-                "failed" => DeploymentStatus::Failed,
-                "rolled_back" => DeploymentStatus::RolledBack,
-                _ => DeploymentStatus::Pending,
-            };
-
-            let strategy: forge_core::DeploymentStrategy = r.strategy
-                .map(|v| serde_json::from_value(v).unwrap_or_default())
-                .unwrap_or_default();
-
-            Ok(Some(Deployment {
-                id: r.id,
-                application_id: r.application_id,
-                version: r.version,
-                spec: r.spec,
-                status,
-                strategy,
-                previous_spec: None,
-                rollout_state: r.rollout_state.unwrap_or(serde_json::json!({})),
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-            }))
-        } else {
-            Ok(None)
-        }
+        Ok(row.map(|r| {
+            build_deployment(
+                r.id,
+                r.application_id,
+                r.version,
+                r.spec,
+                &r.status,
+                Some(r.strategy),
+                r.previous_spec,
+                r.rollout_state,
+                r.created_at,
+                r.updated_at,
+            )
+        }))
     }
 
     pub async fn query_deployment_metrics(
@@ -716,10 +1339,14 @@ impl DeploymentService {
         use std::collections::BTreeMap;
 
         let since = Utc::now() - chrono::Duration::minutes(12);
-        let rows = self.query_deployment_metrics(deployment_id, None, Some(since), None, 300).await?;
+        let rows = self
+            .query_deployment_metrics(deployment_id, None, Some(since), None, 300)
+            .await?;
 
-        // Bucket into 60-second windows keyed by unix minute
-        let mut windows: BTreeMap<i64, (Vec<f64>, Vec<f64>, Vec<f64>)> = BTreeMap::new(); // (canary_err, baseline_err, p99s)
+        // Bucket into 60-second windows keyed by unix minute.
+        // Per-window samples: (canary error rates, baseline error rates, p99 latencies).
+        type MetricWindow = (Vec<f64>, Vec<f64>, Vec<f64>);
+        let mut windows: BTreeMap<i64, MetricWindow> = BTreeMap::new();
 
         for m in rows {
             let name = m["metric_name"].as_str().unwrap_or("");
@@ -731,7 +1358,9 @@ impl DeploymentService {
             let bucket = ts.timestamp() / 60;
 
             let labels = &m["labels"];
-            let variant = labels.get("version").and_then(|v| v.as_str())
+            let variant = labels
+                .get("version")
+                .and_then(|v| v.as_str())
                 .or_else(|| labels.get("variant").and_then(|v| v.as_str()))
                 .unwrap_or("");
             let is_canary = variant.eq_ignore_ascii_case("canary")
@@ -740,8 +1369,15 @@ impl DeploymentService {
 
             let entry = windows.entry(bucket).or_insert((vec![], vec![], vec![]));
             if name == "http_error_rate" || name.contains("error_rate") {
-                if is_canary { entry.0.push(val); } else { entry.1.push(val); }
-            } else if name.contains("p99") || name.contains("latency_p99") || name == "p99_latency_ms" {
+                if is_canary {
+                    entry.0.push(val);
+                } else {
+                    entry.1.push(val);
+                }
+            } else if name.contains("p99")
+                || name.contains("latency_p99")
+                || name == "p99_latency_ms"
+            {
                 entry.2.push(val);
             }
         }
@@ -755,17 +1391,27 @@ impl DeploymentService {
             if let Some((c_errs, b_errs, p99s)) = windows.get(&b) {
                 let c_err = if !c_errs.is_empty() {
                     c_errs.iter().sum::<f64>() / c_errs.len() as f64
-                } else { f64::NAN };
+                } else {
+                    f64::NAN
+                };
                 let b_err = if !b_errs.is_empty() {
                     b_errs.iter().sum::<f64>() / b_errs.len() as f64
                 } else if !c_errs.is_empty() {
                     c_errs.iter().sum::<f64>() / c_errs.len() as f64
-                } else { 0.0 };
+                } else {
+                    0.0
+                };
                 let p99 = if !p99s.is_empty() {
                     p99s.iter().cloned().fold(f64::NAN, f64::max)
-                } else { 0.0 };
+                } else {
+                    0.0
+                };
 
-                let err_ok = if c_err.is_nan() { false } else { c_err <= (b_err * 1.05).max(0.005) };
+                let err_ok = if c_err.is_nan() {
+                    false
+                } else {
+                    c_err <= (b_err * 1.05).max(0.005)
+                };
                 let lat_ok = p99.is_nan() || p99 < 350.0;
                 let good = err_ok && lat_ok;
 
@@ -814,9 +1460,13 @@ impl DeploymentService {
         config: serde_json::Value,
     ) -> Result<serde_json::Value, DeploymentError> {
         if name.trim().is_empty() || name.len() > 128 {
-            return Err(DeploymentError::InvalidInput("name must be 1-128 chars".into()));
+            return Err(DeploymentError::InvalidInput(
+                "name must be 1-128 chars".into(),
+            ));
         }
-        let allowed = ["email", "discord", "slack", "telegram", "webhook", "pushover"];
+        let allowed = [
+            "email", "discord", "slack", "telegram", "webhook", "pushover",
+        ];
         if !allowed.contains(&channel_type) {
             return Err(DeploymentError::InvalidInput("invalid channel_type".into()));
         }
@@ -849,7 +1499,9 @@ impl DeploymentService {
     }
 
     /// List all channels (admin).
-    pub async fn list_notification_channels(&self) -> Result<Vec<serde_json::Value>, DeploymentError> {
+    pub async fn list_notification_channels(
+        &self,
+    ) -> Result<Vec<serde_json::Value>, DeploymentError> {
         let rows = sqlx::query!(
             r#"
             SELECT id, name, channel_type, config, enabled, created_at, updated_at
@@ -862,15 +1514,20 @@ impl DeploymentService {
         .await
         .map_err(|e| DeploymentError::Internal(e.into()))?;
 
-        let out = rows.into_iter().map(|r| serde_json::json!({
-            "id": r.id,
-            "name": r.name,
-            "channel_type": r.channel_type,
-            "config": r.config,
-            "enabled": r.enabled,
-            "created_at": r.created_at.to_rfc3339(),
-            "updated_at": r.updated_at.to_rfc3339()
-        })).collect();
+        let out = rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "name": r.name,
+                    "channel_type": r.channel_type,
+                    "config": r.config,
+                    "enabled": r.enabled,
+                    "created_at": r.created_at.to_rfc3339(),
+                    "updated_at": r.updated_at.to_rfc3339()
+                })
+            })
+            .collect();
 
         Ok(out)
     }
@@ -886,7 +1543,9 @@ impl DeploymentService {
     ) -> Result<serde_json::Value, DeploymentError> {
         let allowed_resources = ["deployment", "application", "agent", "system"];
         if !allowed_resources.contains(&resource_type) {
-            return Err(DeploymentError::InvalidInput("invalid resource_type".into()));
+            return Err(DeploymentError::InvalidInput(
+                "invalid resource_type".into(),
+            ));
         }
 
         let id = Uuid::now_v7();
@@ -942,16 +1601,21 @@ impl DeploymentService {
         .await
         .map_err(|e| DeploymentError::Internal(e.into()))?;
 
-        let out = rows.into_iter().map(|r| serde_json::json!({
-            "id": r.id,
-            "resource_type": r.resource_type,
-            "resource_id": r.resource_id,
-            "channel_id": r.channel_id,
-            "events": r.events,
-            "filters": r.filters,
-            "enabled": r.enabled,
-            "created_at": r.created_at.to_rfc3339()
-        })).collect();
+        let out = rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "resource_type": r.resource_type,
+                    "resource_id": r.resource_id,
+                    "channel_id": r.channel_id,
+                    "events": r.events,
+                    "filters": r.filters,
+                    "enabled": r.enabled,
+                    "created_at": r.created_at.to_rfc3339()
+                })
+            })
+            .collect();
 
         Ok(out)
     }
@@ -986,7 +1650,8 @@ impl DeploymentService {
         for sub in subs {
             // Simple event match (events is JSONB array of strings)
             let matches_event = if let Some(arr) = sub.events.as_array() {
-                arr.iter().any(|v| v.as_str().map_or(false, |s| s == event_type || s == "*"))
+                arr.iter()
+                    .any(|v| v.as_str().is_some_and(|s| s == event_type || s == "*"))
             } else {
                 true
             };
@@ -1170,15 +1835,19 @@ impl DeploymentService {
         targets: Vec<forge_core::DeploymentTarget>,
     ) -> Result<Deployment, DeploymentError> {
         let catalog = Self::load_catalog();
-        let template = catalog.into_iter()
+        let template = catalog
+            .into_iter()
             .find(|t| t.id == template_id)
-            .ok_or_else(|| DeploymentError::InvalidInput(format!("Unknown catalog template: {}", template_id)))?;
+            .ok_or_else(|| {
+                DeploymentError::InvalidInput(format!("Unknown catalog template: {template_id}"))
+            })?;
 
         // v1: use the template spec directly (rich multi-container already works).
         // Full $VAR + password hydration coming in the immediate follow-up.
         let strategy = strategy.unwrap_or(template.default_strategy);
 
-        self.create_deployment(application_id, template.spec, strategy, targets).await
+        self.create_deployment(application_id, template.spec, strategy, targets)
+            .await
     }
 
     // =====================================================================
@@ -1187,6 +1856,9 @@ impl DeploymentService {
     // Integrates with the notification system (backup.success / backup.failed).
     // =====================================================================
 
+    // Mirrors the `backup_schedules` columns 1:1; grouping into a struct would just
+    // duplicate the table shape, so the explicit parameter list is intentional.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_backup_schedule(
         &self,
         deployment_id: Uuid,
@@ -1260,25 +1932,32 @@ impl DeploymentService {
         .await
         .map_err(|e| DeploymentError::Internal(e.into()))?;
 
-        let result = rows.into_iter().map(|r| serde_json::json!({
-            "id": r.id,
-            "name": r.name,
-            "db_type": r.db_type,
-            "database_name": r.database_name,
-            "schedule_type": r.schedule_type,
-            "schedule_value": r.schedule_value,
-            "retention_days": r.retention_days,
-            "s3_bucket": r.s3_bucket,
-            "enabled": r.enabled,
-            "last_run_at": r.last_run_at.map(|t| t.to_rfc3339()),
-            "created_at": r.created_at.to_rfc3339()
-        })).collect();
+        let result = rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "name": r.name,
+                    "db_type": r.db_type,
+                    "database_name": r.database_name,
+                    "schedule_type": r.schedule_type,
+                    "schedule_value": r.schedule_value,
+                    "retention_days": r.retention_days,
+                    "s3_bucket": r.s3_bucket,
+                    "enabled": r.enabled,
+                    "last_run_at": r.last_run_at.map(|t| t.to_rfc3339()),
+                    "created_at": r.created_at.to_rfc3339()
+                })
+            })
+            .collect();
 
         Ok(result)
     }
 
     /// Dispatch a manual or scheduled backup job to the agent(s) running this deployment.
     /// This is the main entry point that creates a backup_execution record and sends Job::Backup.
+    // Parameters map directly to the backup execution + S3 destination fields.
+    #[allow(clippy::too_many_arguments)]
     pub async fn trigger_backup(
         &self,
         deployment_id: Uuid,
@@ -1310,33 +1989,12 @@ impl DeploymentService {
         .await
         .map_err(|e| DeploymentError::Internal(e.into()))?;
 
-        // Build S3 config if provided (passed in the signed job)
-        let s3_config = if let (Some(endpoint), Some(bucket)) = (s3_endpoint, s3_bucket) {
-            let key = format!(
-                "{}/{}/backup-{}.sql.gz",
-                s3_key_prefix.unwrap_or("backups"),
-                deployment_id,
-                now.timestamp()
-            );
-            Some(serde_json::json!({
-                "endpoint": endpoint,
-                "bucket": bucket,
-                "key": key
-            }))
-        } else {
-            None
-        };
-
-        // For now we dispatch a generic Job::Exec that runs the dump.
-        // In a follow-up we will add a dedicated Job::Backup variant on the agent side.
-        // This keeps the feature complete and working today.
-        let dump_command = match db_type {
-            "postgres" | "postgresql" => {
-                let db = database_name.unwrap_or("postgres");
-                vec!["sh".to_string(), "-c".to_string(), format!("pg_dump -U postgres -d {} --clean --if-exists", db)]
-            }
-            _ => vec!["echo".to_string(), "Backup not yet implemented for this DB type".to_string()],
-        };
+        // The S3 destination and dump command are materialized by the dispatcher
+        // (agent_ws) when it builds the signed `Job::Backup` from this execution row.
+        // `trigger_backup` owns only creating the pending execution record and
+        // returning its id; the remaining inputs are part of that row's downstream
+        // contract and are intentionally not consumed here.
+        let _ = (s3_endpoint, s3_bucket, s3_key_prefix, database_name);
 
         // We return the execution id so the caller (or heartbeat reconciliation) can send the actual job.
         // For manual trigger from admin route we will send the job immediately after this call.
@@ -1364,24 +2022,31 @@ impl DeploymentService {
         .await
         .map_err(|e| DeploymentError::Internal(e.into()))?;
 
-        let result = rows.into_iter().map(|r| serde_json::json!({
-            "id": r.id,
-            "schedule_id": r.schedule_id,
-            "status": r.status,
-            "db_type": r.db_type,
-            "size_bytes": r.size_bytes,
-            "location": r.location,
-            "started_at": r.started_at.map(|t| t.to_rfc3339()),
-            "finished_at": r.finished_at.map(|t| t.to_rfc3339()),
-            "error": r.error,
-            "created_at": r.created_at.to_rfc3339()
-        })).collect();
+        let result = rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "schedule_id": r.schedule_id,
+                    "status": r.status,
+                    "db_type": r.db_type,
+                    "size_bytes": r.size_bytes,
+                    "location": r.location,
+                    "started_at": r.started_at.map(|t| t.to_rfc3339()),
+                    "finished_at": r.finished_at.map(|t| t.to_rfc3339()),
+                    "error": r.error,
+                    "created_at": r.created_at.to_rfc3339()
+                })
+            })
+            .collect();
 
         Ok(result)
     }
 
     /// Called when we receive a JobResult for a backup job.
     /// Updates the execution record and triggers notifications.
+    // Invoked from the agent JobResult handler once the Backup result variant is routed.
+    #[allow(dead_code)]
     pub async fn record_backup_result(
         &self,
         execution_id: Uuid,
@@ -1422,18 +2087,25 @@ impl DeploymentService {
         .fetch_optional(&self.pool)
         .await
         {
-            let event = if success { "backup.success" } else { "backup.failed" };
-            let _ = self.trigger_notifications(
-                event,
-                "deployment",
-                Some(exec.deployment_id),
-                serde_json::json!({
-                    "backup_execution_id": execution_id,
-                    "success": success,
-                    "size_bytes": size_bytes,
-                    "location": location
-                }),
-            ).await;
+            let event = if success {
+                "backup.success"
+            } else {
+                "backup.failed"
+            };
+            let _ = self
+                .trigger_notifications(
+                    event,
+                    "deployment",
+                    // `deployment_id` is already nullable from the row.
+                    exec.deployment_id,
+                    serde_json::json!({
+                        "backup_execution_id": execution_id,
+                        "success": success,
+                        "size_bytes": size_bytes,
+                        "location": location
+                    }),
+                )
+                .await;
         }
 
         Ok(())
@@ -1523,8 +2195,9 @@ impl DeploymentService {
             })
         } else {
             // Use the production encrypt helper (age multi-recipient, one ciphertext any of them can open).
-            let ct = forge_agent::job::encrypt_secret_for_recipients(plaintext.as_bytes(), &recipients)
-                .map_err(|e| DeploymentError::Internal(e.into()))?;
+            let ct =
+                forge_agent::job::encrypt_secret_for_recipients(plaintext.as_bytes(), &recipients)
+                    .map_err(|e| DeploymentError::Internal(e.into()))?;
             serde_json::to_value(&ct).map_err(|e| DeploymentError::Internal(e.into()))?
         };
 
@@ -1570,18 +2243,21 @@ impl DeploymentService {
         .await
         .map_err(|e| DeploymentError::Internal(e.into()))?;
 
-        let list = rows.into_iter().map(|r| {
-            // Never include any decrypted value. The blob is opaque ciphertext.
-            serde_json::json!({
-                "id": r.id,
-                "name": r.name,
-                "description": r.description,
-                "encrypted_blob": r.encrypted_blob,
-                "enabled": r.enabled,
-                "created_at": r.created_at,
-                "last_rotated_at": r.last_rotated_at
+        let list = rows
+            .into_iter()
+            .map(|r| {
+                // Never include any decrypted value. The blob is opaque ciphertext.
+                serde_json::json!({
+                    "id": r.id,
+                    "name": r.name,
+                    "description": r.description,
+                    "encrypted_blob": r.encrypted_blob,
+                    "enabled": r.enabled,
+                    "created_at": r.created_at,
+                    "last_rotated_at": r.last_rotated_at
+                })
             })
-        }).collect();
+            .collect();
 
         Ok(list)
     }
@@ -1595,15 +2271,17 @@ impl DeploymentService {
         .await
         .map_err(|e| DeploymentError::Internal(e.into()))?;
 
-        Ok(row.map(|r| serde_json::json!({
-            "id": r.id,
-            "name": r.name,
-            "description": r.description,
-            "encrypted_blob": r.encrypted_blob,
-            "enabled": r.enabled,
-            "created_at": r.created_at,
-            "last_rotated_at": r.last_rotated_at
-        })))
+        Ok(row.map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "name": r.name,
+                "description": r.description,
+                "encrypted_blob": r.encrypted_blob,
+                "enabled": r.enabled,
+                "created_at": r.created_at,
+                "last_rotated_at": r.last_rotated_at
+            })
+        }))
     }
 
     pub async fn rotate_secret(
@@ -1632,8 +2310,11 @@ impl DeploymentService {
                 "note": "Rotated while no agents had recipients. Rotate again after enrollment."
             })
         } else {
-            let ct = forge_agent::job::encrypt_secret_for_recipients(new_plaintext.as_bytes(), &recipients)
-                .map_err(|e| DeploymentError::Internal(e.into()))?;
+            let ct = forge_agent::job::encrypt_secret_for_recipients(
+                new_plaintext.as_bytes(),
+                &recipients,
+            )
+            .map_err(|e| DeploymentError::Internal(e.into()))?;
             serde_json::to_value(&ct).map_err(|e| DeploymentError::Internal(e.into()))?
         };
 
@@ -1683,18 +2364,24 @@ impl DeploymentService {
         let private_key = ssh_key::PrivateKey::random(&mut rng, ssh_key::Algorithm::Ed25519)
             .map_err(|e| DeploymentError::Internal(e.into()))?;
 
-        let public_key = private_key.public_key().to_openssh().map_err(|e| DeploymentError::Internal(e.into()))?;
-        let private_openssh = private_key.to_openssh(ssh_key::LineEnding::LF)
+        let public_key = private_key
+            .public_key()
+            .to_openssh()
+            .map_err(|e| DeploymentError::Internal(e.into()))?;
+        let private_openssh = private_key
+            .to_openssh(ssh_key::LineEnding::LF)
             .map_err(|e| DeploymentError::Internal(e.into()))?
             .to_string();
 
         // Store the private key using the existing secret machinery (gets age-encrypted for agents automatically).
         // We pass the raw private key bytes as "plaintext" — it will be encrypted in create_secret.
-        let secret = self.create_secret(
-            &format!("ssh-{}", name.trim()),
-            description,
-            &private_openssh,
-        ).await?;
+        let secret = self
+            .create_secret(
+                &format!("ssh-{}", name.trim()),
+                description,
+                &private_openssh,
+            )
+            .await?;
 
         // The create_secret response includes the id and (for this call) the plaintext — but we ignore the plaintext here.
         // We only surface the public key to the user.
@@ -1721,14 +2408,19 @@ impl DeploymentService {
         .await
         .map_err(|e| DeploymentError::Internal(e.into()))?;
 
-        let result = rows.into_iter().map(|r| serde_json::json!({
-            "id": r.id,
-            "name": r.name,
-            "provider": r.provider,
-            "installation_id": r.installation_id,
-            "enabled": r.enabled,
-            "created_at": r.created_at.to_rfc3339()
-        })).collect();
+        let result = rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "name": r.name,
+                    "provider": r.provider,
+                    "installation_id": r.installation_id,
+                    "enabled": r.enabled,
+                    "created_at": r.created_at.to_rfc3339()
+                })
+            })
+            .collect();
 
         Ok(result)
     }
@@ -1739,7 +2431,9 @@ impl DeploymentService {
     pub async fn handle_git_webhook(
         &self,
         source_id: Uuid,
-        provider: &str,
+        // `provider` is part of the route contract but not yet branched on here
+        // (push/PR parsing is provider-agnostic for the GitHub/GitLab shapes handled).
+        _provider: &str,
         signature: Option<&str>,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, DeploymentError> {
@@ -1753,11 +2447,16 @@ impl DeploymentService {
         .map_err(|e| DeploymentError::Internal(e.into()))?;
 
         if source.is_none() {
-            return Err(DeploymentError::InvalidInput("Git source not found or disabled".into()));
+            return Err(DeploymentError::InvalidInput(
+                "Git source not found or disabled".into(),
+            ));
         }
 
         let config = source.unwrap().config;
-        let secret = config.get("webhook_secret").and_then(|v| v.as_str()).unwrap_or("");
+        let secret = config
+            .get("webhook_secret")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         // Improved basic signature validation for real GitHub/GitLab webhooks (Tier 1 e2e testing support).
         // GitHub: header is "sha256=<hex>", we strip prefix and do best-effort check.
@@ -1768,35 +2467,52 @@ impl DeploymentService {
                 if !sig_clean.contains(secret) && !sig_clean.ends_with(secret) {
                     // Note: this is still weak string match for demo; real HMAC needed for prod.
                     // For testing with real repos, you can temporarily set a simple secret or enhance validation.
-                    warn!("Webhook signature present but basic check inconclusive for source {}", source_id);
+                    warn!(
+                        "Webhook signature present but basic check inconclusive for source {}",
+                        source_id
+                    );
                     // Do not hard fail in v1 to allow e2e testing; log only.
                 }
             }
         }
 
         // Parse common GitHub / GitLab style payloads for PR/push
-        let event_type = payload.get("action").or(payload.get("object_kind")).map(|v| v.to_string()).unwrap_or_default();
+        let event_type = payload
+            .get("action")
+            .or(payload.get("object_kind"))
+            .map(|v| v.to_string())
+            .unwrap_or_default();
 
-        let is_pr = event_type.contains("pull_request") || payload.get("object_kind").map_or(false, |v| v == "merge_request");
+        let is_pr = event_type.contains("pull_request")
+            || payload
+                .get("object_kind")
+                .is_some_and(|v| v == "merge_request");
 
         // Extract some info for realism (best effort)
-        let repo_name = payload["repository"]["full_name"].as_str()
+        let repo_name = payload["repository"]["full_name"]
+            .as_str()
             .or_else(|| payload["project"]["path_with_namespace"].as_str())
             .unwrap_or("unknown-repo");
 
         let commit_or_pr = if is_pr {
-            payload["pull_request"]["number"].as_i64()
+            payload["pull_request"]["number"]
+                .as_i64()
                 .or_else(|| payload["object_attributes"]["iid"].as_i64())
-                .map(|n| format!("pr-{}", n))
+                .map(|n| format!("pr-{n}"))
                 .unwrap_or_else(|| "pr-unknown".to_string())
         } else {
-            payload["after"].as_str()
+            payload["after"]
+                .as_str()
                 .or_else(|| payload["checkout_sha"].as_str())
                 .unwrap_or("push")
                 .to_string()
         };
 
-        let preview_name = format!("{}-{}", repo_name.split('/').last().unwrap_or("preview"), commit_or_pr);
+        let preview_name = format!(
+            "{}-{}",
+            repo_name.split('/').next_back().unwrap_or("preview"),
+            commit_or_pr
+        );
 
         // Build preview spec. If the git source has an associated SSH key secret, include git_checkout
         // so the agent (with the key injected via secrets) can perform a real private repo clone.
@@ -1812,23 +2528,34 @@ impl DeploymentService {
 
         // Check if this git source has an SSH key configured (stored as secret reference in config)
         let mut secrets_array = Vec::new();
-        if let Ok(Some(source_row)) = sqlx::query!(
-            "SELECT config FROM git_sources WHERE id = $1",
-            source_id
-        ).fetch_optional(&self.pool).await {
-            if let Some(ssh_id_str) = source_row.config.get("ssh_key_secret_id").and_then(|v| v.as_str()) {
+        if let Ok(Some(source_row)) =
+            sqlx::query!("SELECT config FROM git_sources WHERE id = $1", source_id)
+                .fetch_optional(&self.pool)
+                .await
+        {
+            if let Some(ssh_id_str) = source_row
+                .config
+                .get("ssh_key_secret_id")
+                .and_then(|v| v.as_str())
+            {
                 if let Ok(ssh_secret_id) = Uuid::parse_str(ssh_id_str) {
                     // Fetch the already-encrypted secret so we can include it in the spec for the agent
                     if let Ok(Some(secret_row)) = sqlx::query!(
                         "SELECT encrypted_blob FROM secrets WHERE id = $1",
                         ssh_secret_id
-                    ).fetch_optional(&self.pool).await {
+                    )
+                    .fetch_optional(&self.pool)
+                    .await
+                    {
                         if let Some(obj) = preview_spec.as_object_mut() {
-                            obj.insert("git_checkout".to_string(), serde_json::json!({
-                                "url": format!("git@github.com:{}.git", repo_name),
-                                "ref": if is_pr { "main" } else { "HEAD" },
-                                "ssh_key_secret_name": format!("ssh-{}", ssh_id_str)
-                            }));
+                            obj.insert(
+                                "git_checkout".to_string(),
+                                serde_json::json!({
+                                    "url": format!("git@github.com:{}.git", repo_name),
+                                    "ref": if is_pr { "main" } else { "HEAD" },
+                                    "ssh_key_secret_name": format!("ssh-{}", ssh_id_str)
+                                }),
+                            );
                         }
                         // Include the SSH secret in the spec.secrets so the agent can decrypt and use the key file
                         if let Some(blob) = secret_row.encrypted_blob.as_object() {
@@ -1849,7 +2576,10 @@ impl DeploymentService {
 
         if !secrets_array.is_empty() {
             if let Some(obj) = preview_spec.as_object_mut() {
-                obj.insert("secrets".to_string(), serde_json::Value::Array(secrets_array));
+                obj.insert(
+                    "secrets".to_string(),
+                    serde_json::Value::Array(secrets_array),
+                );
             }
         }
 
@@ -1857,12 +2587,12 @@ impl DeploymentService {
         // We use a dummy application for previews or create one on the fly in real impl.
         // For this slice, we create the deployment record directly (reusing the pattern).
         // Note: In production you'd resolve or create a proper "preview app".
-        let dummy_app_id = sqlx::query_scalar!(
-            "SELECT id FROM applications ORDER BY created_at LIMIT 1"
-        )
-        .fetch_optional(&self.pool)
-        .await?
-        .unwrap_or(Uuid::nil());  // fallback, user should have at least one app
+        let dummy_app_id =
+            sqlx::query_scalar!("SELECT id FROM applications ORDER BY created_at LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| DeploymentError::Internal(e.into()))?
+                .unwrap_or(Uuid::nil()); // fallback, user should have at least one app
 
         if dummy_app_id == Uuid::nil() {
             return Ok(serde_json::json!({
@@ -1873,18 +2603,20 @@ impl DeploymentService {
             }));
         }
 
-        let preview_deployment = self.create_deployment(
-            dummy_app_id,
-            preview_spec,
-            forge_core::DeploymentStrategy::Rolling(forge_core::RollingConfig {
-                max_unavailable: 0,
-                max_surge: 1,
-                health_check_grace_period_secs: 10,
-                rollback_on_failure: true,
-                failure_threshold: 2,
-            }),
-            vec![], // targets would be resolved from agents in real flow
-        ).await?;
+        let preview_deployment = self
+            .create_deployment(
+                dummy_app_id,
+                preview_spec,
+                forge_core::DeploymentStrategy::Rolling(forge_core::RollingConfig {
+                    max_unavailable: 0,
+                    max_surge: 1,
+                    health_check_grace_period_secs: 10,
+                    rollback_on_failure: true,
+                    failure_threshold: 2,
+                }),
+                vec![], // targets would be resolved from agents in real flow
+            )
+            .await?;
 
         // Link git metadata
         sqlx::query!(
@@ -1895,7 +2627,8 @@ impl DeploymentService {
             preview_deployment.id
         )
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
 
         Ok(serde_json::json!({
             "received": true,
@@ -1905,5 +2638,176 @@ impl DeploymentService {
             "preview_name": preview_name,
             "note": "Real preview deployment created and linked to git source. It will be reconciled when an agent connects."
         }))
+    }
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    //! Phase 2 rollback fix — integration tests against real Postgres (`#[sqlx::test]`
+    //! provisions an isolated DB and runs `./migrations`). These prove `previous_spec`
+    //! is captured, persisted, and read back, and that rollback restores the correct
+    //! prior spec instead of `null` (the latent production bug this change fixes).
+    use super::*;
+    use forge_core::{DeploymentStatus, DeploymentStrategy, DeploymentTarget, RollingConfig};
+    use serde_json::json;
+    use sqlx::PgPool;
+
+    /// Build a `DeploymentService` for tests. RBAC is wired but every mutation in
+    /// these tests passes `principal_id = None` (bootstrap path), so the engine is
+    /// present but not exercised here (its matcher has dedicated unit tests in `rbac.rs`).
+    fn svc_with(pool: PgPool) -> DeploymentService {
+        let rbac = std::sync::Arc::new(crate::rbac::RbacService::new(pool.clone()));
+        DeploymentService::new(pool, rbac)
+    }
+
+    fn rolling() -> DeploymentStrategy {
+        DeploymentStrategy::Rolling(RollingConfig {
+            max_unavailable: 1,
+            max_surge: 1,
+            health_check_grace_period_secs: 30,
+            rollback_on_failure: true,
+            failure_threshold: 3,
+        })
+    }
+
+    fn spec(image: &str) -> serde_json::Value {
+        json!({ "containers": [{ "name": "web", "image": image }] })
+    }
+
+    #[sqlx::test]
+    async fn previous_spec_is_snapshotted_and_read_back(pool: PgPool) {
+        let svc = svc_with(pool);
+        let app = svc
+            .create_application("snap-app", None, None)
+            .await
+            .unwrap();
+
+        let v1 = svc
+            .create_deployment(app.id, spec("nginx:1"), rolling(), vec![])
+            .await
+            .unwrap();
+        assert_eq!(v1.version, 1);
+        assert!(
+            v1.previous_spec.is_none(),
+            "first version has no predecessor"
+        );
+
+        let v2 = svc
+            .create_deployment(app.id, spec("nginx:2"), rolling(), vec![])
+            .await
+            .unwrap();
+        assert_eq!(v2.version, 2);
+        assert_eq!(
+            v2.previous_spec.as_ref(),
+            Some(&spec("nginx:1")),
+            "v2 captures v1's spec"
+        );
+
+        // Regression guard: the read path must return previous_spec + rollout_state
+        // (hardcoded None / {} before the fix, which silently broke the heartbeat engine).
+        let fetched = svc.get_deployment(v2.id).await.unwrap().unwrap();
+        assert_eq!(fetched.previous_spec.as_ref(), Some(&spec("nginx:1")));
+        assert!(
+            fetched.rollout_state.get("phase").is_some(),
+            "rollout_state persisted and read back"
+        );
+    }
+
+    #[sqlx::test]
+    async fn rollback_restores_previous_spec_as_new_version(pool: PgPool) {
+        let svc = svc_with(pool);
+        let app = svc.create_application("rb-app", None, None).await.unwrap();
+
+        svc.create_deployment(app.id, spec("nginx:1"), rolling(), vec![])
+            .await
+            .unwrap();
+        let v2 = svc
+            .create_deployment(app.id, spec("nginx:2"), rolling(), vec![])
+            .await
+            .unwrap();
+
+        let v3 = svc.rollback_deployment(v2.id).await.unwrap();
+        assert_eq!(v3.version, 3, "rollback is a new immutable version");
+        assert_eq!(
+            v3.spec,
+            spec("nginx:1"),
+            "rolled back to v1's real spec, not null"
+        );
+        assert_eq!(
+            v3.previous_spec.as_ref(),
+            Some(&spec("nginx:2")),
+            "v3 snapshots the rolled-back-from spec so a redo is possible"
+        );
+
+        let v2_after = svc.get_deployment(v2.id).await.unwrap().unwrap();
+        assert_eq!(v2_after.status, DeploymentStatus::RolledBack);
+    }
+
+    #[sqlx::test]
+    async fn rollback_without_predecessor_is_rejected(pool: PgPool) {
+        let svc = svc_with(pool);
+        let app = svc
+            .create_application("nopre-app", None, None)
+            .await
+            .unwrap();
+        let v1 = svc
+            .create_deployment(app.id, spec("nginx:1"), rolling(), vec![])
+            .await
+            .unwrap();
+
+        let err = svc.rollback_deployment(v1.id).await.unwrap_err();
+        assert!(
+            matches!(err, DeploymentError::InvalidInput(_)),
+            "no previous version → client error, not a null rollback"
+        );
+    }
+
+    #[sqlx::test]
+    async fn active_deployments_carry_real_rollout_state_and_previous_spec(pool: PgPool) {
+        // get_active_deployments_for_agent is the heartbeat engine's source; this proves
+        // it now returns real rollout_state + previous_spec instead of {} / None.
+        let svc = svc_with(pool.clone());
+        let app = svc
+            .create_application("active-app", None, None)
+            .await
+            .unwrap();
+
+        // Minimal agent so the deployment_targets FK is satisfied.
+        let agent_id = Uuid::now_v7();
+        sqlx::query("INSERT INTO agents (id, public_key) VALUES ($1, $2)")
+            .bind(agent_id)
+            .bind(agent_id.as_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let target = vec![DeploymentTarget {
+            agent_id,
+            replicas: 1,
+        }];
+
+        svc.create_deployment(app.id, spec("nginx:1"), rolling(), target.clone())
+            .await
+            .unwrap();
+        svc.create_deployment(app.id, spec("nginx:2"), rolling(), target)
+            .await
+            .unwrap();
+
+        let active = svc
+            .get_active_deployments_for_agent(agent_id)
+            .await
+            .unwrap();
+        let v2 = active
+            .iter()
+            .find(|d| d.version == 2)
+            .expect("v2 is active");
+        assert_eq!(
+            v2.previous_spec.as_ref(),
+            Some(&spec("nginx:1")),
+            "heartbeat source returns real previous_spec"
+        );
+        assert!(
+            v2.rollout_state.get("phase").is_some(),
+            "heartbeat source returns real rollout_state"
+        );
     }
 }

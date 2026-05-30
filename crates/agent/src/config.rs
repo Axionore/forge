@@ -1,8 +1,8 @@
 //! Agent configuration.
 
 use figment::{
-    providers::{Env, Format, Toml},
     Figment,
+    providers::{Env, Format, Toml},
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -63,7 +63,9 @@ pub struct AgentConfig {
     pub ssh_port: u16,
 }
 
-fn default_ssh_port() -> u16 { 22 }
+fn default_ssh_port() -> u16 {
+    22
+}
 
 fn default_wg_interface() -> String {
     "wg0".to_string()
@@ -91,8 +93,7 @@ fn default_docker_socket() -> String {
 
 impl AgentConfig {
     pub fn from_env_and_file(path: Option<&Path>) -> Result<Self, Box<figment::Error>> {
-        let mut figment = Figment::new()
-            .merge(Env::prefixed("FORGE_AGENT_").split("_"));
+        let mut figment = Figment::new().merge(Env::prefixed("FORGE_AGENT_").split("_"));
 
         if let Some(p) = path {
             figment = figment.merge(Toml::file(p));

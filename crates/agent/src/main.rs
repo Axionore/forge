@@ -7,11 +7,11 @@ use std::path::PathBuf;
 
 use ed25519_dalek::VerifyingKey;
 use forge_agent::{
+    AgentError,
     config::AgentConfig,
     execution::execute_job,
     receiver::{AgentTelemetry, ControlPlaneJobReceiver, MockJobReceiver},
     verification::verify_and_attest_job,
-    AgentError,
 };
 use std::time::Duration;
 
@@ -39,9 +39,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Forge Agent starting");
 
-    let config_path = std::env::var("FORGE_AGENT_CONFIG")
-        .ok()
-        .map(PathBuf::from);
+    let config_path = std::env::var("FORGE_AGENT_CONFIG").ok().map(PathBuf::from);
 
     let config = AgentConfig::from_env_and_file(config_path.as_deref())
         .map_err(|e| AgentError::Config(e.to_string()))?;
@@ -74,9 +72,9 @@ async fn main() -> anyhow::Result<()> {
     let mut identity = forge_agent::identity::load_or_create_identity(&config)?;
 
     if identity.control_plane_public_key.is_none() || identity.agent_id.is_none() {
-        if let Err(e) = tokio::runtime::Handle::current()
-            .block_on(forge_agent::identity::enroll_if_needed(&config, &mut identity))
-        {
+        if let Err(e) = tokio::runtime::Handle::current().block_on(
+            forge_agent::identity::enroll_if_needed(&config, &mut identity),
+        ) {
             error!(error = %e, "Agent enrollment failed — this is fatal on first run");
             // Production: do not continue without successful enrollment.
             // The excellent error message above guides the operator.
@@ -85,7 +83,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let control_plane_public_key = if let Some(bytes) = &identity.control_plane_public_key {
-        if let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(bytes.as_slice().try_into().unwrap_or(&[0u8; 32])) {
+        if let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(
+            bytes.as_slice().try_into().unwrap_or(&[0u8; 32]),
+        ) {
             key
         } else {
             get_control_plane_public_key(&config)?
@@ -120,10 +120,23 @@ async fn main() -> anyhow::Result<()> {
         let (rx, _tx) = MockJobReceiver::channel(32);
         Box::new(rx)
     } else {
-        info!("Connecting to real control plane at {}", config.control_plane_url);
-        let effective_token = identity.agent_token.clone().unwrap_or_else(|| config.agent_token.clone());
+        info!(
+            "Connecting to real control plane at {}",
+            config.control_plane_url
+        );
+        let effective_token = identity
+            .agent_token
+            .clone()
+            .unwrap_or_else(|| config.agent_token.clone());
 
-        match ControlPlaneJobReceiver::connect(&config.control_plane_url, &effective_token, Some(readiness_tx.clone()), Some(telemetry.clone())).await {
+        match ControlPlaneJobReceiver::connect(
+            &config.control_plane_url,
+            &effective_token,
+            Some(readiness_tx.clone()),
+            Some(telemetry.clone()),
+        )
+        .await
+        {
             Ok(real_rx) => {
                 info!("Successfully connected to control plane WebSocket");
                 Box::new(real_rx)
@@ -160,7 +173,9 @@ async fn main() -> anyhow::Result<()> {
                 return;
             }
 
-            info!("Agent is ready (control plane connected + first heartbeat sent) — initiating handover handshake");
+            info!(
+                "Agent is ready (control plane connected + first heartbeat sent) — initiating handover handshake"
+            );
 
             match perform_handover_handshake(&socket_path).await {
                 Ok(()) => info!("Handover handshake with old agent completed successfully"),

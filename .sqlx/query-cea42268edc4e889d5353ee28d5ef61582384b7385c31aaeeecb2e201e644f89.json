@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT \n                encode(token_hash, 'hex') as token_hash_hex,\n                description,\n                created_at,\n                expires_at,\n                used_at,\n                max_uses,\n                uses_count,\n                revoked_at\n            FROM enrollment_tokens\n            ORDER BY created_at DESC\n            LIMIT 200\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "token_hash_hex",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "used_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "max_uses",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "uses_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "revoked_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      true,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "cea42268edc4e889d5353ee28d5ef61582384b7385c31aaeeecb2e201e644f89"
+}

@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO applications (id, name, description, created_by_principal_id, created_at, updated_at)\n            VALUES ($1, $2, $3, $4, $5, $5)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "95fc6d41b17e5ba7383aefc3bc98a54bfd30d65d904accf6e11826982c12926d"
+}

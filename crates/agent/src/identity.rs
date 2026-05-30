@@ -125,10 +125,15 @@ pub fn load_or_create_identity(config: &AgentConfig) -> anyhow::Result<AgentIden
                 file.write_all(toml.as_bytes())?;
                 file.sync_all()?;
             }
-            info!("Backfilled age secret identity for existing agent (one-time upgrade for Tier 3-2)");
+            info!(
+                "Backfilled age secret identity for existing agent (one-time upgrade for Tier 3-2)"
+            );
         }
 
-        info!("Loaded existing agent identity from {}", config.identity_path);
+        info!(
+            "Loaded existing agent identity from {}",
+            config.identity_path
+        );
         return Ok(identity);
     }
 
@@ -193,7 +198,10 @@ pub fn load_or_create_identity(config: &AgentConfig) -> anyhow::Result<AgentIden
         fs::set_permissions(path, perms)?;
     }
 
-    info!("Generated new agent identity and wrote it to {} (0600)", config.identity_path);
+    info!(
+        "Generated new agent identity and wrote it to {} (0600)",
+        config.identity_path
+    );
     Ok(identity)
 }
 
@@ -244,11 +252,7 @@ pub async fn enroll_if_needed(
     });
 
     let client = reqwest::Client::new();
-    let resp = client
-        .post(&enroll_url)
-        .json(&body)
-        .send()
-        .await?;
+    let resp = client.post(&enroll_url).json(&body).send().await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -313,6 +317,9 @@ pub async fn enroll_if_needed(
         fs::set_permissions(path, perms)?;
     }
 
-    info!("Agent enrollment successful. Agent ID: {:?}", identity.agent_id);
+    info!(
+        "Agent enrollment successful. Agent ID: {:?}",
+        identity.agent_id
+    );
     Ok(())
 }

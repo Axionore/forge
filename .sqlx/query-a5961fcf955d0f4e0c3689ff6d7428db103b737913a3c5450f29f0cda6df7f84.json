@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployments SET git_source_id = $1, commit_sha = $2, ref = $3 WHERE id = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a5961fcf955d0f4e0c3689ff6d7428db103b737913a3c5450f29f0cda6df7f84"
+}

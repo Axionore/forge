@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT labels\n            FROM deployment_metrics\n            WHERE agent_id = $1 AND metric_name = 'agent_heartbeat'\n            ORDER BY timestamp DESC\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "labels",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "010a9f19557c512ee67a615d82be71653c7ab5aac4b2879603938be92d896414"
+}

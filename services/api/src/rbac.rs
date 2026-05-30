@@ -262,16 +262,14 @@ impl RbacService {
         created_by: Option<&str>,
     ) -> Result<CreatedAdminToken, RbacError> {
         // Basic validation (defense in depth)
-        if description.as_ref().map_or(false, |d| d.len() > 256) {
+        if description.as_ref().is_some_and(|d| d.len() > 256) {
             return Err(RbacError::InvalidInput(
                 "description must be <= 256 chars".into(),
             ));
         }
         if let Some(d) = expires_in_days {
-            if d < 0 || d > 365 {
-                return Err(RbacError::InvalidInput(
-                    "expires_in_days 0..=365".into(),
-                ));
+            if !(0..=365).contains(&d) {
+                return Err(RbacError::InvalidInput("expires_in_days 0..=365".into()));
             }
         }
 
@@ -344,6 +342,8 @@ impl RbacService {
             .map(|r| {
                 let prefix: String = r
                     .token_hash_hex
+                    .as_deref()
+                    .unwrap_or("")
                     .chars()
                     .take(8)
                     .collect();
@@ -413,12 +413,13 @@ impl RbacService {
     }
 }
 
-/// Core permission matcher (default-deny).
-/// Supports:
-/// - exact: "deployments:read"
-/// - wildcard namespace: "deployments:*" matches any deployments:xxx
-/// - super-admin: "*" matches everything
-/// All other cases (including malformed) → false.
+/// Core permission matcher (default-deny). Supports three grant shapes:
+///
+/// - exact: `"deployments:read"`
+/// - wildcard namespace: `"deployments:*"` matches any `deployments:xxx`
+/// - super-admin: `"*"` matches everything
+///
+/// All other cases (including malformed input) return `false`.
 pub fn action_allowed(permissions: &serde_json::Value, action: &str) -> bool {
     let obj = match permissions.as_object() {
         Some(o) => o,
@@ -438,7 +439,7 @@ pub fn action_allowed(permissions: &serde_json::Value, action: &str) -> bool {
     // Namespace wildcard: "foo:*" covers "foo:bar" and "foo:baz:quux"
     if let Some(colon) = action.find(':') {
         let ns = &action[..colon + 1]; // "foo:"
-        let wildcard = format!("{}*", ns);
+        let wildcard = format!("{ns}*");
         if obj.get(&wildcard).and_then(|v| v.as_bool()) == Some(true) {
             return true;
         }

@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, secret, action_type, action_config, enabled FROM webhook_endpoints WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "secret",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "action_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "action_config",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 4,
+        "name": "enabled",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "05027491b562bde86051bf9f5fe56a59c8a1eadb6591e841bebc6cb75a805a8c"
+}

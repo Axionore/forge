@@ -23,7 +23,7 @@ Forge combines the best ideas from Coolify and Dokploy, fixes their critical sho
 
 This project is in early active development. The foundational architecture for zero-downtime updates (including self-updates of Forge) has been designed with maximum ambition.
 
-**Roadmap & Competitive Positioning**: See [docs/roadmap-competitive-advantage.md](./docs/roadmap-competitive-advantage.md) for the honest gap analysis against Coolify/Dokploy and the prioritized path to becoming a real threat on the dimensions that matter (security model, execution quality, zero-downtime, and platform self-update safety).
+**Roadmap & Competitive Positioning**: See [docs/roadmap-competitive-advantage.md](./docs/roadmap-competitive-advantage.md) and the detailed [Gap Analysis vs Coolify, Dokploy & Caddy (2026)](./docs/gap-analysis-coolify-dokploy-caddy-2026.md) for the honest competitive assessment and the prioritized path to becoming a real threat on the dimensions that matter (security model, execution quality, zero-downtime, and platform self-update safety).
 
 ## Getting Started (Development)
 

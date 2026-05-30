@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO webhook_deliveries (id, webhook_id, status, error_message, payload_sha256, received_at)\n               VALUES ($1, $2, 'signature_failed', 'Invalid or missing HMAC signature', $3, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fe053172ad7c36ece765a2d732d5c27bc576d0a1e3c2e33621a044411b1cec5d"
+}

@@ -142,8 +142,12 @@ impl Default for AgentTelemetry {
         Self {
             start_time: std::time::Instant::now(),
             managed_container_count: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            active_deployments: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            observed_metrics: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_deployments: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
+            observed_metrics: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 }
@@ -196,13 +200,19 @@ impl ControlPlaneJobReceiver {
                             "agent_version": env!("CARGO_PKG_VERSION"),
                         });
 
-                        if write.send(Message::Text(auth_msg.to_string())).await.is_err() {
+                        if write
+                            .send(Message::Text(auth_msg.to_string()))
+                            .await
+                            .is_err()
+                        {
                             // backoff below
                         } else {
                             // Wait for auth ack
                             let mut authed = false;
                             if let Some(Ok(Message::Text(text))) = read.next().await {
-                                if text.contains("\"status\":\"ok\"") || text.contains("authenticated") {
+                                if text.contains("\"status\":\"ok\"")
+                                    || text.contains("authenticated")
+                                {
                                     info!("Successfully authenticated with control plane");
                                     authed = true;
 
@@ -216,7 +226,8 @@ impl ControlPlaneJobReceiver {
                                 backoff = Duration::from_secs(1); // reset
 
                                 // Run pump until this connection dies
-                                let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30));
+                                let mut heartbeat_interval =
+                                    tokio::time::interval(Duration::from_secs(30));
                                 let mut first_hb_sent = false;
 
                                 'pump: loop {

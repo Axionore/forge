@@ -4,8 +4,8 @@ members = [
     "crates/agent",
     "crates/core",
     "services/api",
+    "crates/providers/hetzner",
     # Future members (will be added as we build):
-    # "crates/providers/hetzner",
     # "crates/providers/digitalocean",
     # "crates/providers/ssh",
     # "services/worker",
@@ -22,7 +22,7 @@ repository = "https://github.com/forge-deploy/forge"
 [workspace.dependencies]
 # Async runtime & web
 tokio = { version = "1.45", features = ["full"] }
-axum = { version = "0.8", features = ["macros", "ws"] }
+axum = { version = "0.7", features = ["macros", "ws"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
 
@@ -69,15 +69,16 @@ ssh-key = { version = "0.6", features = ["ed25519", "alloc"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # gRPC + xDS (ADS) for true dynamic Envoy control plane (no sidecar restarts on canary steps)
-tonic = { version = "0.12", features = ["transport", "codegen", "tls"] }
-prost = "0.13"
+tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "tls-ring"] }
+prost = "0.14"
 envoy-types = "0.7"
 tokio-stream = "0.1"
 
 # Let's Encrypt / ACME for free public certificates on the control plane endpoints
 rustls-acme = { version = "0.12", features = ["tokio"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-hyper-util = { version = "0.1", features = ["tokio", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 rustls-pemfile = "2"
 
 [workspace.lints.rust]

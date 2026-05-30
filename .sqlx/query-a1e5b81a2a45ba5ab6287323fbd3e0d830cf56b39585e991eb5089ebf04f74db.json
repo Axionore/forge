@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE backup_executions\n            SET status = $1,\n                size_bytes = COALESCE($2, size_bytes),\n                location = COALESCE($3, location),\n                error = $4,\n                finished_at = $5\n            WHERE id = $6\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a1e5b81a2a45ba5ab6287323fbd3e0d830cf56b39585e991eb5089ebf04f74db"
+}
