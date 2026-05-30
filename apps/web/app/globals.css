@@ -1,40 +1,163 @@
 @import "tailwindcss";
 
-/* Forge Design Tokens - CSS-first Tailwind v4 */
+/*
+  Forge — "Molten Steel" design system.
+  Dark, translucent, operator-grade (Dokploy / Northflank / Railway lineage).
+  Deep cool charcoal base + molten-amber ember accent (forge identity) + glass surfaces.
+  All admin pages consume these tokens, so the system drives the whole UI.
+*/
 @theme {
   --font-sans: "Inter Variable", system-ui, sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 
-  /* Base colors - will be refined */
-  --color-background: oklch(0.98 0.005 260);
-  --color-foreground: oklch(0.15 0.02 260);
+  /* Base — deep blue-charcoal, layered elevation */
+  --color-background: oklch(0.17 0.014 264);
+  --color-foreground: oklch(0.96 0.006 264);
 
-  --color-primary: oklch(0.55 0.22 260);
-  --color-primary-foreground: oklch(0.98 0.005 260);
+  /* Molten ember — brand / primary action / focus / active */
+  --color-primary: oklch(0.74 0.16 58);
+  --color-primary-foreground: oklch(0.19 0.03 60);
 
-  --color-muted: oklch(0.96 0.005 260);
-  --color-muted-foreground: oklch(0.45 0.02 260);
+  /* Muted / elevated slate */
+  --color-muted: oklch(0.235 0.014 264);
+  --color-muted-foreground: oklch(0.68 0.014 264);
 
-  --color-destructive: oklch(0.55 0.22 25);
-  --color-destructive-foreground: oklch(0.98 0.005 260);
+  --color-destructive: oklch(0.63 0.2 25);
+  --color-destructive-foreground: oklch(0.98 0.005 25);
 
-  --color-border: oklch(0.90 0.005 260);
-  --color-input: oklch(0.92 0.005 260);
-  --color-ring: oklch(0.55 0.22 260);
+  /* Hairline translucent borders + inputs */
+  --color-border: oklch(0.78 0.02 264 / 0.12);
+  --color-input: oklch(0.78 0.02 264 / 0.16);
+  --color-ring: oklch(0.74 0.16 58 / 0.65);
 
-  /* Admin / operator surfaces */
-  --color-card: oklch(1 0 0);
-  --color-card-border: oklch(0.90 0.005 260);
-  --color-success: oklch(0.55 0.18 145);
-  --color-success-foreground: oklch(0.98 0.005 260);
-  --color-warning: oklch(0.75 0.18 85);
-  --color-warning-foreground: oklch(0.15 0.02 260);
+  /* Operator surfaces — translucent glass over the base */
+  --color-card: oklch(0.225 0.015 264 / 0.72);
+  --color-card-border: oklch(0.8 0.02 264 / 0.1);
+  --color-success: oklch(0.7 0.15 156);
+  --color-success-foreground: oklch(0.16 0.03 156);
+  --color-warning: oklch(0.81 0.14 85);
+  --color-warning-foreground: oklch(0.2 0.04 85);
 
-  /* Radix UI + shadcn-style primitives (Tailwind 4 CSS-first) */
-  --color-popover: oklch(1 0 0);
-  --color-popover-foreground: oklch(0.15 0.02 260);
-  --color-accent: oklch(0.96 0.005 260);
-  --color-accent-foreground: oklch(0.15 0.02 260);
-  --color-secondary: oklch(0.96 0.005 260);
-  --color-secondary-foreground: oklch(0.15 0.02 260);
+  /* Radix / shadcn-style primitives */
+  --color-popover: oklch(0.2 0.015 264 / 0.92);
+  --color-popover-foreground: oklch(0.96 0.006 264);
+  --color-accent: oklch(0.28 0.016 264);
+  --color-accent-foreground: oklch(0.96 0.006 264);
+  --color-secondary: oklch(0.26 0.015 264);
+  --color-secondary-foreground: oklch(0.94 0.006 264);
+
+  --radius: 0.7rem;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-feature-settings: "cv02", "cv03", "cv04", "ss01";
+    -webkit-font-smoothing: antialiased;
+    /* Atmosphere: twin ember glows fading into the charcoal, + a faint top sheen */
+    background-image:
+      radial-gradient(
+        60rem 40rem at 12% -8%,
+        oklch(0.74 0.16 58 / 0.1),
+        transparent 60%
+      ),
+      radial-gradient(
+        48rem 36rem at 100% 0%,
+        oklch(0.6 0.13 28 / 0.08),
+        transparent 55%
+      ),
+      linear-gradient(oklch(0.99 0 0 / 0.015), transparent 18%);
+    background-attachment: fixed;
+    min-height: 100vh;
+  }
+
+  ::selection {
+    background: oklch(0.74 0.16 58 / 0.3);
+  }
+
+  /* Refined dark scrollbars */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: oklch(0.5 0.02 264 / 0.4) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: oklch(0.5 0.02 264 / 0.35);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: oklch(0.62 0.03 264 / 0.5);
+    background-clip: content-box;
+  }
+}
+
+@layer components {
+  /* Translucent elevated panel — the signature surface.
+     Backdrop blur + hairline border + soft depth, so cards float over the glow. */
+  .glass-panel {
+    background: var(--color-card);
+    border: 1px solid var(--color-card-border);
+    backdrop-filter: blur(16px) saturate(1.3);
+    -webkit-backdrop-filter: blur(16px) saturate(1.3);
+    box-shadow:
+      0 1px 0 0 oklch(1 0 0 / 0.04) inset,
+      0 12px 40px -12px oklch(0 0 0 / 0.55);
+  }
+
+  /* Ember primary button glow */
+  .ember-glow {
+    box-shadow:
+      0 0 0 1px oklch(0.74 0.16 58 / 0.35),
+      0 6px 24px -6px oklch(0.74 0.16 58 / 0.5);
+  }
+
+  /* Animated status dot for live/healthy indicators */
+  .pulse-dot {
+    position: relative;
+  }
+  .pulse-dot::after {
+    content: "";
+    position: absolute;
+    inset: -3px;
+    border-radius: 999px;
+    background: currentColor;
+    opacity: 0.35;
+    animation: forge-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+  @keyframes forge-pulse {
+    0%,
+    100% {
+      transform: scale(1);
+      opacity: 0.35;
+    }
+    50% {
+      transform: scale(1.9);
+      opacity: 0;
+    }
+  }
+
+  /* Staggered page-load reveal */
+  .reveal {
+    animation: forge-reveal 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+  @keyframes forge-reveal {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
 }

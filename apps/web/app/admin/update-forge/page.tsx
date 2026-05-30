@@ -246,7 +246,7 @@ export default function UpdateForgePage() {
 
           <div className="grid gap-4 md:grid-cols-3">
             {components.map((comp) => (
-              <div key={comp.id} className="rounded-2xl border border-[var(--color-border)] p-4 bg-white/50">
+              <div key={comp.id} className="rounded-2xl border border-[var(--color-border)] p-4 bg-[var(--color-card)]/50">
                 <div className="flex justify-between items-start">
                   <div>
                     <div className="font-medium">{comp.name}</div>
@@ -304,7 +304,7 @@ export default function UpdateForgePage() {
                       <td className="py-2 pr-4">
                         <div className="flex items-center gap-2">
                           <div className="h-1.5 flex-1 bg-[var(--color-muted)] rounded">
-                            <div className="h-1.5 bg-emerald-500 rounded" style={{ width: `${Math.round((a.on_desired / a.agents_total) * 100)}%` }} />
+                            <div className="h-1.5 bg-[var(--color-success)]/120 rounded" style={{ width: `${Math.round((a.on_desired / a.agents_total) * 100)}%` }} />
                           </div>
                           <span className="text-xs font-mono w-8 text-right">{Math.round((a.on_desired / a.agents_total) * 100)}%</span>
                         </div>
@@ -353,7 +353,7 @@ export default function UpdateForgePage() {
           <div className="mb-6">
             <label className="text-xs text-[var(--color-muted-foreground)] block mb-1.5">Strategy</label>
             <Select.Root value={selectedStrategy} onValueChange={(v) => setSelectedStrategy(v as any)}>
-              <Select.Trigger className="w-full flex items-center justify-between rounded-2xl border border-[var(--color-input)] bg-white px-4 py-3 text-sm">
+              <Select.Trigger className="w-full flex items-center justify-between rounded-2xl border border-[var(--color-input)] bg-[var(--color-card)] px-4 py-3 text-sm">
                 <Select.Value />
                 <Select.Icon><ChevronDown className="h-4 w-4" /></Select.Icon>
               </Select.Trigger>
