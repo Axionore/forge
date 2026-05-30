@@ -7,6 +7,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { toast } from "sonner";
 import { Copy, X, Play, Pause, Clock } from "lucide-react";
 import { StatusTimeline } from "../../../../components/StatusTimeline";
+import { useAdminToken } from "../../token-store";
 
 const API_BASE = "http://localhost:3000";
 
@@ -63,8 +64,7 @@ export default function ApplicationDetailPage() {
   const params = useParams<{ id: string }>();
   const appId = params?.id as string;
 
-  const [adminToken, setAdminToken] = React.useState("");
-  const [showAdminToken, setShowAdminToken] = React.useState(false);
+  const [adminToken] = useAdminToken();
   const [application, setApplication] = React.useState<Application | null>(
     null,
   );
@@ -766,1243 +766,1179 @@ export default function ApplicationDetailPage() {
   }
 
   return (
-    <div className="min-h-screen bg-[var(--color-background)] text-[var(--color-foreground)]">
-      {/* Header — consistent with list + other admin pages */}
-      <header className="sticky top-0 z-50 border-b border-[var(--color-border)] bg-[var(--color-card)]/95 backdrop-blur">
-        <div className="mx-auto max-w-7xl px-6 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="h-8 w-8 rounded bg-[var(--color-primary)]" />
-            <div>
-              <div className="font-semibold tracking-tighter text-lg">
-                Forge
-              </div>
-              <div className="text-[10px] text-[var(--color-muted-foreground)] -mt-1">
-                CONTROL PLANE
-              </div>
+    <div className="mx-auto max-w-7xl px-6 py-8 space-y-8">
+      <div className="flex items-center justify-between gap-4">
+        <Link
+          href="/admin/applications"
+          className="text-sm text-[var(--color-muted-foreground)] hover:text-foreground"
+        >
+          ← Back to Applications
+        </Link>
+        <button
+          onClick={() => setShowUpdateForge(true)}
+          className="btn btn-ghost"
+        >
+          Update Forge
+        </button>
+      </div>
+
+      {/* Phase 3: One-time amber secret banner for catalog DB connection details (exact pattern from access page; honest because secrets never leave age envelopes) */}
+      {oneTimeSecret && (
+        <div className="mb-4 rounded-lg border border-[var(--color-warning)]/40 bg-[var(--color-warning)]/10 p-6">
+          <div className="flex items-start gap-4">
+            <div className="mt-0.5 text-amber-500">
+              <svg
+                width="22"
+                height="22"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.5"
+              >
+                <path d="M12 9v4m0 4h.01M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
+              </svg>
             </div>
-            <div className="ml-4 text-sm font-medium text-[var(--color-muted-foreground)]">
-              Application Details
+            <div className="flex-1 min-w-0">
+              <div className="font-semibold tracking-tight text-amber-950">
+                One-time connection note — copy immediately
+              </div>
+              <div className="text-sm text-[var(--color-warning)]/80 mt-0.5">
+                Generated secret is age-wrapped server-side and injected only
+                into the container (tmpfs 0600). Never logged or returned in
+                control-plane responses.
+              </div>
+              <div className="mt-4 flex items-center gap-3 rounded-2xl bg-[var(--color-card)] px-5 py-4 font-mono text-[15px] border border-[var(--color-warning)]/25 tracking-[0.5px] break-all select-all">
+                {oneTimeSecret}
+              </div>
+              <div className="mt-3 flex items-center gap-3">
+                <button
+                  onClick={copyOneTimeSecret}
+                  className="inline-flex items-center gap-2 rounded-2xl bg-[var(--color-card)] border border-[var(--color-warning)]/25 px-6 h-10 text-sm font-medium active:bg-[var(--color-warning)]/15 transition"
+                >
+                  {copiedOneTime ? "Copied to clipboard ✓" : "Copy note"}
+                </button>
+                <button
+                  onClick={() => {
+                    setOneTimeSecret(null);
+                    setCopiedOneTime(false);
+                  }}
+                  className="text-sm text-amber-950/70 hover:text-amber-950 underline underline-offset-2"
+                >
+                  Dismiss
+                </button>
+                <div className="text-[10px] text-[var(--color-warning)]/60 ml-auto font-mono tracking-[1px]">
+                  AGE-PROTECTED • NEVER REPLAYED
+                </div>
+              </div>
             </div>
           </div>
-          <Link
-            href="/admin/applications"
-            className="text-sm px-4 py-1.5 rounded-md hover:bg-[var(--color-muted)]"
-          >
-            ← Back to Applications
-          </Link>
-          {/* Phase 3 Magical Self-Update */}
-          <button
-            onClick={() => setShowUpdateForge(true)}
-            className="ml-3 px-4 py-1.5 text-sm font-semibold rounded-2xl bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white hover:brightness-110 flex items-center gap-1.5"
-          >
-            ✨ Update Forge
+        </div>
+      )}
+
+      {/* App Header + 4-state handling */}
+      {isLoadingApp ? (
+        <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8 animate-pulse">
+          <div className="h-9 w-2/3 bg-[var(--color-muted)] rounded" />
+          <div className="mt-3 h-4 w-1/3 bg-[var(--color-muted)] rounded" />
+        </div>
+      ) : appError ? (
+        <div className="rounded-3xl border border-red-500/30 bg-[var(--color-destructive)]/100/5 p-6 text-[var(--color-destructive)]">
+          Failed to load application: {appError}
+          <button onClick={() => loadApplication()} className="ml-4 underline">
+            Retry
           </button>
         </div>
-      </header>
+      ) : application ? (
+        <div>
+          <div className="flex items-baseline justify-between">
+            <div>
+              <h1 className="text-4xl font-semibold tracking-tighter">
+                {application.name}
+              </h1>
+              <div className="text-[var(--color-muted-foreground)] mt-1">
+                {application.kind ?? "git"} · created{" "}
+                {new Date(application.created_at).toLocaleString()}
+              </div>
+            </div>
+            <div className="text-xs font-mono px-3 py-1 rounded-full border border-[var(--color-border)]">
+              {appId}
+            </div>
+          </div>
+        </div>
+      ) : null}
 
-      <main className="mx-auto max-w-7xl px-6 py-8 space-y-8">
-        {/* Admin Token (same pattern) */}
-        <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-6">
-          <div className="flex items-center gap-3 mb-3">
-            <div className="font-medium">Admin Token</div>
-            <Link
-              href="/admin/access"
-              className="text-xs underline text-[var(--color-muted-foreground)]"
-            >
-              Manage tokens
-            </Link>
-          </div>
-          <div className="flex gap-3">
-            <input
-              type={showAdminToken ? "text" : "password"}
-              value={adminToken}
-              onChange={(e) => setAdminToken(e.target.value)}
-              placeholder="Paste FORGE_ADMIN_TOKEN"
-              className="flex-1 rounded-2xl border border-[var(--color-input)] bg-[var(--color-background)] px-4 py-2.5 text-sm font-mono"
-            />
-            <button
-              onClick={() => setShowAdminToken(!showAdminToken)}
-              className="px-4 rounded-2xl border border-[var(--color-border)] text-sm"
-            >
-              {showAdminToken ? "Hide" : "Show"}
-            </button>
-          </div>
-          <div className="mt-1 text-xs text-[var(--color-muted-foreground)]">
-            Required for all actions on this page.
+      {/* Deploy Panel — polished primary flow from details (Phase 1) */}
+      <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8">
+        <div className="flex items-center justify-between mb-6">
+          <div>
+            <div className="font-semibold text-2xl tracking-tight">Deploy</div>
+            <div className="text-[var(--color-muted-foreground)] mt-1">
+              Real signed Job::Deploy. Image or Git source. Runs on any
+              connected agent.
+            </div>
           </div>
         </div>
 
-        {/* Phase 3: One-time amber secret banner for catalog DB connection details (exact pattern from access page; honest because secrets never leave age envelopes) */}
-        {oneTimeSecret && (
-          <div className="mb-4 rounded-3xl border-2 border-amber-400/70 bg-[var(--color-warning)]/10/60 p-6">
-            <div className="flex items-start gap-4">
-              <div className="mt-0.5 text-amber-500">
-                <svg
-                  width="22"
-                  height="22"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2.5"
-                >
-                  <path d="M12 9v4m0 4h.01M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
-                </svg>
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="font-semibold tracking-tight text-amber-950">
-                  One-time connection note — copy immediately
-                </div>
-                <div className="text-sm text-[var(--color-warning)]/80 mt-0.5">
-                  Generated secret is age-wrapped server-side and injected only
-                  into the container (tmpfs 0600). Never logged or returned in
-                  control-plane responses.
-                </div>
-                <div className="mt-4 flex items-center gap-3 rounded-2xl bg-[var(--color-card)] px-5 py-4 font-mono text-[15px] border border-[var(--color-warning)]/25 tracking-[0.5px] break-all select-all">
-                  {oneTimeSecret}
-                </div>
-                <div className="mt-3 flex items-center gap-3">
-                  <button
-                    onClick={copyOneTimeSecret}
-                    className="inline-flex items-center gap-2 rounded-2xl bg-[var(--color-card)] border border-[var(--color-warning)]/25 px-6 h-10 text-sm font-medium active:bg-[var(--color-warning)]/15 transition"
-                  >
-                    {copiedOneTime ? "Copied to clipboard ✓" : "Copy note"}
-                  </button>
-                  <button
-                    onClick={() => {
-                      setOneTimeSecret(null);
-                      setCopiedOneTime(false);
-                    }}
-                    className="text-sm text-amber-950/70 hover:text-amber-950 underline underline-offset-2"
-                  >
-                    Dismiss
-                  </button>
-                  <div className="text-[10px] text-[var(--color-warning)]/60 ml-auto font-mono tracking-[1px]">
-                    AGE-PROTECTED • NEVER REPLAYED
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
+        {/* Mode tabs – Image (default) vs Git (secondary, high value for parity) */}
+        <div className="flex gap-2 mb-6">
+          <button
+            type="button"
+            onClick={() => setDeployMode("image")}
+            className={`px-5 py-2 rounded-2xl text-sm font-medium transition ${deployMode === "image" ? "bg-[var(--color-foreground)] text-[var(--color-background)]" : "border border-[var(--color-border)] hover:bg-[var(--color-muted)]"}`}
+          >
+            Container Image
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setDeployMode("git");
+              if (gitSources.length === 0) void fetchGitSources();
+            }}
+            className={`px-5 py-2 rounded-2xl text-sm font-medium transition ${deployMode === "git" ? "bg-[var(--color-foreground)] text-[var(--color-background)]" : "border border-[var(--color-border)] hover:bg-[var(--color-muted)]"}`}
+          >
+            Git Repository
+          </button>
+        </div>
 
-        {/* App Header + 4-state handling */}
-        {isLoadingApp ? (
-          <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8 animate-pulse">
-            <div className="h-9 w-2/3 bg-[var(--color-muted)] rounded" />
-            <div className="mt-3 h-4 w-1/3 bg-[var(--color-muted)] rounded" />
-          </div>
-        ) : appError ? (
-          <div className="rounded-3xl border border-red-500/30 bg-[var(--color-destructive)]/100/5 p-6 text-[var(--color-destructive)]">
-            Failed to load application: {appError}
-            <button
-              onClick={() => loadApplication()}
-              className="ml-4 underline"
-            >
-              Retry
-            </button>
-          </div>
-        ) : application ? (
-          <div>
-            <div className="flex items-baseline justify-between">
-              <div>
-                <h1 className="text-4xl font-semibold tracking-tighter">
-                  {application.name}
-                </h1>
-                <div className="text-[var(--color-muted-foreground)] mt-1">
-                  {application.kind ?? "git"} · created{" "}
-                  {new Date(application.created_at).toLocaleString()}
-                </div>
-              </div>
-              <div className="text-xs font-mono px-3 py-1 rounded-full border border-[var(--color-border)]">
-                {appId}
-              </div>
-            </div>
-          </div>
-        ) : null}
-
-        {/* Deploy Panel — polished primary flow from details (Phase 1) */}
-        <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8">
-          <div className="flex items-center justify-between mb-6">
+        <form onSubmit={handleDeploy} className="space-y-6 max-w-2xl">
+          {deployMode === "image" ? (
             <div>
-              <div className="font-semibold text-2xl tracking-tight">
-                Deploy
-              </div>
-              <div className="text-[var(--color-muted-foreground)] mt-1">
-                Real signed Job::Deploy. Image or Git source. Runs on any
-                connected agent.
+              <label className="block text-sm font-medium mb-2">
+                Container Image
+              </label>
+              <input
+                value={deployImage}
+                onChange={(e) => setDeployImage(e.target.value)}
+                className="w-full rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-5 py-3 text-sm font-mono"
+                placeholder="nginx:alpine or ghcr.io/org/app:v1.2.3"
+                required
+              />
+
+              {/* Optional private registry auth — complete Phase 1 path, no stubs */}
+              <div className="pt-2 border-t border-[var(--color-border)]">
+                <div className="text-xs font-medium text-[var(--color-muted-foreground)] mb-2">
+                  Private Registry (optional)
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <input
+                    value={registryServer}
+                    onChange={(e) => setRegistryServer(e.target.value)}
+                    className="rounded-xl border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm"
+                    placeholder="registry.example.com (or ghcr.io)"
+                  />
+                  <input
+                    value={registryUsername}
+                    onChange={(e) => setRegistryUsername(e.target.value)}
+                    className="rounded-xl border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm"
+                    placeholder="username"
+                  />
+                  <input
+                    type="password"
+                    value={registryPassword}
+                    onChange={(e) => setRegistryPassword(e.target.value)}
+                    className="rounded-xl border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm"
+                    placeholder="password or token"
+                  />
+                </div>
+                <p className="mt-1 text-[10px] text-[var(--color-muted-foreground)]">
+                  Credentials are sent in the DeploymentSpec (agent uses them
+                  for pull). For production use the stored secret + age path.
+                </p>
               </div>
             </div>
-          </div>
-
-          {/* Mode tabs – Image (default) vs Git (secondary, high value for parity) */}
-          <div className="flex gap-2 mb-6">
-            <button
-              type="button"
-              onClick={() => setDeployMode("image")}
-              className={`px-5 py-2 rounded-2xl text-sm font-medium transition ${deployMode === "image" ? "bg-[var(--color-foreground)] text-[var(--color-background)]" : "border border-[var(--color-border)] hover:bg-[var(--color-muted)]"}`}
-            >
-              Container Image
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setDeployMode("git");
-                if (gitSources.length === 0) void fetchGitSources();
-              }}
-              className={`px-5 py-2 rounded-2xl text-sm font-medium transition ${deployMode === "git" ? "bg-[var(--color-foreground)] text-[var(--color-background)]" : "border border-[var(--color-border)] hover:bg-[var(--color-muted)]"}`}
-            >
-              Git Repository
-            </button>
-          </div>
-
-          <form onSubmit={handleDeploy} className="space-y-6 max-w-2xl">
-            {deployMode === "image" ? (
+          ) : (
+            <div className="space-y-4">
               <div>
                 <label className="block text-sm font-medium mb-2">
-                  Container Image
+                  Git Source
                 </label>
-                <input
-                  value={deployImage}
-                  onChange={(e) => setDeployImage(e.target.value)}
-                  className="w-full rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-5 py-3 text-sm font-mono"
-                  placeholder="nginx:alpine or ghcr.io/org/app:v1.2.3"
+                <select
+                  value={selectedGitSourceId}
+                  onChange={(e) => setSelectedGitSourceId(e.target.value)}
+                  className="w-full rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-5 py-3 text-sm"
                   required
-                />
-
-                {/* Optional private registry auth — complete Phase 1 path, no stubs */}
-                <div className="pt-2 border-t border-[var(--color-border)]">
-                  <div className="text-xs font-medium text-[var(--color-muted-foreground)] mb-2">
-                    Private Registry (optional)
-                  </div>
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                    <input
-                      value={registryServer}
-                      onChange={(e) => setRegistryServer(e.target.value)}
-                      className="rounded-xl border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm"
-                      placeholder="registry.example.com (or ghcr.io)"
-                    />
-                    <input
-                      value={registryUsername}
-                      onChange={(e) => setRegistryUsername(e.target.value)}
-                      className="rounded-xl border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm"
-                      placeholder="username"
-                    />
-                    <input
-                      type="password"
-                      value={registryPassword}
-                      onChange={(e) => setRegistryPassword(e.target.value)}
-                      className="rounded-xl border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm"
-                      placeholder="password or token"
-                    />
-                  </div>
-                  <p className="mt-1 text-[10px] text-[var(--color-muted-foreground)]">
-                    Credentials are sent in the DeploymentSpec (agent uses them
-                    for pull). For production use the stored secret + age path.
-                  </p>
-                </div>
-              </div>
-            ) : (
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium mb-2">
-                    Git Source
-                  </label>
-                  <select
-                    value={selectedGitSourceId}
-                    onChange={(e) => setSelectedGitSourceId(e.target.value)}
-                    className="w-full rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-5 py-3 text-sm"
-                    required
-                  >
-                    <option value="">Select connected Git source...</option>
-                    {gitSources.map((gs) => (
-                      <option key={gs.id} value={gs.id}>
-                        {gs.name} ({gs.repo_url})
-                      </option>
-                    ))}
-                  </select>
-                  {gitSources.length === 0 && (
-                    <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
-                      No Git sources yet. Connect one from the Deployments page
-                      → Git Sources.
-                    </p>
-                  )}
-                </div>
-                <div>
-                  <label className="block text-sm font-medium mb-2">
-                    Branch / Ref / PR
-                  </label>
-                  <input
-                    value={gitRef}
-                    onChange={(e) => setGitRef(e.target.value)}
-                    className="w-full rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-5 py-3 text-sm font-mono"
-                    placeholder="main or pr/42 or commit-sha"
-                  />
-                  <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
-                    Uses the same preview + build path as the rest of the
-                    platform.
-                  </p>
-                </div>
-              </div>
-            )}
-
-            {/* Rich Dynamic Environment Variables Editor — major DX improvement over textarea */}
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <label className="block text-sm font-medium">
-                  Environment Variables
-                </label>
-                <button
-                  type="button"
-                  onClick={() =>
-                    setEnvVars((prev) => [
-                      ...prev,
-                      { key: "", value: "", isSecret: false },
-                    ])
-                  }
-                  className="text-xs px-3 py-1 rounded-xl border border-[var(--color-border)] hover:bg-[var(--color-muted)]"
                 >
-                  + Add variable
-                </button>
-              </div>
-
-              <div className="space-y-2">
-                {envVars.map((ev, idx) => (
-                  <div
-                    key={idx}
-                    className="flex gap-2 items-center rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2"
-                  >
-                    <input
-                      value={ev.key}
-                      onChange={(e) => {
-                        const next = [...envVars];
-                        next[idx] = { ...next[idx]!, key: e.target.value };
-                        setEnvVars(next);
-                      }}
-                      placeholder="KEY"
-                      className="font-mono w-40 rounded-xl border border-[var(--color-border)] bg-transparent px-3 py-1.5 text-sm focus:outline-none focus:ring-1"
-                    />
-                    <input
-                      value={ev.value}
-                      onChange={(e) => {
-                        const next = [...envVars];
-                        next[idx] = { ...next[idx]!, value: e.target.value };
-                        setEnvVars(next);
-                      }}
-                      type={ev.isSecret ? "password" : "text"}
-                      placeholder="value"
-                      className="font-mono flex-1 rounded-xl border border-[var(--color-border)] bg-transparent px-3 py-1.5 text-sm focus:outline-none focus:ring-1"
-                    />
-                    <label className="flex items-center gap-1 text-xs whitespace-nowrap select-none cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={ev.isSecret}
-                        onChange={(e) => {
-                          const next = [...envVars];
-                          next[idx] = {
-                            ...next[idx]!,
-                            isSecret: e.target.checked,
-                          };
-                          setEnvVars(next);
-                        }}
-                      />
-                      Secret
-                    </label>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setEnvVars(envVars.filter((_, i) => i !== idx))
-                      }
-                      className="ml-1 text-[var(--color-muted-foreground)] hover:text-red-500 text-lg leading-none"
-                      title="Remove"
-                    >
-                      ×
-                    </button>
-                  </div>
-                ))}
-                {envVars.length === 0 && (
-                  <div className="text-xs text-[var(--color-muted-foreground)]">
-                    No variables yet. Add some above.
-                  </div>
+                  <option value="">Select connected Git source...</option>
+                  {gitSources.map((gs) => (
+                    <option key={gs.id} value={gs.id}>
+                      {gs.name} ({gs.repo_url})
+                    </option>
+                  ))}
+                </select>
+                {gitSources.length === 0 && (
+                  <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
+                    No Git sources yet. Connect one from the Deployments page →
+                    Git Sources.
+                  </p>
                 )}
               </div>
-              <p className="mt-1 text-[10px] text-[var(--color-muted-foreground)]">
-                "Secret" rows are masked in the UI. Full age secret storage +
-                rotation comes in the next slice.
-              </p>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium mb-2">
-                Target Agents
-              </label>
-              {availableAgents.length === 0 ? (
-                <div className="text-xs text-[var(--color-muted-foreground)] rounded-2xl border border-[var(--color-border)] p-3">
-                  No agents registered yet. Go to{" "}
-                  <a href="/admin/enrollment-tokens" className="underline">
-                    Add Server
-                  </a>{" "}
-                  to enroll your first node.
-                </div>
-              ) : (
-                <div className="flex flex-wrap gap-2">
-                  {availableAgents.map((a: any) => {
-                    const id = String(a.id);
-                    const selected = selectedAgentIds.includes(id);
-                    const connected =
-                      a.connected ||
-                      (a.last_seen_at &&
-                        Date.now() - new Date(a.last_seen_at).getTime() <
-                          90_000);
-                    return (
-                      <button
-                        key={id}
-                        type="button"
-                        onClick={() => {
-                          setSelectedAgentIds((prev) =>
-                            selected
-                              ? prev.filter((x) => x !== id)
-                              : [...prev, id],
-                          );
-                        }}
-                        className={`px-3 py-1.5 rounded-2xl text-sm border transition flex items-center gap-2 ${selected ? "bg-violet-600 text-white border-violet-600" : "bg-[var(--color-card)] border-[var(--color-border)] hover:border-violet-400"}`}
-                      >
-                        <span
-                          className={`inline-block w-2 h-2 rounded-full ${connected ? "bg-[var(--color-success)]/120" : "bg-[var(--color-warning)]/100"}`}
-                        />
-                        {a.hostname || a.name || id.slice(0, 8)}
-                        <span className="text-[10px] opacity-70 font-mono">
-                          {id.slice(0, 8)}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
-              <div className="text-[10px] text-[var(--color-muted-foreground)] mt-1.5">
-                Selected: {selectedAgentIds.length || "all connected"}.
-                Deployment will be dispatched only to these agents (signed jobs
-                + age envelopes per-agent).
+              <div>
+                <label className="block text-sm font-medium mb-2">
+                  Branch / Ref / PR
+                </label>
+                <input
+                  value={gitRef}
+                  onChange={(e) => setGitRef(e.target.value)}
+                  className="w-full rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-5 py-3 text-sm font-mono"
+                  placeholder="main or pr/42 or commit-sha"
+                />
+                <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
+                  Uses the same preview + build path as the rest of the
+                  platform.
+                </p>
               </div>
             </div>
+          )}
 
-            {/* Ports (published) — complete deploy form per plan */}
-            <div>
-              <label className="block text-sm font-medium mb-2">
-                Published Ports (host:container or just port)
+          {/* Rich Dynamic Environment Variables Editor — major DX improvement over textarea */}
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <label className="block text-sm font-medium">
+                Environment Variables
               </label>
-              <div className="flex gap-2">
-                <input
-                  value={newPort}
-                  onChange={(e) => setNewPort(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      if (newPort.trim()) {
-                        setPublishedPorts((p) => [...p, newPort.trim()]);
-                        setNewPort("");
-                      }
+              <button
+                type="button"
+                onClick={() =>
+                  setEnvVars((prev) => [
+                    ...prev,
+                    { key: "", value: "", isSecret: false },
+                  ])
+                }
+                className="text-xs px-3 py-1 rounded-xl border border-[var(--color-border)] hover:bg-[var(--color-muted)]"
+              >
+                + Add variable
+              </button>
+            </div>
+
+            <div className="space-y-2">
+              {envVars.map((ev, idx) => (
+                <div
+                  key={idx}
+                  className="flex gap-2 items-center rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2"
+                >
+                  <input
+                    value={ev.key}
+                    onChange={(e) => {
+                      const next = [...envVars];
+                      next[idx] = { ...next[idx]!, key: e.target.value };
+                      setEnvVars(next);
+                    }}
+                    placeholder="KEY"
+                    className="font-mono w-40 rounded-xl border border-[var(--color-border)] bg-transparent px-3 py-1.5 text-sm focus:outline-none focus:ring-1"
+                  />
+                  <input
+                    value={ev.value}
+                    onChange={(e) => {
+                      const next = [...envVars];
+                      next[idx] = { ...next[idx]!, value: e.target.value };
+                      setEnvVars(next);
+                    }}
+                    type={ev.isSecret ? "password" : "text"}
+                    placeholder="value"
+                    className="font-mono flex-1 rounded-xl border border-[var(--color-border)] bg-transparent px-3 py-1.5 text-sm focus:outline-none focus:ring-1"
+                  />
+                  <label className="flex items-center gap-1 text-xs whitespace-nowrap select-none cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={ev.isSecret}
+                      onChange={(e) => {
+                        const next = [...envVars];
+                        next[idx] = {
+                          ...next[idx]!,
+                          isSecret: e.target.checked,
+                        };
+                        setEnvVars(next);
+                      }}
+                    />
+                    Secret
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setEnvVars(envVars.filter((_, i) => i !== idx))
                     }
-                  }}
-                  className="flex-1 rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-5 py-3 text-sm font-mono"
-                  placeholder="80 or 8080:80"
-                />
-                <button
-                  type="button"
-                  onClick={() => {
+                    className="ml-1 text-[var(--color-muted-foreground)] hover:text-red-500 text-lg leading-none"
+                    title="Remove"
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+              {envVars.length === 0 && (
+                <div className="text-xs text-[var(--color-muted-foreground)]">
+                  No variables yet. Add some above.
+                </div>
+              )}
+            </div>
+            <p className="mt-1 text-[10px] text-[var(--color-muted-foreground)]">
+              "Secret" rows are masked in the UI. Full age secret storage +
+              rotation comes in the next slice.
+            </p>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2">
+              Target Agents
+            </label>
+            {availableAgents.length === 0 ? (
+              <div className="text-xs text-[var(--color-muted-foreground)] rounded-2xl border border-[var(--color-border)] p-3">
+                No agents registered yet. Go to{" "}
+                <a href="/admin/enrollment-tokens" className="underline">
+                  Add Server
+                </a>{" "}
+                to enroll your first node.
+              </div>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                {availableAgents.map((a: any) => {
+                  const id = String(a.id);
+                  const selected = selectedAgentIds.includes(id);
+                  const connected =
+                    a.connected ||
+                    (a.last_seen_at &&
+                      Date.now() - new Date(a.last_seen_at).getTime() < 90_000);
+                  return (
+                    <button
+                      key={id}
+                      type="button"
+                      onClick={() => {
+                        setSelectedAgentIds((prev) =>
+                          selected
+                            ? prev.filter((x) => x !== id)
+                            : [...prev, id],
+                        );
+                      }}
+                      className={`px-3 py-1.5 rounded-lg text-sm border transition flex items-center gap-2 ${selected ? "bg-[var(--color-primary)] text-[var(--color-primary-foreground)] border-transparent" : "bg-[var(--color-card)] border-[var(--color-border)] hover:bg-[oklch(1_0_0/0.05)]"}`}
+                    >
+                      <span
+                        className={`inline-block w-2 h-2 rounded-full ${connected ? "bg-[var(--color-success)]/120" : "bg-[var(--color-warning)]/100"}`}
+                      />
+                      {a.hostname || a.name || id.slice(0, 8)}
+                      <span className="text-[10px] opacity-70 font-mono">
+                        {id.slice(0, 8)}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            <div className="text-[10px] text-[var(--color-muted-foreground)] mt-1.5">
+              Selected: {selectedAgentIds.length || "all connected"}. Deployment
+              will be dispatched only to these agents (signed jobs + age
+              envelopes per-agent).
+            </div>
+          </div>
+
+          {/* Ports (published) — complete deploy form per plan */}
+          <div>
+            <label className="block text-sm font-medium mb-2">
+              Published Ports (host:container or just port)
+            </label>
+            <div className="flex gap-2">
+              <input
+                value={newPort}
+                onChange={(e) => setNewPort(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
                     if (newPort.trim()) {
                       setPublishedPorts((p) => [...p, newPort.trim()]);
                       setNewPort("");
                     }
-                  }}
-                  className="rounded-2xl border border-[var(--color-border)] px-4 text-sm hover:bg-[var(--color-muted)]"
-                >
-                  Add
-                </button>
-              </div>
-              {publishedPorts.length > 0 && (
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {publishedPorts.map((p, i) => (
-                    <span
-                      key={i}
-                      className="inline-flex items-center gap-1 rounded-full border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-1 text-xs font-mono"
-                    >
-                      {p}
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setPublishedPorts((arr) =>
-                            arr.filter((_, j) => j !== i),
-                          )
-                        }
-                        className="ml-1 text-[var(--color-muted-foreground)] hover:text-red-500"
-                      >
-                        ×
-                      </button>
-                    </span>
-                  ))}
-                </div>
-              )}
+                  }
+                }}
+                className="flex-1 rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-5 py-3 text-sm font-mono"
+                placeholder="80 or 8080:80"
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  if (newPort.trim()) {
+                    setPublishedPorts((p) => [...p, newPort.trim()]);
+                    setNewPort("");
+                  }
+                }}
+                className="rounded-2xl border border-[var(--color-border)] px-4 text-sm hover:bg-[var(--color-muted)]"
+              >
+                Add
+              </button>
             </div>
-
-            {/* Domains for Traefik + automatic SSL (makes "reachable with SSL" visible end-to-end) */}
-            <div>
-              <label className="block text-sm font-medium mb-2">
-                Public Domains (Traefik will create routers + request Let&apos;s
-                Encrypt certs)
-              </label>
-              <div className="flex gap-2">
-                <input
-                  value={newDomain}
-                  onChange={(e) => setNewDomain(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      if (newDomain.trim()) {
-                        setDomains((d) => [...d, newDomain.trim()]);
-                        setNewDomain("");
+            {publishedPorts.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-2">
+                {publishedPorts.map((p, i) => (
+                  <span
+                    key={i}
+                    className="inline-flex items-center gap-1 rounded-full border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-1 text-xs font-mono"
+                  >
+                    {p}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setPublishedPorts((arr) =>
+                          arr.filter((_, j) => j !== i),
+                        )
                       }
-                    }
-                  }}
-                  className="flex-1 rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-5 py-3 text-sm"
-                  placeholder="app.example.com"
-                />
-                <button
-                  type="button"
-                  onClick={() => {
+                      className="ml-1 text-[var(--color-muted-foreground)] hover:text-red-500"
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Domains for Traefik + automatic SSL (makes "reachable with SSL" visible end-to-end) */}
+          <div>
+            <label className="block text-sm font-medium mb-2">
+              Public Domains (Traefik will create routers + request Let&apos;s
+              Encrypt certs)
+            </label>
+            <div className="flex gap-2">
+              <input
+                value={newDomain}
+                onChange={(e) => setNewDomain(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
                     if (newDomain.trim()) {
                       setDomains((d) => [...d, newDomain.trim()]);
                       setNewDomain("");
                     }
-                  }}
-                  className="rounded-2xl border border-[var(--color-border)] px-4 text-sm hover:bg-[var(--color-muted)]"
-                >
-                  Add
-                </button>
-              </div>
-              {domains.length > 0 && (
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {domains.map((d, i) => (
-                    <span
-                      key={i}
-                      className="inline-flex items-center gap-1 rounded-full border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-1 text-xs font-mono"
-                    >
-                      {d}
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setDomains((arr) => arr.filter((_, j) => j !== i))
-                        }
-                        className="ml-1 text-[var(--color-muted-foreground)] hover:text-red-500"
-                      >
-                        ×
-                      </button>
-                    </span>
-                  ))}
-                </div>
-              )}
-              <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
-                These will appear as https:// links with SSL status after the
-                job is dispatched.
-              </p>
-            </div>
-
-            {/* Strategy configuration (Zero-Downtime ready) */}
-            <div className="border border-[var(--color-border)] rounded-2xl p-4 space-y-4">
-              <div className="font-medium text-sm">Deployment Strategy</div>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => setDeployStrategyType("rolling")}
-                  className={`flex-1 py-2 rounded-xl text-sm font-medium ${deployStrategyType === "rolling" ? "bg-[var(--color-foreground)] text-[var(--color-background)]" : "border border-[var(--color-border)]"}`}
-                >
-                  Rolling
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setDeployStrategyType("bluegreen")}
-                  className={`flex-1 py-2 rounded-xl text-sm font-medium ${deployStrategyType === "bluegreen" ? "bg-[var(--color-foreground)] text-[var(--color-background)]" : "border border-[var(--color-border)]"}`}
-                >
-                  Blue/Green
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setDeployStrategyType("canary")}
-                  className={`flex-1 py-2 rounded-xl text-sm font-medium ${deployStrategyType === "canary" ? "bg-[var(--color-foreground)] text-[var(--color-background)]" : "border border-[var(--color-border)]"}`}
-                >
-                  Canary
-                </button>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
-                <div>
-                  <label className="block mb-1">Health grace (secs)</label>
-                  <input
-                    type="number"
-                    value={healthGrace}
-                    onChange={(e) =>
-                      setHealthGrace(parseInt(e.target.value) || 30)
-                    }
-                    className="w-full rounded-xl border px-3 py-2 bg-[var(--color-background)]"
-                  />
-                </div>
-                <div>
-                  <label className="block mb-1">Failure threshold</label>
-                  <input
-                    type="number"
-                    value={failureThreshold}
-                    onChange={(e) =>
-                      setFailureThreshold(parseInt(e.target.value) || 3)
-                    }
-                    className="w-full rounded-xl border px-3 py-2 bg-[var(--color-background)]"
-                  />
-                </div>
-                <div className="flex items-end">
-                  <label className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      checked={rollbackOnFailure}
-                      onChange={(e) => setRollbackOnFailure(e.target.checked)}
-                    />
-                    Auto-rollback on failure
-                  </label>
-                </div>
-              </div>
-
-              {deployStrategyType === "canary" && (
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm border-t pt-3 mt-2">
-                  <div>
-                    <label className="block mb-1">Initial traffic %</label>
-                    <input
-                      type="number"
-                      value={canaryInitialTraffic}
-                      onChange={(e) =>
-                        setCanaryInitialTraffic(parseInt(e.target.value) || 10)
-                      }
-                      className="w-full rounded-xl border px-3 py-2 bg-[var(--color-background)]"
-                    />
-                  </div>
-                  <div>
-                    <label className="block mb-1">Step %</label>
-                    <input
-                      type="number"
-                      value={canaryStepPercent}
-                      onChange={(e) =>
-                        setCanaryStepPercent(parseInt(e.target.value) || 10)
-                      }
-                      className="w-full rounded-xl border px-3 py-2 bg-[var(--color-background)]"
-                    />
-                  </div>
-                  <div>
-                    <label className="block mb-1">Step duration (secs)</label>
-                    <input
-                      type="number"
-                      value={canaryStepDuration}
-                      onChange={(e) =>
-                        setCanaryStepDuration(parseInt(e.target.value) || 300)
-                      }
-                      className="w-full rounded-xl border px-3 py-2 bg-[var(--color-background)]"
-                    />
-                  </div>
-                </div>
-              )}
-              <div className="text-[10px] text-[var(--color-muted-foreground)]">
-                Strategy and gates are sent with the job and will drive phased
-                execution + rollback in the engine.
-              </div>
-
-              {/* Honest zero-downtime warning for stateful workloads */}
-              <div className="pt-3 border-t">
-                <label className="block text-sm font-medium mb-1">
-                  Workload Type
-                </label>
-                <select
-                  value={workloadType}
-                  onChange={(e) => setWorkloadType(e.target.value as any)}
-                  className="w-full rounded-xl border px-3 py-2 bg-[var(--color-background)] text-sm"
-                >
-                  <option value="stateless">
-                    Stateless (zero-downtime fully supported)
-                  </option>
-                  <option value="stateful">
-                    Stateful Service (brief disruption possible)
-                  </option>
-                  <option value="database">
-                    Database / Stateful Store (zero-downtime not guaranteed)
-                  </option>
-                </select>
-                {!zeroDowntimeGuaranteed && (
-                  <div className="mt-2 rounded-xl border border-amber-500/40 bg-[var(--color-warning)]/100/5 p-3 text-xs text-[var(--color-warning)]">
-                    ⚠ Zero-downtime is not guaranteed for {workloadType}{" "}
-                    workloads. Expect possible connection resets or dual-write
-                    windows during cutover. Consider a maintenance window for
-                    production stateful systems.
-                  </div>
-                )}
-              </div>
-
-              {/* Phase 3: Prominent One-click Databases & Services (direct "Deploy from Catalog" path + amber secret flow) */}
-              <div className="pt-3 border-t">
-                <div className="flex items-center justify-between mb-2">
-                  <div className="font-semibold text-sm">
-                    One-click Databases &amp; Services
-                  </div>
-                  <div className="text-[10px] px-2 py-0.5 rounded-full bg-[var(--color-success)]/120/10 text-emerald-700">
-                    Auto backup schedule + age secrets
-                  </div>
-                </div>
-                {isLoadingCatalog ? (
-                  <div className="text-xs text-[var(--color-muted-foreground)]">
-                    Loading catalog...
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                    {catalog
-                      .filter((c: any) =>
-                        ["database", "cache", "storage"].includes(c.category),
-                      )
-                      .slice(0, 6)
-                      .map((tpl: any) => (
-                        <button
-                          key={tpl.id}
-                          type="button"
-                          onClick={async () => {
-                            if (!adminToken) return;
-                            setIsDeploying(true);
-                            try {
-                              const res = await fetch(
-                                `${API_BASE}/applications/${appId}/deploy-from-catalog`,
-                                {
-                                  method: "POST",
-                                  headers,
-                                  body: JSON.stringify({
-                                    template_id: tpl.id,
-                                    // Let the backend handle generation for secret+generate variables.
-                                    // We only send explicit user overrides here.
-                                    variables: Object.fromEntries(
-                                      (tpl.variables || [])
-                                        .filter(
-                                          (v: any) => !v.generate && v.default,
-                                        )
-                                        .map((v: any) => [v.name, v.default]),
-                                    ),
-                                    strategy: tpl.default_strategy,
-                                    targets: deployAgent
-                                      ? [{ agent_id: deployAgent, replicas: 1 }]
-                                      : [],
-                                  }),
-                                },
-                              );
-                              if (res.ok) {
-                                const dep = await res.json();
-                                toast.success(
-                                  `Deployed ${tpl.name} from catalog (auto daily backup schedule created)`,
-                                );
-                                // Backend now automatically creates the backup schedule for database templates.
-                                // One-time secret reveal (if any were generated) is handled via the global oneTimeSecret banner.
-                                setOneTimeSecret(
-                                  `One or more strong secrets were generated for this catalog deploy. They were age-encrypted for your enrolled agents and will be injected via secure tmpfs. Check the Secrets list or deployment details.`,
-                                );
-                                setLatestDeployment(dep);
-                              } else {
-                                toast.error("Catalog deploy failed");
-                              }
-                            } catch {
-                              toast.error("Catalog deploy failed");
-                            } finally {
-                              setIsDeploying(false);
-                            }
-                          }}
-                          className="group text-left rounded-3xl border border-[var(--color-border)] p-4 hover:border-violet-500/60 hover:shadow-sm transition bg-[var(--color-card)] flex flex-col gap-1.5"
-                          disabled={isDeploying}
-                        >
-                          <div className="flex items-center gap-2">
-                            <div className="text-xl">🗄️</div>
-                            <div className="font-semibold tracking-tight group-hover:text-violet-600 transition">
-                              {tpl.name}
-                            </div>
-                          </div>
-                          <div className="text-xs text-[var(--color-muted-foreground)] line-clamp-2 min-h-[2.25rem]">
-                            {tpl.description}
-                          </div>
-                          <div className="mt-auto pt-2 flex items-center justify-between text-[10px]">
-                            <span className="font-medium text-violet-600 group-hover:underline">
-                              Deploy from Catalog →
-                            </span>
-                            <span className="text-[var(--color-muted-foreground)]">
-                              {tpl.category}
-                            </span>
-                          </div>
-                        </button>
-                      ))}
-                    {catalog.filter((c: any) =>
-                      ["database", "cache", "storage"].includes(c.category),
-                    ).length === 0 && (
-                      <div className="col-span-full text-xs text-[var(--color-muted-foreground)]">
-                        No database/cache templates in catalog yet.
-                      </div>
-                    )}
-                  </div>
-                )}
-                <div className="text-[10px] text-[var(--color-muted-foreground)] mt-2">
-                  One-click deploys a managed workload with rolling strategy
-                  tuned for stateful, auto daily backup schedule, and
-                  age-protected secrets shown once above via amber banner (exact
-                  RBAC pattern).
-                </div>
-              </div>
-            </div>
-
-            {/* Phase 2 Change Preview with actual spec diff */}
-            <div className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] p-4 text-sm">
-              <div className="font-medium mb-2">
-                Change Preview — What will actually change on the agent
-              </div>
-
-              {previousDeployment ? (
-                <div className="space-y-2">
-                  <DiffRow
-                    label="Image"
-                    oldVal={getImageFromSpec(previousDeployment.spec)}
-                    newVal={deployImage}
-                  />
-                  <DiffRow
-                    label="Strategy"
-                    oldVal={String(
-                      (previousDeployment.strategy as any)?.type || "unknown",
-                    )}
-                    newVal={deployStrategyType}
-                  />
-                  <DiffRow
-                    label="Ports"
-                    oldVal={JSON.stringify(
-                      getPortsFromSpec(previousDeployment.spec),
-                    )}
-                    newVal={JSON.stringify(publishedPorts)}
-                  />
-                  <DiffRow
-                    label="Domains"
-                    oldVal={JSON.stringify(
-                      getDomainsFromSpec(previousDeployment.spec),
-                    )}
-                    newVal={JSON.stringify(domains)}
-                  />
-                  <DiffRow
-                    label="Env Vars"
-                    oldVal={getEnvSummaryFromVars([])}
-                    newVal={getEnvSummaryFromVars(envVars)}
-                  />
-                </div>
-              ) : (
-                <div className="text-[var(--color-muted-foreground)]">
-                  First deployment for this app — no previous version to diff
-                  against.
-                </div>
-              )}
-
-              <div className="mt-2 text-[10px] text-[var(--color-muted-foreground)]">
-                Using {deployStrategyType} with the config above. Previous
-                version kept for rollback.
-              </div>
-
-              {!zeroDowntimeGuaranteed && (
-                <div className="mt-2 text-[10px] text-[var(--color-warning)] font-medium">
-                  ⚠ Honest note: Zero-downtime not guaranteed for this workload
-                  type.
-                </div>
-              )}
-            </div>
-
-            <div className="flex gap-3">
+                  }
+                }}
+                className="flex-1 rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-5 py-3 text-sm"
+                placeholder="app.example.com"
+              />
               <button
                 type="button"
                 onClick={() => {
-                  const spec = buildImageDeploySpec();
-                  // Merge secrets handling for preview (simplified - real secrets added on submit)
-                  const previewSpec = {
-                    ...spec,
-                    // Note: real secrets are added via age in handleDeploy
-                  };
-                  setPreviewSpecJson(JSON.stringify(previewSpec, null, 2));
-                  setShowPreviewSpec(true);
+                  if (newDomain.trim()) {
+                    setDomains((d) => [...d, newDomain.trim()]);
+                    setNewDomain("");
+                  }
                 }}
-                className="flex-1 rounded-2xl border border-[var(--color-border)] py-3.5 text-sm font-medium hover:bg-[var(--color-muted)] transition"
+                className="rounded-2xl border border-[var(--color-border)] px-4 text-sm hover:bg-[var(--color-muted)]"
               >
-                Preview Spec (JSON)
-              </button>
-
-              <button
-                type="submit"
-                disabled={
-                  isDeploying ||
-                  !adminToken ||
-                  !deployImage.trim() ||
-                  selectedAgentIds.length === 0
-                }
-                className="flex-[2] rounded-2xl bg-[var(--color-primary)] text-[var(--color-primary-foreground)] py-3.5 text-sm font-semibold disabled:opacity-60 active:opacity-90 transition flex items-center justify-center gap-2"
-              >
-                {isDeploying ? (
-                  <>Signing &amp; dispatching…</>
-                ) : (
-                  `Deploy Image to ${selectedAgentIds.length || 0} agent${selectedAgentIds.length === 1 ? "" : "s"}`
-                )}
+                Add
               </button>
             </div>
-
-            {/* Helpful note for image path completeness (Slice C) */}
-            <div className="text-[10px] text-[var(--color-muted-foreground)]">
-              Image deploy path is complete for Phase 1: private registry,
-              dynamic secrets (age), ports, domains, strategy, targets. Git path
-              is secondary.
-            </div>
-          </form>
-        </div>
-
-        {/* Rich Post-Deploy Experience – polished status + activity */}
-        {latestDeployment ? (
-          <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8 space-y-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="font-semibold text-xl tracking-tight">
-                  Latest Deployment
-                </div>
-                <div className="text-sm text-[var(--color-muted-foreground)]">
-                  v{latestDeployment.version} ·{" "}
-                  {new Date(latestDeployment.created_at).toLocaleString()}
-                </div>
-              </div>
-
-              {/* Derived rich status badge */}
-              <div
-                className={`text-xs px-3 py-1 rounded-full border font-medium ${
-                  liveResults[0]?.success === false
-                    ? "bg-[var(--color-destructive)]/100/10 text-[var(--color-destructive)] border-red-500/20"
-                    : liveResults.length > 0
-                      ? "bg-[var(--color-success)]/120/10 text-emerald-600 border-emerald-500/20"
-                      : "bg-[var(--color-warning)]/100/10 text-amber-600 border-amber-500/20"
-                }`}
-              >
-                {liveResults[0]?.success === false
-                  ? "FAILED"
-                  : liveResults.length > 0
-                    ? "RUNNING / HEALTHY"
-                    : latestDeployment.status || "DISPATCHED"}
-              </div>
-            </div>
-
-            {/* Live status from JobResults polling – richer */}
-            <div>
-              <div className="flex items-center gap-2 mb-3">
-                <div className="text-sm font-medium">
-                  Live Activity from Agent (JobResults)
-                </div>
-                {isPolling && (
-                  <div className="text-[10px] px-2 py-0.5 rounded bg-[var(--color-success)]/120/10 text-emerald-600">
-                    LIVE • refreshing
-                  </div>
-                )}
-              </div>
-
-              {liveResults.length === 0 ? (
-                <div className="rounded-2xl border border-[var(--color-border)] p-6 text-sm text-[var(--color-muted-foreground)]">
-                  Waiting for first results from the agent. Logs are already
-                  streaming above.
-                </div>
-              ) : (
-                <div className="space-y-2 text-sm font-mono bg-[var(--color-background)] rounded-2xl p-4 border border-[var(--color-border)]">
-                  {liveResults.slice(0, 8).map((r, idx) => (
-                    <div
-                      key={idx}
-                      className="flex justify-between py-1 border-b border-[var(--color-border)] last:border-b-0"
+            {domains.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-2">
+                {domains.map((d, i) => (
+                  <span
+                    key={i}
+                    className="inline-flex items-center gap-1 rounded-full border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-1 text-xs font-mono"
+                  >
+                    {d}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setDomains((arr) => arr.filter((_, j) => j !== i))
+                      }
+                      className="ml-1 text-[var(--color-muted-foreground)] hover:text-red-500"
                     >
-                      <div className="text-[var(--color-muted-foreground)]">
-                        {r.job_type} ·{" "}
-                        {r.started_at
-                          ? new Date(r.started_at).toLocaleTimeString()
-                          : ""}
-                      </div>
-                      <div
-                        className={
-                          r.success
-                            ? "text-emerald-600"
-                            : "text-[var(--color-destructive)]"
-                        }
-                      >
-                        {r.success ? "✓ SUCCESS" : "✕ FAILED"}
-                        {r.error && ` — ${r.error}`}
-                      </div>
-                    </div>
-                  ))}
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+            <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
+              These will appear as https:// links with SSL status after the job
+              is dispatched.
+            </p>
+          </div>
+
+          {/* Strategy configuration (Zero-Downtime ready) */}
+          <div className="border border-[var(--color-border)] rounded-2xl p-4 space-y-4">
+            <div className="font-medium text-sm">Deployment Strategy</div>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setDeployStrategyType("rolling")}
+                className={`flex-1 py-2 rounded-xl text-sm font-medium ${deployStrategyType === "rolling" ? "bg-[var(--color-foreground)] text-[var(--color-background)]" : "border border-[var(--color-border)]"}`}
+              >
+                Rolling
+              </button>
+              <button
+                type="button"
+                onClick={() => setDeployStrategyType("bluegreen")}
+                className={`flex-1 py-2 rounded-xl text-sm font-medium ${deployStrategyType === "bluegreen" ? "bg-[var(--color-foreground)] text-[var(--color-background)]" : "border border-[var(--color-border)]"}`}
+              >
+                Blue/Green
+              </button>
+              <button
+                type="button"
+                onClick={() => setDeployStrategyType("canary")}
+                className={`flex-1 py-2 rounded-xl text-sm font-medium ${deployStrategyType === "canary" ? "bg-[var(--color-foreground)] text-[var(--color-background)]" : "border border-[var(--color-border)]"}`}
+              >
+                Canary
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+              <div>
+                <label className="block mb-1">Health grace (secs)</label>
+                <input
+                  type="number"
+                  value={healthGrace}
+                  onChange={(e) =>
+                    setHealthGrace(parseInt(e.target.value) || 30)
+                  }
+                  className="w-full rounded-xl border px-3 py-2 bg-[var(--color-background)]"
+                />
+              </div>
+              <div>
+                <label className="block mb-1">Failure threshold</label>
+                <input
+                  type="number"
+                  value={failureThreshold}
+                  onChange={(e) =>
+                    setFailureThreshold(parseInt(e.target.value) || 3)
+                  }
+                  className="w-full rounded-xl border px-3 py-2 bg-[var(--color-background)]"
+                />
+              </div>
+              <div className="flex items-end">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={rollbackOnFailure}
+                    onChange={(e) => setRollbackOnFailure(e.target.checked)}
+                  />
+                  Auto-rollback on failure
+                </label>
+              </div>
+            </div>
+
+            {deployStrategyType === "canary" && (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm border-t pt-3 mt-2">
+                <div>
+                  <label className="block mb-1">Initial traffic %</label>
+                  <input
+                    type="number"
+                    value={canaryInitialTraffic}
+                    onChange={(e) =>
+                      setCanaryInitialTraffic(parseInt(e.target.value) || 10)
+                    }
+                    className="w-full rounded-xl border px-3 py-2 bg-[var(--color-background)]"
+                  />
+                </div>
+                <div>
+                  <label className="block mb-1">Step %</label>
+                  <input
+                    type="number"
+                    value={canaryStepPercent}
+                    onChange={(e) =>
+                      setCanaryStepPercent(parseInt(e.target.value) || 10)
+                    }
+                    className="w-full rounded-xl border px-3 py-2 bg-[var(--color-background)]"
+                  />
+                </div>
+                <div>
+                  <label className="block mb-1">Step duration (secs)</label>
+                  <input
+                    type="number"
+                    value={canaryStepDuration}
+                    onChange={(e) =>
+                      setCanaryStepDuration(parseInt(e.target.value) || 300)
+                    }
+                    className="w-full rounded-xl border px-3 py-2 bg-[var(--color-background)]"
+                  />
+                </div>
+              </div>
+            )}
+            <div className="text-[10px] text-[var(--color-muted-foreground)]">
+              Strategy and gates are sent with the job and will drive phased
+              execution + rollback in the engine.
+            </div>
+
+            {/* Honest zero-downtime warning for stateful workloads */}
+            <div className="pt-3 border-t">
+              <label className="block text-sm font-medium mb-1">
+                Workload Type
+              </label>
+              <select
+                value={workloadType}
+                onChange={(e) => setWorkloadType(e.target.value as any)}
+                className="w-full rounded-xl border px-3 py-2 bg-[var(--color-background)] text-sm"
+              >
+                <option value="stateless">
+                  Stateless (zero-downtime fully supported)
+                </option>
+                <option value="stateful">
+                  Stateful Service (brief disruption possible)
+                </option>
+                <option value="database">
+                  Database / Stateful Store (zero-downtime not guaranteed)
+                </option>
+              </select>
+              {!zeroDowntimeGuaranteed && (
+                <div className="mt-2 rounded-xl border border-amber-500/40 bg-[var(--color-warning)]/100/5 p-3 text-xs text-[var(--color-warning)]">
+                  ⚠ Zero-downtime is not guaranteed for {workloadType}{" "}
+                  workloads. Expect possible connection resets or dual-write
+                  windows during cutover. Consider a maintenance window for
+                  production stateful systems.
                 </div>
               )}
             </div>
 
-            {/* Sophisticated Rollout UI + Deeper Observability (Phase 2 advanced) */}
-            <div className="rounded-2xl border border-[var(--color-border)] p-5 text-sm space-y-4">
-              <div className="flex items-center justify-between">
-                <div className="font-semibold">
-                  Rollout Progress — {deployStrategyType.toUpperCase()}
+            {/* Phase 3: Prominent One-click Databases & Services (direct "Deploy from Catalog" path + amber secret flow) */}
+            <div className="pt-3 border-t">
+              <div className="flex items-center justify-between mb-2">
+                <div className="font-semibold text-sm">
+                  One-click Databases &amp; Services
                 </div>
-                <div
-                  className={`text-xs px-2 py-0.5 rounded ${latestDeployment?.status === "healthy" ? "bg-[var(--color-success)]/120/10 text-emerald-700" : "bg-[var(--color-warning)]/100/10 text-[var(--color-warning)]"}`}
-                >
-                  {latestDeployment?.status || "in progress"}
+                <div className="text-[10px] px-2 py-0.5 rounded-full bg-[var(--color-success)]/120/10 text-emerald-700">
+                  Auto backup schedule + age secrets
                 </div>
               </div>
-
-              {/* Visual progress + stateful awareness */}
-              <div>
-                {deployStrategyType === "canary" ? (
-                  <div>
-                    <div className="flex justify-between text-xs mb-1">
-                      <span>Traffic to new version</span>
-                      <span className="font-mono">
-                        {(latestDeployment as any)?.rollout_state
-                          ?.current_traffic_percent || 0}
-                        %
-                      </span>
-                    </div>
-                    <div className="h-2 bg-[var(--color-muted)] rounded-full overflow-hidden">
-                      <div
-                        className="h-2 bg-[var(--color-primary)] transition-all"
-                        style={{
-                          width: `${(latestDeployment as any)?.rollout_state?.current_traffic_percent || 0}%`,
-                        }}
-                      />
-                    </div>
-                  </div>
-                ) : (
-                  <div>
-                    <div className="flex justify-between text-xs mb-1">
-                      <span>Replicas rolled</span>
-                      <span className="font-mono">
-                        {(latestDeployment as any)?.rollout_state
-                          ?.current_replicas || 0}{" "}
-                        /{" "}
-                        {(latestDeployment as any)?.rollout_state
-                          ?.target_replicas || 1}
-                      </span>
-                    </div>
-                    <div className="h-2 bg-[var(--color-muted)] rounded-full overflow-hidden">
-                      <div
-                        className="h-2 bg-[var(--color-primary)] transition-all"
-                        style={{
-                          width: `${Math.min(100, (((latestDeployment as any)?.rollout_state?.current_replicas || 0) / ((latestDeployment as any)?.rollout_state?.target_replicas || 1)) * 100)}%`,
-                        }}
-                      />
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* Deeper observability: recent metric snapshots for rollout + stateful signals */}
-              <div>
-                <div className="font-medium mb-1 text-xs">
-                  Live Rollout Observability (metrics over time)
+              {isLoadingCatalog ? (
+                <div className="text-xs text-[var(--color-muted-foreground)]">
+                  Loading catalog...
                 </div>
-                {rolloutMetrics.length > 0 ? (
-                  <div className="text-[10px] font-mono bg-[var(--color-background)] p-2 rounded border border-[var(--color-border)] max-h-24 overflow-auto">
-                    {rolloutMetrics.slice(-5).map((m: any, i: number) => (
-                      <div key={i}>
-                        {new Date(m.timestamp).toLocaleTimeString()}:{" "}
-                        {m.metric_name}={m.value}{" "}
-                        {m.labels && JSON.stringify(m.labels)}
-                      </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                  {catalog
+                    .filter((c: any) =>
+                      ["database", "cache", "storage"].includes(c.category),
+                    )
+                    .slice(0, 6)
+                    .map((tpl: any) => (
+                      <button
+                        key={tpl.id}
+                        type="button"
+                        onClick={async () => {
+                          if (!adminToken) return;
+                          setIsDeploying(true);
+                          try {
+                            const res = await fetch(
+                              `${API_BASE}/applications/${appId}/deploy-from-catalog`,
+                              {
+                                method: "POST",
+                                headers,
+                                body: JSON.stringify({
+                                  template_id: tpl.id,
+                                  // Let the backend handle generation for secret+generate variables.
+                                  // We only send explicit user overrides here.
+                                  variables: Object.fromEntries(
+                                    (tpl.variables || [])
+                                      .filter(
+                                        (v: any) => !v.generate && v.default,
+                                      )
+                                      .map((v: any) => [v.name, v.default]),
+                                  ),
+                                  strategy: tpl.default_strategy,
+                                  targets: deployAgent
+                                    ? [{ agent_id: deployAgent, replicas: 1 }]
+                                    : [],
+                                }),
+                              },
+                            );
+                            if (res.ok) {
+                              const dep = await res.json();
+                              toast.success(
+                                `Deployed ${tpl.name} from catalog (auto daily backup schedule created)`,
+                              );
+                              // Backend now automatically creates the backup schedule for database templates.
+                              // One-time secret reveal (if any were generated) is handled via the global oneTimeSecret banner.
+                              setOneTimeSecret(
+                                `One or more strong secrets were generated for this catalog deploy. They were age-encrypted for your enrolled agents and will be injected via secure tmpfs. Check the Secrets list or deployment details.`,
+                              );
+                              setLatestDeployment(dep);
+                            } else {
+                              toast.error("Catalog deploy failed");
+                            }
+                          } catch {
+                            toast.error("Catalog deploy failed");
+                          } finally {
+                            setIsDeploying(false);
+                          }
+                        }}
+                        className="group text-left rounded-3xl border border-[var(--color-border)] p-4 hover:border-violet-500/60 hover:shadow-sm transition bg-[var(--color-card)] flex flex-col gap-1.5"
+                        disabled={isDeploying}
+                      >
+                        <div className="flex items-center gap-2">
+                          <div className="font-semibold tracking-tight group-hover:text-foreground transition">
+                            {tpl.name}
+                          </div>
+                        </div>
+                        <div className="text-xs text-[var(--color-muted-foreground)] line-clamp-2 min-h-[2.25rem]">
+                          {tpl.description}
+                        </div>
+                        <div className="mt-auto pt-2 flex items-center justify-between text-[10px]">
+                          <span className="font-medium text-violet-600 group-hover:underline">
+                            Deploy from Catalog →
+                          </span>
+                          <span className="text-[var(--color-muted-foreground)]">
+                            {tpl.category}
+                          </span>
+                        </div>
+                      </button>
                     ))}
-                  </div>
-                ) : (
-                  <div className="text-[var(--color-muted-foreground)] text-xs">
-                    Collecting rollout metrics (error_rate, p99, health, traffic
-                    weight, drain progress for stateful)...
-                  </div>
-                )}
-                <div className="text-[10px] text-[var(--color-muted-foreground)] mt-1">
-                  Deeper signals: HealthCheck results, container stats, L7
-                  weights, stateful drain metrics (connections, replication lag)
-                  flow here during phased execution.
+                  {catalog.filter((c: any) =>
+                    ["database", "cache", "storage"].includes(c.category),
+                  ).length === 0 && (
+                    <div className="col-span-full text-xs text-[var(--color-muted-foreground)]">
+                      No database/cache templates in catalog yet.
+                    </div>
+                  )}
                 </div>
+              )}
+              <div className="text-[10px] text-[var(--color-muted-foreground)] mt-2">
+                One-click deploys a managed workload with rolling strategy tuned
+                for stateful, auto daily backup schedule, and age-protected
+                secrets shown once above via amber banner (exact RBAC pattern).
               </div>
+            </div>
+          </div>
 
-              <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-                <div>
-                  Phase:{" "}
-                  <span className="font-mono">
-                    {(latestDeployment as any)?.rollout_state?.phase ||
-                      "initial"}
-                  </span>
+          {/* Phase 2 Change Preview with actual spec diff */}
+          <div className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] p-4 text-sm">
+            <div className="font-medium mb-2">
+              Change Preview — What will actually change on the agent
+            </div>
+
+            {previousDeployment ? (
+              <div className="space-y-2">
+                <DiffRow
+                  label="Image"
+                  oldVal={getImageFromSpec(previousDeployment.spec)}
+                  newVal={deployImage}
+                />
+                <DiffRow
+                  label="Strategy"
+                  oldVal={String(
+                    (previousDeployment.strategy as any)?.type || "unknown",
+                  )}
+                  newVal={deployStrategyType}
+                />
+                <DiffRow
+                  label="Ports"
+                  oldVal={JSON.stringify(
+                    getPortsFromSpec(previousDeployment.spec),
+                  )}
+                  newVal={JSON.stringify(publishedPorts)}
+                />
+                <DiffRow
+                  label="Domains"
+                  oldVal={JSON.stringify(
+                    getDomainsFromSpec(previousDeployment.spec),
+                  )}
+                  newVal={JSON.stringify(domains)}
+                />
+                <DiffRow
+                  label="Env Vars"
+                  oldVal={getEnvSummaryFromVars([])}
+                  newVal={getEnvSummaryFromVars(envVars)}
+                />
+              </div>
+            ) : (
+              <div className="text-[var(--color-muted-foreground)]">
+                First deployment for this app — no previous version to diff
+                against.
+              </div>
+            )}
+
+            <div className="mt-2 text-[10px] text-[var(--color-muted-foreground)]">
+              Using {deployStrategyType} with the config above. Previous version
+              kept for rollback.
+            </div>
+
+            {!zeroDowntimeGuaranteed && (
+              <div className="mt-2 text-[10px] text-[var(--color-warning)] font-medium">
+                ⚠ Honest note: Zero-downtime not guaranteed for this workload
+                type.
+              </div>
+            )}
+          </div>
+
+          <div className="flex gap-3">
+            <button
+              type="button"
+              onClick={() => {
+                const spec = buildImageDeploySpec();
+                // Merge secrets handling for preview (simplified - real secrets added on submit)
+                const previewSpec = {
+                  ...spec,
+                  // Note: real secrets are added via age in handleDeploy
+                };
+                setPreviewSpecJson(JSON.stringify(previewSpec, null, 2));
+                setShowPreviewSpec(true);
+              }}
+              className="flex-1 rounded-2xl border border-[var(--color-border)] py-3.5 text-sm font-medium hover:bg-[var(--color-muted)] transition"
+            >
+              Preview Spec (JSON)
+            </button>
+
+            <button
+              type="submit"
+              disabled={
+                isDeploying ||
+                !adminToken ||
+                !deployImage.trim() ||
+                selectedAgentIds.length === 0
+              }
+              className="flex-[2] rounded-2xl bg-[var(--color-primary)] text-[var(--color-primary-foreground)] py-3.5 text-sm font-semibold disabled:opacity-60 active:opacity-90 transition flex items-center justify-center gap-2"
+            >
+              {isDeploying ? (
+                <>Signing &amp; dispatching…</>
+              ) : (
+                `Deploy Image to ${selectedAgentIds.length || 0} agent${selectedAgentIds.length === 1 ? "" : "s"}`
+              )}
+            </button>
+          </div>
+
+          {/* Helpful note for image path completeness (Slice C) */}
+          <div className="text-[10px] text-[var(--color-muted-foreground)]">
+            Image deploy path is complete for Phase 1: private registry, dynamic
+            secrets (age), ports, domains, strategy, targets. Git path is
+            secondary.
+          </div>
+        </form>
+      </div>
+
+      {/* Rich Post-Deploy Experience – polished status + activity */}
+      {latestDeployment ? (
+        <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8 space-y-6">
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="font-semibold text-xl tracking-tight">
+                Latest Deployment
+              </div>
+              <div className="text-sm text-[var(--color-muted-foreground)]">
+                v{latestDeployment.version} ·{" "}
+                {new Date(latestDeployment.created_at).toLocaleString()}
+              </div>
+            </div>
+
+            {/* Derived rich status badge */}
+            <div
+              className={`text-xs px-3 py-1 rounded-full border font-medium ${
+                liveResults[0]?.success === false
+                  ? "bg-[var(--color-destructive)]/100/10 text-[var(--color-destructive)] border-red-500/20"
+                  : liveResults.length > 0
+                    ? "bg-[var(--color-success)]/120/10 text-emerald-600 border-emerald-500/20"
+                    : "bg-[var(--color-warning)]/100/10 text-amber-600 border-amber-500/20"
+              }`}
+            >
+              {liveResults[0]?.success === false
+                ? "FAILED"
+                : liveResults.length > 0
+                  ? "RUNNING / HEALTHY"
+                  : latestDeployment.status || "DISPATCHED"}
+            </div>
+          </div>
+
+          {/* Live status from JobResults polling – richer */}
+          <div>
+            <div className="flex items-center gap-2 mb-3">
+              <div className="text-sm font-medium">
+                Live Activity from Agent (JobResults)
+              </div>
+              {isPolling && (
+                <div className="text-[10px] px-2 py-0.5 rounded bg-[var(--color-success)]/120/10 text-emerald-600">
+                  LIVE • refreshing
                 </div>
+              )}
+            </div>
+
+            {liveResults.length === 0 ? (
+              <div className="rounded-2xl border border-[var(--color-border)] p-6 text-sm text-[var(--color-muted-foreground)]">
+                Waiting for first results from the agent. Logs are already
+                streaming above.
+              </div>
+            ) : (
+              <div className="space-y-2 text-sm font-mono bg-[var(--color-background)] rounded-2xl p-4 border border-[var(--color-border)]">
+                {liveResults.slice(0, 8).map((r, idx) => (
+                  <div
+                    key={idx}
+                    className="flex justify-between py-1 border-b border-[var(--color-border)] last:border-b-0"
+                  >
+                    <div className="text-[var(--color-muted-foreground)]">
+                      {r.job_type} ·{" "}
+                      {r.started_at
+                        ? new Date(r.started_at).toLocaleTimeString()
+                        : ""}
+                    </div>
+                    <div
+                      className={
+                        r.success
+                          ? "text-emerald-600"
+                          : "text-[var(--color-destructive)]"
+                      }
+                    >
+                      {r.success ? "✓ SUCCESS" : "✕ FAILED"}
+                      {r.error && ` — ${r.error}`}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Sophisticated Rollout UI + Deeper Observability (Phase 2 advanced) */}
+          <div className="rounded-2xl border border-[var(--color-border)] p-5 text-sm space-y-4">
+            <div className="flex items-center justify-between">
+              <div className="font-semibold">
+                Rollout Progress — {deployStrategyType.toUpperCase()}
+              </div>
+              <div
+                className={`text-xs px-2 py-0.5 rounded ${latestDeployment?.status === "healthy" ? "bg-[var(--color-success)]/120/10 text-emerald-700" : "bg-[var(--color-warning)]/100/10 text-[var(--color-warning)]"}`}
+              >
+                {latestDeployment?.status || "in progress"}
+              </div>
+            </div>
+
+            {/* Visual progress + stateful awareness */}
+            <div>
+              {deployStrategyType === "canary" ? (
                 <div>
-                  Failure count:{" "}
-                  <span className="font-mono">
-                    {(latestDeployment as any)?.rollout_state?.failure_count ||
-                      0}
-                  </span>
-                </div>
-                <div>
-                  Last healthy gate:{" "}
-                  <span className="font-mono text-[10px]">
-                    {(latestDeployment as any)?.rollout_state
-                      ?.last_health_gate_passed_at
-                      ? new Date(
-                          (latestDeployment as any).rollout_state
-                            .last_health_gate_passed_at,
-                        ).toLocaleTimeString()
-                      : "—"}
-                  </span>
-                </div>
-                {deployStrategyType === "canary" && (
-                  <div>
-                    Current traffic:{" "}
+                  <div className="flex justify-between text-xs mb-1">
+                    <span>Traffic to new version</span>
                     <span className="font-mono">
                       {(latestDeployment as any)?.rollout_state
                         ?.current_traffic_percent || 0}
                       %
                     </span>
                   </div>
-                )}
-              </div>
-
-              {/* Real status timeline — sourced from liveResults (JobResultRow from /results endpoint) */}
-              <div className="pt-3 border-t border-[var(--color-border)]">
-                <div className="flex items-center gap-2 text-xs uppercase tracking-widest text-[var(--color-muted-foreground)] mb-2">
-                  <Clock className="w-3.5 h-3.5" /> Execution Timeline
-                  (JobResults)
-                </div>
-                <StatusTimeline results={liveResults as any} max={10} />
-              </div>
-
-              <div className="text-[10px] text-[var(--color-muted-foreground)] pt-1 border-t">
-                Health gates driven by real HealthCheck jobs + metrics
-                (error_rate, p99, stateful signals). Automatic rollback active.
-                Better stateful drain (pre-stop + extended grace) active in
-                agent.
-              </div>
-            </div>
-
-            {/* Prominent rich actions + Phase 2 manual controls */}
-            <div className="flex gap-3 pt-4 border-t border-[var(--color-border)]">
-              <button
-                onClick={() =>
-                  latestDeployment && openLogsForDeployment(latestDeployment)
-                }
-                className="flex-1 rounded-2xl border border-[var(--color-border)] py-3 text-sm font-medium hover:bg-[var(--color-muted)]"
-              >
-                Open Live Logs
-              </button>
-              <Link
-                href="/admin/deployments"
-                className="flex-1 text-center rounded-2xl bg-[var(--color-foreground)] text-[var(--color-background)] py-3 text-sm font-medium"
-              >
-                Full Deployments
-              </Link>
-            </div>
-
-            {/* Phase 2 manual promote / rollback controls (wired to backend) */}
-            <div className="flex gap-3">
-              <button
-                onClick={async () => {
-                  if (!latestDeployment || !adminToken) return;
-                  try {
-                    const res = await fetch(
-                      `${API_BASE}/admin/deployments/${latestDeployment.id}/promote`,
-                      { method: "POST", headers },
-                    );
-                    if (res.ok) {
-                      toast.success("Promote requested");
-                      // refresh activity
-                      await loadApplication();
-                    } else {
-                      toast.error("Promote failed");
-                    }
-                  } catch {
-                    toast.error("Promote failed");
-                  }
-                }}
-                className="flex-1 rounded-2xl border border-emerald-500/30 text-emerald-600 py-2 text-sm font-medium hover:bg-[var(--color-success)]/120/5"
-              >
-                Manual Promote (to 100%)
-              </button>
-              <button
-                onClick={async () => {
-                  if (!latestDeployment || !adminToken) return;
-                  try {
-                    const res = await fetch(
-                      `${API_BASE}/admin/deployments/${latestDeployment.id}/rollback`,
-                      { method: "POST", headers },
-                    );
-                    if (res.ok) {
-                      toast.success("Rollback requested");
-                      await loadApplication();
-                    } else {
-                      toast.error("Rollback failed");
-                    }
-                  } catch {
-                    toast.error("Rollback failed");
-                  }
-                }}
-                className="flex-1 rounded-2xl border border-red-500/30 text-[var(--color-destructive)] py-2 text-sm font-medium hover:bg-[var(--color-destructive)]/100/5"
-              >
-                Manual Rollback
-              </button>
-            </div>
-
-            {/* End-to-end reachable with SSL visibility (per Phase 1 plan) */}
-            {domains.length > 0 && (
-              <div className="pt-4 border-t border-[var(--color-border)]">
-                <div className="font-semibold text-sm mb-2">
-                  Reachable Endpoints (Traefik + Let&apos;s Encrypt)
-                </div>
-                <div className="space-y-2">
-                  {domains.map((d, idx) => (
+                  <div className="h-2 bg-[var(--color-muted)] rounded-full overflow-hidden">
                     <div
-                      key={idx}
-                      className="flex items-center gap-3 rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-4 py-2.5 text-sm"
-                    >
-                      <div className="font-mono flex-1 truncate">
-                        https://{d}
-                      </div>
-                      <button
-                        onClick={() => {
-                          navigator.clipboard.writeText(`https://${d}`);
-                          toast.success("Copied");
-                        }}
-                        className="px-3 py-1 text-xs rounded-xl border border-[var(--color-border)] hover:bg-[var(--color-muted)]"
-                      >
-                        Copy
-                      </button>
-                      <a
-                        href={`https://${d}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="px-3 py-1 text-xs rounded-xl bg-[var(--color-primary)] text-[var(--color-primary-foreground)] hover:opacity-90"
-                      >
-                        Open
-                      </a>
+                      className="h-2 bg-[var(--color-primary)] transition-all"
+                      style={{
+                        width: `${(latestDeployment as any)?.rollout_state?.current_traffic_percent || 0}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              ) : (
+                <div>
+                  <div className="flex justify-between text-xs mb-1">
+                    <span>Replicas rolled</span>
+                    <span className="font-mono">
+                      {(latestDeployment as any)?.rollout_state
+                        ?.current_replicas || 0}{" "}
+                      /{" "}
+                      {(latestDeployment as any)?.rollout_state
+                        ?.target_replicas || 1}
+                    </span>
+                  </div>
+                  <div className="h-2 bg-[var(--color-muted)] rounded-full overflow-hidden">
+                    <div
+                      className="h-2 bg-[var(--color-primary)] transition-all"
+                      style={{
+                        width: `${Math.min(100, (((latestDeployment as any)?.rollout_state?.current_replicas || 0) / ((latestDeployment as any)?.rollout_state?.target_replicas || 1)) * 100)}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Deeper observability: recent metric snapshots for rollout + stateful signals */}
+            <div>
+              <div className="font-medium mb-1 text-xs">
+                Live Rollout Observability (metrics over time)
+              </div>
+              {rolloutMetrics.length > 0 ? (
+                <div className="text-[10px] font-mono bg-[var(--color-background)] p-2 rounded border border-[var(--color-border)] max-h-24 overflow-auto">
+                  {rolloutMetrics.slice(-5).map((m: any, i: number) => (
+                    <div key={i}>
+                      {new Date(m.timestamp).toLocaleTimeString()}:{" "}
+                      {m.metric_name}={m.value}{" "}
+                      {m.labels && JSON.stringify(m.labels)}
                     </div>
                   ))}
                 </div>
-                <div className="mt-2 text-[10px] text-[var(--color-muted-foreground)]">
-                  Configuration sent with the job. Agent will configure Traefik
-                  router + request certificate on first request. Monitor logs
-                  for &quot;acme&quot; / certificate events.
+              ) : (
+                <div className="text-[var(--color-muted-foreground)] text-xs">
+                  Collecting rollout metrics (error_rate, p99, health, traffic
+                  weight, drain progress for stateful)...
                 </div>
+              )}
+              <div className="text-[10px] text-[var(--color-muted-foreground)] mt-1">
+                Deeper signals: HealthCheck results, container stats, L7
+                weights, stateful drain metrics (connections, replication lag)
+                flow here during phased execution.
               </div>
-            )}
-          </div>
-        ) : (
-          /* Better empty state */
-          <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-12 text-center">
-            <div className="mx-auto w-12 h-12 rounded-full bg-[var(--color-muted)] mb-4" />
-            <div className="font-medium text-lg">
-              No deployments yet for this application
             </div>
-            <p className="mt-2 text-[var(--color-muted-foreground)] max-w-sm mx-auto">
-              Use the form above to deploy a container image or connect a Git
-              source. After the first deploy, live status and logs will appear
-              here automatically.
-            </p>
+
+            <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+              <div>
+                Phase:{" "}
+                <span className="font-mono">
+                  {(latestDeployment as any)?.rollout_state?.phase || "initial"}
+                </span>
+              </div>
+              <div>
+                Failure count:{" "}
+                <span className="font-mono">
+                  {(latestDeployment as any)?.rollout_state?.failure_count || 0}
+                </span>
+              </div>
+              <div>
+                Last healthy gate:{" "}
+                <span className="font-mono text-[10px]">
+                  {(latestDeployment as any)?.rollout_state
+                    ?.last_health_gate_passed_at
+                    ? new Date(
+                        (latestDeployment as any).rollout_state
+                          .last_health_gate_passed_at,
+                      ).toLocaleTimeString()
+                    : "—"}
+                </span>
+              </div>
+              {deployStrategyType === "canary" && (
+                <div>
+                  Current traffic:{" "}
+                  <span className="font-mono">
+                    {(latestDeployment as any)?.rollout_state
+                      ?.current_traffic_percent || 0}
+                    %
+                  </span>
+                </div>
+              )}
+            </div>
+
+            {/* Real status timeline — sourced from liveResults (JobResultRow from /results endpoint) */}
+            <div className="pt-3 border-t border-[var(--color-border)]">
+              <div className="flex items-center gap-2 text-xs uppercase tracking-widest text-[var(--color-muted-foreground)] mb-2">
+                <Clock className="w-3.5 h-3.5" /> Execution Timeline
+                (JobResults)
+              </div>
+              <StatusTimeline results={liveResults as any} max={10} />
+            </div>
+
+            <div className="text-[10px] text-[var(--color-muted-foreground)] pt-1 border-t">
+              Health gates driven by real HealthCheck jobs + metrics
+              (error_rate, p99, stateful signals). Automatic rollback active.
+              Better stateful drain (pre-stop + extended grace) active in agent.
+            </div>
           </div>
-        )}
-      </main>
+
+          {/* Prominent rich actions + Phase 2 manual controls */}
+          <div className="flex gap-3 pt-4 border-t border-[var(--color-border)]">
+            <button
+              onClick={() =>
+                latestDeployment && openLogsForDeployment(latestDeployment)
+              }
+              className="flex-1 rounded-2xl border border-[var(--color-border)] py-3 text-sm font-medium hover:bg-[var(--color-muted)]"
+            >
+              Open Live Logs
+            </button>
+            <Link
+              href="/admin/deployments"
+              className="flex-1 text-center rounded-2xl bg-[var(--color-foreground)] text-[var(--color-background)] py-3 text-sm font-medium"
+            >
+              Full Deployments
+            </Link>
+          </div>
+
+          {/* Phase 2 manual promote / rollback controls (wired to backend) */}
+          <div className="flex gap-3">
+            <button
+              onClick={async () => {
+                if (!latestDeployment || !adminToken) return;
+                try {
+                  const res = await fetch(
+                    `${API_BASE}/admin/deployments/${latestDeployment.id}/promote`,
+                    { method: "POST", headers },
+                  );
+                  if (res.ok) {
+                    toast.success("Promote requested");
+                    // refresh activity
+                    await loadApplication();
+                  } else {
+                    toast.error("Promote failed");
+                  }
+                } catch {
+                  toast.error("Promote failed");
+                }
+              }}
+              className="flex-1 rounded-2xl border border-emerald-500/30 text-emerald-600 py-2 text-sm font-medium hover:bg-[var(--color-success)]/120/5"
+            >
+              Manual Promote (to 100%)
+            </button>
+            <button
+              onClick={async () => {
+                if (!latestDeployment || !adminToken) return;
+                try {
+                  const res = await fetch(
+                    `${API_BASE}/admin/deployments/${latestDeployment.id}/rollback`,
+                    { method: "POST", headers },
+                  );
+                  if (res.ok) {
+                    toast.success("Rollback requested");
+                    await loadApplication();
+                  } else {
+                    toast.error("Rollback failed");
+                  }
+                } catch {
+                  toast.error("Rollback failed");
+                }
+              }}
+              className="flex-1 rounded-2xl border border-red-500/30 text-[var(--color-destructive)] py-2 text-sm font-medium hover:bg-[var(--color-destructive)]/100/5"
+            >
+              Manual Rollback
+            </button>
+          </div>
+
+          {/* End-to-end reachable with SSL visibility (per Phase 1 plan) */}
+          {domains.length > 0 && (
+            <div className="pt-4 border-t border-[var(--color-border)]">
+              <div className="font-semibold text-sm mb-2">
+                Reachable Endpoints (Traefik + Let&apos;s Encrypt)
+              </div>
+              <div className="space-y-2">
+                {domains.map((d, idx) => (
+                  <div
+                    key={idx}
+                    className="flex items-center gap-3 rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-4 py-2.5 text-sm"
+                  >
+                    <div className="font-mono flex-1 truncate">https://{d}</div>
+                    <button
+                      onClick={() => {
+                        navigator.clipboard.writeText(`https://${d}`);
+                        toast.success("Copied");
+                      }}
+                      className="px-3 py-1 text-xs rounded-xl border border-[var(--color-border)] hover:bg-[var(--color-muted)]"
+                    >
+                      Copy
+                    </button>
+                    <a
+                      href={`https://${d}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="px-3 py-1 text-xs rounded-xl bg-[var(--color-primary)] text-[var(--color-primary-foreground)] hover:opacity-90"
+                    >
+                      Open
+                    </a>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-2 text-[10px] text-[var(--color-muted-foreground)]">
+                Configuration sent with the job. Agent will configure Traefik
+                router + request certificate on first request. Monitor logs for
+                &quot;acme&quot; / certificate events.
+              </div>
+            </div>
+          )}
+        </div>
+      ) : (
+        /* Better empty state */
+        <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-12 text-center">
+          <div className="mx-auto w-12 h-12 rounded-full bg-[var(--color-muted)] mb-4" />
+          <div className="font-medium text-lg">
+            No deployments yet for this application
+          </div>
+          <p className="mt-2 text-[var(--color-muted-foreground)] max-w-sm mx-auto">
+            Use the form above to deploy a container image or connect a Git
+            source. After the first deploy, live status and logs will appear
+            here automatically.
+          </p>
+        </div>
+      )}
 
       {/* Logs Dialog — now matches deployments polish: timestamps, filter+highlight, pause, copy, status, line nums */}
       <Dialog.Root
@@ -2195,8 +2131,8 @@ export default function ApplicationDetailPage() {
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 bg-black/80 z-[200]" />
           <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[96vw] max-w-4xl rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8 shadow-2xl z-[210] focus:outline-none overflow-auto max-h-[88vh]">
-            <Dialog.Title className="text-3xl font-semibold tracking-tighter mb-1.5 bg-gradient-to-r from-violet-600 to-fuchsia-600 bg-clip-text text-transparent">
-              Update Forge — Zero-Downtime Magic (Dogfood)
+            <Dialog.Title className="text-2xl font-semibold tracking-tight mb-1.5 text-foreground">
+              Update Forge — Zero-Downtime (Dogfood)
             </Dialog.Title>
             <p className="text-[var(--color-muted-foreground)] mb-5 text-sm">
               The entire platform updates using the exact same DeploymentSpec +
@@ -2373,7 +2309,7 @@ export default function ApplicationDetailPage() {
                 }
               }}
               disabled={isUpdatingForge}
-              className="w-full py-3.5 rounded-2xl bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white font-semibold text-base disabled:opacity-60 hover:brightness-110 transition"
+              className="btn btn-primary w-full"
             >
               {isUpdatingForge
                 ? "Dispatching phased SystemUpdate jobs via Canary engine..."

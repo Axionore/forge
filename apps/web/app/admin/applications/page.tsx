@@ -4,6 +4,7 @@ import React from "react";
 import Link from "next/link";
 import * as Dialog from "@radix-ui/react-dialog";
 import { toast } from "sonner";
+import { useAdminToken } from "../token-store";
 
 const API_BASE = "http://localhost:3000";
 
@@ -61,8 +62,7 @@ function copyToClipboard(text: string) {
 }
 
 export default function ApplicationsPage() {
-  const [adminToken, setAdminToken] = React.useState("");
-  const [showAdminToken, setShowAdminToken] = React.useState(false);
+  const [adminToken] = useAdminToken();
   const [applications, setApplications] = React.useState<Application[]>([]);
   const [isLoading, setIsLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -299,267 +299,176 @@ export default function ApplicationsPage() {
   };
 
   return (
-    <div className="min-h-screen bg-[var(--color-background)] text-[var(--color-foreground)]">
-      {/* Header - exact pattern from access + deployments */}
-      <header className="sticky top-0 z-50 border-b border-[var(--color-border)] bg-[var(--color-card)]/95 backdrop-blur">
-        <div className="mx-auto max-w-7xl px-6 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="h-8 w-8 rounded bg-[var(--color-primary)]" />
-            <div>
-              <div className="font-semibold tracking-tighter text-lg">
-                Forge
-              </div>
-              <div className="text-[10px] text-[var(--color-muted-foreground)] -mt-1">
-                CONTROL PLANE
-              </div>
-            </div>
-            <div className="ml-4 text-sm font-medium text-[var(--color-muted-foreground)]">
-              Applications
-            </div>
-          </div>
-          <nav className="flex items-center gap-1 text-sm">
-            <Link
-              href="/admin/access"
-              className="px-3 py-1.5 rounded-md hover:bg-[var(--color-muted)]"
-            >
-              Access
-            </Link>
-            <Link
-              href="/admin/enrollment-tokens"
-              className="px-3 py-1.5 rounded-md hover:bg-[var(--color-muted)]"
-            >
-              Add Server
-            </Link>
-            <Link
-              href="/admin/deployments"
-              className="px-3 py-1.5 rounded-md hover:bg-[var(--color-muted)]"
-            >
-              Deployments
-            </Link>
-            <Link
-              href="/admin/applications"
-              className="px-3 py-1.5 rounded-md bg-[var(--color-muted)] font-medium"
-            >
-              Applications
-            </Link>
-          </nav>
-        </div>
-      </header>
-
-      <main className="mx-auto max-w-7xl px-6 py-8 space-y-8">
-        <div>
-          <div className="flex items-baseline gap-3">
-            <h1 className="text-3xl font-semibold tracking-tight">
-              Applications
-            </h1>
-            <Link
-              href="/admin/enrollment-tokens"
-              className="text-xs px-2.5 py-0.5 rounded-full border border-emerald-500/30 bg-[var(--color-success)]/120/5 text-emerald-700 hover:bg-[var(--color-success)]/120/10"
-            >
-              Servers online → Add more
-            </Link>
-          </div>
-          <p className="text-[var(--color-muted-foreground)] mt-1">
-            Catalog of deployable units from Git, Dockerfiles, Compose, and
-            templates. Deployments target real enrolled agents with signed jobs
-            and per-agent age envelopes.
-          </p>
+    <div className="mx-auto max-w-7xl px-6 py-8 space-y-8">
+      <div>
+        <div className="flex items-baseline gap-3">
+          <h1 className="text-2xl font-semibold tracking-tight">
+            Applications
+          </h1>
           <Link
             href="/admin/enrollment-tokens"
-            className="inline-flex mt-3 items-center gap-2 text-sm font-medium rounded-2xl border border-violet-500/30 bg-violet-500/5 px-4 h-9 hover:bg-violet-500/10"
+            className="text-xs px-2.5 py-0.5 rounded-full border border-border text-[var(--color-muted-foreground)] hover:bg-[oklch(1_0_0/0.05)]"
           >
-            🖥️ Add Server / Scale capacity →{" "}
-            <span className="text-xs text-violet-600">
-              (Ed25519 identity + age secrets per server — never plaintext in
-              control plane)
-            </span>
+            Add server →
           </Link>
         </div>
+        <p className="text-sm text-[var(--color-muted-foreground)] mt-1 max-w-2xl">
+          Catalog of deployable units from Git, Dockerfiles, Compose, and
+          templates. Deployments target real enrolled agents with signed jobs
+          and per-agent age envelopes.
+        </p>
+      </div>
 
-        {/* Admin Token bootstrap card - exact pattern from access + deployments (real X-Admin-Token) */}
-        <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-6">
-          <div className="flex items-center justify-between mb-3">
-            <div className="font-medium">Admin Token (FORGE_ADMIN_TOKEN)</div>
-          </div>
-          <div className="flex gap-3">
-            <input
-              type={showAdminToken ? "text" : "password"}
-              value={adminToken}
-              onChange={(e) => setAdminToken(e.target.value)}
-              placeholder="Paste your strong bootstrap token"
-              className="flex-1 rounded-2xl border border-[var(--color-input)] bg-[var(--color-background)] px-4 py-2.5 text-sm font-mono"
-            />
+      {/* Error banner (real) */}
+      {error && (
+        <div className="rounded-3xl border border-red-500/30 bg-[var(--color-destructive)]/100/5 p-4 text-sm text-[var(--color-destructive)]">
+          {error}
+          <button onClick={() => setError(null)} className="ml-4 underline">
+            dismiss
+          </button>
+        </div>
+      )}
+
+      {/* Exact amber one-time secret banner (copy-once, dismiss, redacted) */}
+      {oneTimeSecret && (
+        <div className="rounded-lg border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/10 p-6">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <div className="font-semibold text-amber-600">
+                One-time secret — copy now
+              </div>
+              <p className="text-sm text-amber-600/90 mt-0.5">
+                It will never be shown again.
+              </p>
+            </div>
             <button
-              type="button"
-              onClick={() => setShowAdminToken(!showAdminToken)}
-              className="px-4 rounded-2xl border border-[var(--color-border)] text-sm"
+              onClick={() => setOneTimeSecret(null)}
+              className="text-amber-600/70 hover:text-amber-600 text-2xl leading-none -mt-1"
             >
-              {showAdminToken ? "Hide" : "Show"}
+              ×
             </button>
-            <Link
-              href="/admin/access"
-              className="px-4 py-2.5 rounded-2xl border border-[var(--color-border)] text-sm hover:bg-[var(--color-muted)]"
-            >
-              Manage
-            </Link>
           </div>
-          <div className="mt-2 text-xs text-[var(--color-muted-foreground)]">
-            This page now calls the real /admin/applications endpoints (RBAC +
-            audit enforced on create).
+          <pre className="mt-4 font-mono text-sm bg-black/60 p-4 rounded-2xl overflow-x-auto whitespace-pre-wrap break-all select-all border border-amber-500/20">
+            {oneTimeSecret}
+          </pre>
+          <div className="mt-4 flex gap-3">
+            <button
+              onClick={() => copyToClipboard(oneTimeSecret)}
+              className="btn btn-primary"
+            >
+              Copy secret
+            </button>
+            <button
+              onClick={() => setOneTimeSecret(null)}
+              className="btn btn-ghost"
+            >
+              Dismiss (never shown again)
+            </button>
           </div>
         </div>
+      )}
 
-        {/* Error banner (real) */}
-        {error && (
-          <div className="rounded-3xl border border-red-500/30 bg-[var(--color-destructive)]/100/5 p-4 text-sm text-[var(--color-destructive)]">
-            {error}
-            <button onClick={() => setError(null)} className="ml-4 underline">
-              dismiss
-            </button>
-          </div>
-        )}
+      {/* Main catalog card */}
+      <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8">
+        <div className="flex items-center justify-between mb-6">
+          <div className="font-semibold text-lg tracking-tight">Catalog</div>
+          <button
+            onClick={() => {
+              setIsWizardOpen(true);
+              setWizardStep("select");
+              setSelectedKind(null);
+              setFormData({});
+            }}
+            className="px-5 py-2.5 rounded-2xl bg-[var(--color-primary)] text-[var(--color-primary-foreground)] text-sm font-medium hover:opacity-90"
+          >
+            Create Application
+          </button>
+        </div>
 
-        {/* Exact amber one-time secret banner (copy-once, dismiss, redacted) */}
-        {oneTimeSecret && (
-          <div className="rounded-3xl border border-amber-500/30 bg-[var(--color-warning)]/100/5 p-6">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <div className="font-semibold text-amber-600">
-                  One-time secret — copy now
+        {/* 4 async states - exact empty p-12, loading skeletons, error banner above, success grid (real API now) */}
+        {isLoading ? (
+          <div className="space-y-3">
+            {[1, 2].map((i) => (
+              <div
+                key={i}
+                className="rounded-2xl border border-[var(--color-border)] p-6 animate-pulse"
+              >
+                <div className="flex justify-between">
+                  <div className="space-y-2 flex-1">
+                    <div className="h-5 bg-[var(--color-muted)] rounded w-2/5" />
+                    <div className="h-3 bg-[var(--color-muted)] rounded w-1/4" />
+                  </div>
+                  <div className="h-6 w-20 bg-[var(--color-muted)] rounded-full" />
                 </div>
-                <p className="text-sm text-amber-600/90 mt-0.5">
-                  It will never be shown again.
-                </p>
               </div>
-              <button
-                onClick={() => setOneTimeSecret(null)}
-                className="text-amber-600/70 hover:text-amber-600 text-2xl leading-none -mt-1"
-              >
-                ×
-              </button>
-            </div>
-            <pre className="mt-4 font-mono text-sm bg-black/60 p-4 rounded-2xl overflow-x-auto whitespace-pre-wrap break-all select-all border border-amber-500/20">
-              {oneTimeSecret}
-            </pre>
-            <div className="mt-4 flex gap-3">
-              <button
-                onClick={() => copyToClipboard(oneTimeSecret)}
-                className="px-4 py-2 rounded-2xl bg-[var(--color-warning)]/100 text-black text-sm font-medium hover:bg-amber-400"
-              >
-                Copy secret
-              </button>
-              <button
-                onClick={() => setOneTimeSecret(null)}
-                className="px-4 py-2 rounded-2xl border border-amber-500/30 text-amber-600 text-sm hover:bg-[var(--color-warning)]/100/10"
-              >
-                Dismiss (never shown again)
-              </button>
-            </div>
+            ))}
           </div>
-        )}
-
-        {/* Main catalog card */}
-        <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8">
-          <div className="flex items-center justify-between mb-6">
-            <div className="font-semibold text-lg tracking-tight">Catalog</div>
+        ) : applications.length === 0 ? (
+          <div className="p-12 text-center">
+            <p className="text-lg text-[var(--color-muted-foreground)]">
+              No applications yet. Create your first from Git, Dockerfile,
+              Compose or Template.
+            </p>
             <button
               onClick={() => {
                 setIsWizardOpen(true);
                 setWizardStep("select");
-                setSelectedKind(null);
-                setFormData({});
               }}
-              className="px-5 py-2.5 rounded-2xl bg-[var(--color-primary)] text-[var(--color-primary-foreground)] text-sm font-medium hover:opacity-90"
+              className="mt-6 px-6 py-3 rounded-2xl bg-[var(--color-primary)] text-[var(--color-primary-foreground)] font-medium text-sm"
             >
               Create Application
             </button>
           </div>
-
-          {/* 4 async states - exact empty p-12, loading skeletons, error banner above, success grid (real API now) */}
-          {isLoading ? (
-            <div className="space-y-3">
-              {[1, 2].map((i) => (
-                <div
-                  key={i}
-                  className="rounded-2xl border border-[var(--color-border)] p-6 animate-pulse"
-                >
-                  <div className="flex justify-between">
-                    <div className="space-y-2 flex-1">
-                      <div className="h-5 bg-[var(--color-muted)] rounded w-2/5" />
-                      <div className="h-3 bg-[var(--color-muted)] rounded w-1/4" />
-                    </div>
-                    <div className="h-6 w-20 bg-[var(--color-muted)] rounded-full" />
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : applications.length === 0 ? (
-            <div className="p-12 text-center">
-              <p className="text-lg text-[var(--color-muted-foreground)]">
-                No applications yet. Create your first from Git, Dockerfile,
-                Compose or Template.
-              </p>
-              <button
-                onClick={() => {
-                  setIsWizardOpen(true);
-                  setWizardStep("select");
-                }}
-                className="mt-6 px-6 py-3 rounded-2xl bg-[var(--color-primary)] text-[var(--color-primary-foreground)] font-medium text-sm"
+        ) : (
+          <div className="grid gap-4 md:grid-cols-2">
+            {applications.map((app) => (
+              <div
+                key={app.id}
+                className="rounded-2xl border border-[var(--color-border)] p-6"
               >
-                Create Application
-              </button>
-            </div>
-          ) : (
-            <div className="grid gap-4 md:grid-cols-2">
-              {applications.map((app) => (
-                <div
-                  key={app.id}
-                  className="rounded-2xl border border-[var(--color-border)] p-6"
-                >
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <div className="font-semibold text-lg tracking-tight">
-                        {app.name}
-                      </div>
-                      <div className="mt-1 text-xs uppercase tracking-widest text-[var(--color-muted-foreground)]">
-                        {app.kind ?? "git"}
-                      </div>
+                <div className="flex justify-between items-start">
+                  <div>
+                    <div className="font-semibold text-lg tracking-tight">
+                      {app.name}
                     </div>
-                    <div className="text-xs text-[var(--color-muted-foreground)]">
-                      {new Date(app.created_at).toLocaleString()}
+                    <div className="mt-1 text-xs uppercase tracking-widest text-[var(--color-muted-foreground)]">
+                      {app.kind ?? "git"}
                     </div>
                   </div>
-                  {app.status && (
-                    <div className="mt-2 text-xs text-[var(--color-muted-foreground)]">
-                      Status: {app.status}
-                    </div>
-                  )}
-
-                  <div className="mt-4 flex gap-2">
-                    {/* Primary: go to clean detail page with rich Deploy + live status/logs */}
-                    <Link
-                      href={`/admin/applications/${app.id}`}
-                      className="flex-1 text-center rounded-2xl border border-[var(--color-border)] py-2 text-sm font-medium hover:bg-[var(--color-muted)]"
-                    >
-                      View details
-                    </Link>
-                    {/* Secondary fast path (list-level quick deploy) */}
-                    <button
-                      onClick={() => {
-                        setQuickDeployApp(app);
-                        setQuickDeployImage("nginx:alpine");
-                      }}
-                      className="flex-1 rounded-2xl bg-[var(--color-primary)] text-[var(--color-primary-foreground)] py-2 text-sm font-medium hover:opacity-90"
-                    >
-                      Quick Deploy
-                    </button>
+                  <div className="text-xs text-[var(--color-muted-foreground)]">
+                    {new Date(app.created_at).toLocaleString()}
                   </div>
                 </div>
-              ))}
-            </div>
-          )}
-        </div>
-      </main>
+                {app.status && (
+                  <div className="mt-2 text-xs text-[var(--color-muted-foreground)]">
+                    Status: {app.status}
+                  </div>
+                )}
+
+                <div className="mt-4 flex gap-2">
+                  {/* Primary: go to clean detail page with rich Deploy + live status/logs */}
+                  <Link
+                    href={`/admin/applications/${app.id}`}
+                    className="flex-1 text-center rounded-2xl border border-[var(--color-border)] py-2 text-sm font-medium hover:bg-[var(--color-muted)]"
+                  >
+                    View details
+                  </Link>
+                  {/* Secondary fast path (list-level quick deploy) */}
+                  <button
+                    onClick={() => {
+                      setQuickDeployApp(app);
+                      setQuickDeployImage("nginx:alpine");
+                    }}
+                    className="flex-1 rounded-2xl bg-[var(--color-primary)] text-[var(--color-primary-foreground)] py-2 text-sm font-medium hover:opacity-90"
+                  >
+                    Quick Deploy
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
 
       {/* Wizard Dialog - Radix + Service Catalog grid reuse */}
       <Dialog.Root open={isWizardOpen} onOpenChange={setIsWizardOpen}>

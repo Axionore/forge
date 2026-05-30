@@ -1,6 +1,7 @@
 "use client";
 
 import React from "react";
+import { useAdminToken } from "../token-store";
 
 type TokenSummary = {
   token_hash_prefix: string;
@@ -25,8 +26,7 @@ type CreatedToken = {
 const API_BASE = "http://localhost:3000";
 
 export default function EnrollmentTokensPage() {
-  const [adminToken, setAdminToken] = React.useState("");
-  const [showAdminToken, setShowAdminToken] = React.useState(false);
+  const [adminToken] = useAdminToken();
 
   const [description, setDescription] = React.useState("");
   const [expiresInDays, setExpiresInDays] = React.useState<number | "">("");
@@ -448,77 +448,18 @@ export default function EnrollmentTokensPage() {
   const hasAdminToken = adminToken.length >= 12;
 
   return (
-    <div className="min-h-screen bg-[var(--color-background)] text-[var(--color-foreground)]">
-      <header className="border-b bg-[var(--color-card)]/80 backdrop-blur supports-[backdrop-filter]:bg-[var(--color-card)]/60 sticky top-0 z-50">
-        <div className="mx-auto max-w-6xl px-6 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="h-8 w-8 rounded bg-[var(--color-primary)]" />
-            <div>
-              <div className="font-semibold tracking-tighter text-lg">
-                Forge
-              </div>
-              <div className="text-[10px] text-[var(--color-muted-foreground)] -mt-1">
-                CONTROL PLANE
-              </div>
-            </div>
-            <div className="ml-4 text-sm font-medium text-[var(--color-muted-foreground)]">
-              Add Server
-            </div>
-          </div>
+    <div className="mx-auto max-w-6xl px-6 py-8">
+      <div className="mb-6">
+        <h1 className="text-2xl font-semibold tracking-tight">
+          Enrollment Tokens
+        </h1>
+        <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
+          Issue one-time enrollment tokens and provision servers. Set your admin
+          token in the top bar to manage.
+        </p>
+      </div>
 
-          <div className="flex items-center gap-3 text-sm">
-            <a
-              href="/"
-              className="text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)] transition"
-            >
-              ← Back to home
-            </a>
-          </div>
-        </div>
-      </header>
-
-      <main className="mx-auto max-w-6xl px-6 py-10">
-        {/* Admin token bootstrap */}
-        <div className="mb-8 rounded-2xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-5">
-          <div className="flex items-start justify-between gap-6">
-            <div className="flex-1">
-              <div className="text-xs uppercase tracking-[0.5px] font-medium text-[var(--color-muted-foreground)] mb-1">
-                OPERATOR AUTH
-              </div>
-              <div className="font-semibold tracking-tight">Admin Token</div>
-              <p className="mt-1 text-sm text-[var(--color-muted-foreground)] max-w-md">
-                Paste your{" "}
-                <code className="font-mono text-xs bg-muted px-1 py-px rounded">
-                  FORGE_ADMIN_TOKEN
-                </code>{" "}
-                from the control plane environment. It is stored only in memory
-                for this session.
-              </p>
-            </div>
-            <div className="w-80">
-              <div className="relative">
-                <input
-                  type={showAdminToken ? "text" : "password"}
-                  value={adminToken}
-                  onChange={(e) => setAdminToken(e.target.value.trim())}
-                  placeholder="forge_admin_xxxxxxxxxxxxxxxx"
-                  className="w-full rounded-xl border border-[var(--color-input)] bg-[var(--color-card)] px-4 py-2.5 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-[var(--color-ring)] placeholder:text-[var(--color-muted-foreground)]/60"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowAdminToken(!showAdminToken)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-medium text-[var(--color-muted-foreground)] hover:text-foreground"
-                >
-                  {showAdminToken ? "HIDE" : "SHOW"}
-                </button>
-              </div>
-              <div className="mt-1.5 text-[10px] text-[var(--color-muted-foreground)]">
-                Required for all issuance and revocation actions.
-              </div>
-            </div>
-          </div>
-        </div>
-
+      <div>
         {/* === Advanced Hetzner Provisioning (A0-4) === */}
         <div className="mb-10 rounded-3xl border border-violet-500/30 bg-[var(--color-card)] p-6">
           <div className="flex items-center gap-3 mb-4">
@@ -659,7 +600,7 @@ export default function EnrollmentTokensPage() {
               <button
                 onClick={provisionHetznerServers}
                 disabled={!hetznerToken || isProvisioning}
-                className="rounded-2xl bg-violet-600 hover:bg-violet-700 disabled:opacity-60 text-white px-8 py-2.5 text-sm font-semibold transition"
+                className="btn btn-primary"
               >
                 {isProvisioning
                   ? "Provisioning..."
@@ -791,8 +732,8 @@ export default function EnrollmentTokensPage() {
         )}
 
         {/* Phase 4 marketing: why this is different (crypto superiority, no weakening) */}
-        <div className="mb-8 rounded-3xl border border-violet-500/20 bg-gradient-to-br from-violet-500/5 to-transparent p-6">
-          <div className="uppercase tracking-[1.5px] text-xs font-semibold text-violet-600 mb-1">
+        <div className="card mb-8 p-6">
+          <div className="uppercase tracking-[1.5px] text-xs font-semibold text-[var(--color-muted-foreground)] mb-1">
             THE FORGE DIFFERENCE
           </div>
           <div className="text-xl font-semibold tracking-tighter">
@@ -892,7 +833,7 @@ export default function EnrollmentTokensPage() {
               <button
                 type="submit"
                 disabled={isCreating || !hasAdminToken}
-                className="inline-flex h-12 items-center justify-center rounded-2xl bg-[var(--color-primary)] px-10 text-base font-semibold text-white transition active:scale-[0.985] disabled:cursor-not-allowed disabled:opacity-60 hover:bg-[var(--color-primary)]/90"
+                className="btn btn-primary"
               >
                 {isCreating
                   ? "Issuing secure token…"
@@ -1082,7 +1023,6 @@ export default function EnrollmentTokensPage() {
             </div>
           ) : agents.length === 0 ? (
             <div className="rounded-3xl border border-dashed border-[var(--color-border)] bg-[var(--color-card)] p-10 text-center">
-              <div className="text-2xl mb-2">🖥️</div>
               <div className="font-medium">No servers enrolled yet</div>
               <div className="text-sm text-[var(--color-muted-foreground)] mt-1 max-w-xs mx-auto">
                 Issue a token above, run the one-liner on any Linux box
@@ -1295,9 +1235,9 @@ export default function EnrollmentTokensPage() {
             for automated provisioning scripts you fully control.
           </div>
         </div>
-      </main>
+      </div>
 
-      <footer className="border-t mt-16 py-6 text-center text-xs text-[var(--color-muted-foreground)]">
+      <footer className="border-t border-border mt-16 py-6 text-center text-xs text-[var(--color-muted-foreground)]">
         Forge Control Plane • Enrollment is the root of trust for every agent
       </footer>
     </div>
