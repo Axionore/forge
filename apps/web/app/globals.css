@@ -7,8 +7,8 @@
   All admin pages consume these tokens, so the system drives the whole UI.
 */
 @theme {
-  --font-sans: "Inter Variable", system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-sans: "Geist", system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 
   /* Base — near-black neutral, no hue */
   --color-background: oklch(0.145 0 0);
@@ -177,6 +177,99 @@
     padding-inline: 0.625rem;
     font-size: 0.75rem;
     border-radius: 0.375rem;
+  }
+
+  /* ---- Inputs — shared style for all form controls ---- */
+  .input {
+    height: 2.25rem;
+    width: 100%;
+    border-radius: 0.5rem;
+    border: 1px solid var(--color-input);
+    background: transparent;
+    padding-inline: 0.75rem;
+    font-size: 0.875rem;
+    color: var(--color-foreground);
+    transition:
+      border-color 0.15s ease,
+      box-shadow 0.15s ease;
+  }
+  .input::placeholder {
+    color: oklch(1 0 0 / 0.3);
+  }
+  .input:focus {
+    outline: none;
+    border-color: transparent;
+    box-shadow:
+      0 0 0 2px var(--color-background),
+      0 0 0 4px var(--color-ring);
+  }
+  .input:disabled {
+    opacity: 0.5;
+    pointer-events: none;
+  }
+
+  /* Textarea variant */
+  .textarea {
+    width: 100%;
+    border-radius: 0.5rem;
+    border: 1px solid var(--color-input);
+    background: transparent;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.875rem;
+    color: var(--color-foreground);
+    transition:
+      border-color 0.15s ease,
+      box-shadow 0.15s ease;
+    resize: vertical;
+  }
+  .textarea::placeholder {
+    color: oklch(1 0 0 / 0.3);
+  }
+  .textarea:focus {
+    outline: none;
+    border-color: transparent;
+    box-shadow:
+      0 0 0 2px var(--color-background),
+      0 0 0 4px var(--color-ring);
+  }
+
+  /* Select shares input base */
+  .select {
+    height: 2.25rem;
+    width: 100%;
+    border-radius: 0.5rem;
+    border: 1px solid var(--color-input);
+    background: var(--color-card);
+    padding-inline: 0.75rem;
+    font-size: 0.875rem;
+    color: var(--color-foreground);
+    cursor: pointer;
+    transition:
+      border-color 0.15s ease,
+      box-shadow 0.15s ease;
+  }
+  .select:focus {
+    outline: none;
+    border-color: transparent;
+    box-shadow:
+      0 0 0 2px var(--color-background),
+      0 0 0 4px var(--color-ring);
+  }
+
+  /* ---- Section header ---- */
+  .section-label {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: oklch(1 0 0 / 0.35);
+  }
+
+  /* ---- Page wrapper ---- */
+  .page-root {
+    margin-inline: auto;
+    max-width: 72rem;
+    padding: 2rem 1.5rem;
   }
 
   /* ---- Status dots (Dokploy-style) ---- */

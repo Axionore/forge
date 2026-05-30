@@ -8,6 +8,7 @@ import {
   ChevronDown,
   Check,
   X,
+  Plus,
   TrendingUp,
   AlertTriangle,
   ShieldCheck,
@@ -703,24 +704,24 @@ export default function DeploymentsPage() {
   };
 
   return (
-    <div className="mx-auto max-w-6xl px-6 py-8">
+    <div className="page-root">
       {error && (
-        <div className="mb-6 rounded-lg border border-[var(--color-destructive)]/40 bg-[var(--color-destructive)]/10 px-4 py-3 text-sm text-[var(--color-destructive)] flex justify-between">
+        <div className="mb-5 flex items-center justify-between rounded-md border border-[var(--color-destructive)]/40 bg-[var(--color-destructive)]/10 px-4 py-3 text-sm text-[var(--color-destructive)]">
           <span>{error}</span>
           <button
             onClick={() => setError(null)}
-            className="font-medium underline"
+            className="font-medium underline underline-offset-2"
           >
             Dismiss
           </button>
         </div>
       )}
 
-      {/* Title + primary actions */}
-      <div className="flex items-start justify-between gap-4 mb-5">
+      {/* Header row */}
+      <div className="mb-5 flex items-center justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Deployments</h1>
-          <p className="text-sm text-[var(--color-muted-foreground)]">
+          <h1 className="text-xl font-semibold tracking-tight">Deployments</h1>
+          <p className="mt-0.5 text-[13px] text-[oklch(1_0_0/0.45)]">
             Live status + recent agent results
           </p>
         </div>
@@ -728,7 +729,7 @@ export default function DeploymentsPage() {
           <select
             value={selectedAppId}
             onChange={(e) => setSelectedAppId(e.target.value)}
-            className="h-9 rounded-lg border border-[var(--color-input)] bg-[var(--color-card)] px-3 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--color-ring)]"
+            className="select h-8 w-auto pr-8 text-[13px]"
             disabled={!applications.length}
           >
             {applications.length === 0 && (
@@ -743,69 +744,69 @@ export default function DeploymentsPage() {
           <button
             onClick={fetchDeployments}
             disabled={isLoading || !selectedAppId}
-            className="btn btn-ghost"
+            className="btn btn-ghost btn-sm"
           >
-            {isLoading ? "Refreshing..." : "Refresh"}
+            {isLoading ? "Refreshing…" : "Refresh"}
           </button>
           <button
-            onClick={() => setShowCreate(!showCreate)}
-            className="btn btn-primary"
+            onClick={() => setShowCreate(true)}
+            disabled={!selectedAppId}
+            className="btn btn-primary btn-sm"
           >
-            {showCreate ? "Close" : "+ Quick Deploy"}
+            <Plus className="h-3.5 w-3.5" />
+            New Deployment
           </button>
         </div>
       </div>
 
-      {/* Metric pills (neutral) */}
-      <div className="flex flex-wrap gap-2 mb-5 text-sm">
-        <div className="inline-flex items-center gap-2 rounded-lg border border-border bg-[var(--color-card)] px-3 py-1.5">
-          <span className="text-[var(--color-muted-foreground)]">Total</span>
-          <span className="font-mono font-semibold tabular-nums">
-            {deployments.length}
-          </span>
-        </div>
-        <div className="inline-flex items-center gap-2 rounded-lg border border-border bg-[var(--color-card)] px-3 py-1.5">
-          <span className="status-dot status-dot-healthy" />
-          <span className="text-[var(--color-muted-foreground)]">Healthy</span>
-          <span className="font-mono font-semibold tabular-nums">
-            {
-              deployments.filter((d) => d.deployment.status === "healthy")
-                .length
-            }
-          </span>
-        </div>
-        <div className="inline-flex items-center gap-2 rounded-lg border border-border bg-[var(--color-card)] px-3 py-1.5">
-          <span className="status-dot status-dot-progress" />
-          <span className="text-[var(--color-muted-foreground)]">
-            In progress
-          </span>
-          <span className="font-mono font-semibold tabular-nums">
-            {
-              deployments.filter((d) => d.deployment.status === "in_progress")
-                .length
-            }
-          </span>
-        </div>
-        <div className="inline-flex items-center gap-2 rounded-lg border border-border bg-[var(--color-card)] px-3 py-1.5">
-          <span className="status-dot status-dot-failed" />
-          <span className="text-[var(--color-muted-foreground)]">Failed</span>
-          <span className="font-mono font-semibold tabular-nums">
-            {
-              deployments.filter((d) =>
-                ["failed", "unhealthy"].includes(d.deployment.status),
-              ).length
-            }
-          </span>
-        </div>
+      {/* Compact stat row */}
+      <div className="mb-5 flex flex-wrap items-center gap-px divide-x divide-[oklch(1_0_0/0.07)] rounded-md border border-[oklch(1_0_0/0.08)] bg-[oklch(0.185_0_0)]">
+        {[
+          { label: "Total", dot: null, count: deployments.length },
+          {
+            label: "Healthy",
+            dot: "status-dot-healthy",
+            count: deployments.filter((d) => d.deployment.status === "healthy")
+              .length,
+          },
+          {
+            label: "In Progress",
+            dot: "status-dot-progress",
+            count: deployments.filter(
+              (d) => d.deployment.status === "in_progress",
+            ).length,
+          },
+          {
+            label: "Failed",
+            dot: "status-dot-failed",
+            count: deployments.filter((d) =>
+              ["failed", "unhealthy"].includes(d.deployment.status),
+            ).length,
+          },
+        ].map(({ label, dot, count }) => (
+          <div
+            key={label}
+            className="flex items-center gap-2 px-4 py-2.5 text-[13px] first:rounded-l-md last:rounded-r-md"
+          >
+            {dot && <span className={`status-dot ${dot}`} />}
+            <span className="text-[oklch(1_0_0/0.45)]">{label}</span>
+            <span className="font-mono font-semibold tabular-nums text-[oklch(0.97_0_0)]">
+              {count}
+            </span>
+          </div>
+        ))}
       </div>
 
       {/* Secondary toolbar */}
-      <div className="flex flex-wrap items-center gap-2 mb-6">
-        <button onClick={toggleResults} className="btn btn-ghost">
-          {resultsLimit > 0 ? "Hide Results" : "Show Recent Results (5)"}
+      <div className="mb-6 flex flex-wrap items-center gap-2">
+        <button onClick={toggleResults} className="btn btn-ghost btn-sm">
+          {resultsLimit > 0 ? "Hide Results" : "Show Recent Results"}
         </button>
-        <button onClick={() => setShowCatalog(true)} className="btn btn-ghost">
-          Browse Catalog
+        <button
+          onClick={() => setShowCatalog(true)}
+          className="btn btn-ghost btn-sm"
+        >
+          Catalog
         </button>
         <button
           onClick={() => {
@@ -826,7 +827,7 @@ export default function DeploymentsPage() {
                 .catch(() => {});
             }
           }}
-          className="btn btn-ghost"
+          className="btn btn-ghost btn-sm"
         >
           Git Sources
         </button>
@@ -835,7 +836,7 @@ export default function DeploymentsPage() {
             setShowSecrets(true);
             fetchSecrets();
           }}
-          className="btn btn-ghost"
+          className="btn btn-ghost btn-sm"
         >
           Secrets
         </button>
@@ -868,221 +869,274 @@ export default function DeploymentsPage() {
               );
             else toast.error("Trigger failed (check logs)");
           }}
-          className="btn btn-ghost ml-auto"
+          className="btn btn-ghost btn-sm ml-auto"
         >
           Trigger Self-Update
         </button>
       </div>
 
-      {showCreate && (
-        <div className="mb-8 rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-6">
-          <div className="font-semibold mb-4">Quick Deploy (lightweight)</div>
-          <form
-            onSubmit={createDeployment}
-            className="grid grid-cols-1 md:grid-cols-2 gap-4"
-          >
-            <div>
-              <label className="block text-xs mb-1 text-[var(--color-muted-foreground)]">
-                Image
-              </label>
-              <input
-                value={createImage}
-                onChange={(e) => setCreateImage(e.target.value)}
-                className="w-full rounded-xl border px-4 py-2 text-sm"
-                placeholder="nginx:alpine"
-              />
+      {/* ---- New Deployment Dialog ---- */}
+      <Dialog.Root open={showCreate} onOpenChange={setShowCreate}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm" />
+          <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-full max-w-2xl -translate-x-1/2 -translate-y-1/2 rounded-xl border border-[oklch(1_0_0/0.1)] bg-[oklch(0.185_0_0)] p-7 shadow-2xl focus:outline-none">
+            <div className="mb-5 flex items-center justify-between">
+              <Dialog.Title className="text-base font-semibold tracking-tight">
+                New Deployment
+              </Dialog.Title>
+              <Dialog.Close asChild>
+                <button className="grid h-7 w-7 place-items-center rounded-md text-[oklch(1_0_0/0.4)] transition-colors hover:bg-[oklch(1_0_0/0.07)] hover:text-[oklch(0.97_0_0)]">
+                  <X className="h-4 w-4" />
+                </button>
+              </Dialog.Close>
             </div>
-            <div>
-              <label className="block text-xs mb-1 text-[var(--color-muted-foreground)]">
-                Target Agent UUID (optional)
-              </label>
-              <input
-                value={createTargetAgent}
-                onChange={(e) => setCreateTargetAgent(e.target.value)}
-                className="w-full rounded-xl border px-4 py-2 text-sm font-mono"
-                placeholder="paste agent id from heartbeat or list"
-              />
-            </div>
-            <div className="md:col-span-2">
-              <label className="block text-xs mb-1 text-[var(--color-muted-foreground)]">
-                Env (KEY=val, one per line)
-              </label>
-              <textarea
-                value={createEnv}
-                onChange={(e) => setCreateEnv(e.target.value)}
-                className="w-full rounded-xl border px-4 py-2 text-sm font-mono h-20"
-              />
-            </div>
-
-            <div className="md:col-span-2">
-              <label className="block text-xs mb-1 text-[var(--color-muted-foreground)]">
-                Update Strategy
-              </label>
-              <Select.Root
-                value={createStrategy}
-                onValueChange={(v) => setCreateStrategy(v as any)}
-              >
-                <Select.Trigger className="w-full inline-flex items-center justify-between rounded-xl border border-[var(--color-input)] bg-[var(--color-card)] px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--color-ring)]">
-                  <Select.Value />
-                  <Select.Icon>
-                    <ChevronDown className="h-4 w-4" />
-                  </Select.Icon>
-                </Select.Trigger>
-                <Select.Portal>
-                  <Select.Content className="overflow-hidden rounded-xl border border-[var(--color-border)] bg-[var(--color-popover)] shadow-md z-50">
-                    <Select.Viewport className="p-1">
-                      {(["rolling", "blue_green", "canary"] as const).map(
-                        (s) => (
-                          <Select.Item
-                            key={s}
-                            value={s}
-                            className="flex items-center px-3 py-2 text-sm rounded-lg cursor-pointer hover:bg-[var(--color-accent)] focus:bg-[var(--color-accent)] outline-none"
-                          >
-                            <Select.ItemText className="capitalize">
-                              {s.replace("_", " ")}
-                            </Select.ItemText>
-                            <Select.ItemIndicator className="ml-auto">
-                              <Check className="h-4 w-4" />
-                            </Select.ItemIndicator>
-                          </Select.Item>
-                        ),
-                      )}
-                    </Select.Viewport>
-                  </Select.Content>
-                </Select.Portal>
-              </Select.Root>
-              <div className="mt-1 text-xs text-[var(--color-muted-foreground)]">
-                {createStrategy === "rolling" &&
-                  "Gradual replacement with health gates + auto-rollback."}
-                {createStrategy === "blue_green" &&
-                  "Full new set + traffic cutover (zero downtime)."}
-                {createStrategy === "canary" &&
-                  "Small % traffic to new version first with progressive rollout."}
+            <form onSubmit={createDeployment} className="space-y-4">
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                <div>
+                  <label className="mb-1.5 block text-[12px] font-medium text-[oklch(1_0_0/0.55)]">
+                    Container image
+                  </label>
+                  <input
+                    value={createImage}
+                    onChange={(e) => setCreateImage(e.target.value)}
+                    className="input font-mono"
+                    placeholder="nginx:alpine"
+                    autoFocus
+                  />
+                </div>
+                <div>
+                  <label className="mb-1.5 block text-[12px] font-medium text-[oklch(1_0_0/0.55)]">
+                    Target agent UUID{" "}
+                    <span className="font-normal text-[oklch(1_0_0/0.3)]">
+                      (optional)
+                    </span>
+                  </label>
+                  <input
+                    value={createTargetAgent}
+                    onChange={(e) => setCreateTargetAgent(e.target.value)}
+                    className="input font-mono"
+                    placeholder="paste agent id"
+                  />
+                </div>
               </div>
-            </div>
-            <div className="md:col-span-2">
-              <button
-                type="submit"
-                disabled={isCreating || !selectedAppId}
-                className="btn btn-primary"
-              >
-                {isCreating ? "Deploying..." : "Create & Dispatch"}
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
+
+              <div>
+                <label className="mb-1.5 block text-[12px] font-medium text-[oklch(1_0_0/0.55)]">
+                  Environment variables{" "}
+                  <span className="font-normal text-[oklch(1_0_0/0.3)]">
+                    (KEY=val, one per line)
+                  </span>
+                </label>
+                <textarea
+                  value={createEnv}
+                  onChange={(e) => setCreateEnv(e.target.value)}
+                  className="textarea h-20 font-mono text-[13px]"
+                />
+              </div>
+
+              <div>
+                <label className="mb-1.5 block text-[12px] font-medium text-[oklch(1_0_0/0.55)]">
+                  Update strategy
+                </label>
+                <Select.Root
+                  value={createStrategy}
+                  onValueChange={(v) =>
+                    setCreateStrategy(v as "rolling" | "blue_green" | "canary")
+                  }
+                >
+                  <Select.Trigger className="select flex items-center justify-between">
+                    <Select.Value />
+                    <Select.Icon>
+                      <ChevronDown className="h-3.5 w-3.5 text-[oklch(1_0_0/0.4)]" />
+                    </Select.Icon>
+                  </Select.Trigger>
+                  <Select.Portal>
+                    <Select.Content className="z-[200] overflow-hidden rounded-lg border border-[oklch(1_0_0/0.1)] bg-[oklch(0.2_0_0)] shadow-xl">
+                      <Select.Viewport className="p-1">
+                        {(["rolling", "blue_green", "canary"] as const).map(
+                          (s) => (
+                            <Select.Item
+                              key={s}
+                              value={s}
+                              className="flex cursor-pointer items-center rounded-md px-3 py-2 text-[13px] capitalize outline-none hover:bg-[oklch(1_0_0/0.07)] focus:bg-[oklch(1_0_0/0.07)]"
+                            >
+                              <Select.ItemText>
+                                {s.replace("_", " ")}
+                              </Select.ItemText>
+                              <Select.ItemIndicator className="ml-auto">
+                                <Check className="h-3.5 w-3.5" />
+                              </Select.ItemIndicator>
+                            </Select.Item>
+                          ),
+                        )}
+                      </Select.Viewport>
+                    </Select.Content>
+                  </Select.Portal>
+                </Select.Root>
+                <p className="mt-1 text-[11px] text-[oklch(1_0_0/0.35)]">
+                  {createStrategy === "rolling" &&
+                    "Gradual replacement with health gates + auto-rollback."}
+                  {createStrategy === "blue_green" &&
+                    "Full new set + traffic cutover (zero downtime)."}
+                  {createStrategy === "canary" &&
+                    "Small % traffic to new version first with progressive rollout."}
+                </p>
+              </div>
+
+              <div className="flex justify-end gap-2 border-t border-[oklch(1_0_0/0.07)] pt-4">
+                <Dialog.Close asChild>
+                  <button type="button" className="btn btn-ghost btn-sm">
+                    Cancel
+                  </button>
+                </Dialog.Close>
+                <button
+                  type="submit"
+                  disabled={isCreating || !selectedAppId}
+                  className="btn btn-primary btn-sm"
+                >
+                  {isCreating ? "Deploying…" : "Create & Dispatch"}
+                </button>
+              </div>
+            </form>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
 
       {/* Deployments List */}
       {!selectedAppId ? (
-        <div className="rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-12 text-center text-[var(--color-muted-foreground)]">
-          Select an application to view its deployments.
+        <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-[oklch(1_0_0/0.1)] py-16 text-center">
+          <Rocket className="mb-3 h-8 w-8 text-[oklch(1_0_0/0.2)]" />
+          <div className="text-sm text-[oklch(1_0_0/0.45)]">
+            Select an application above to view its deployments
+          </div>
         </div>
       ) : deployments.length === 0 && !isLoading ? (
-        <div className="rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-12 text-center">
-          No deployments yet for this application.
+        <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-[oklch(1_0_0/0.1)] py-16 text-center">
+          <Rocket className="mb-3 h-8 w-8 text-[oklch(1_0_0/0.2)]" />
+          <div className="text-sm text-[oklch(1_0_0/0.45)]">
+            No deployments yet for this application
+          </div>
+          <button
+            onClick={() => setShowCreate(true)}
+            className="btn btn-primary btn-sm mt-4"
+          >
+            <Plus className="h-3.5 w-3.5" />
+            New Deployment
+          </button>
         </div>
       ) : (
-        <div className="space-y-4">
-          {deployments.map((item) => (
+        <div className="space-y-2">
+          {deployments.map((item, idx) => (
             <div
               key={item.deployment.id}
-              className="rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-6"
+              className="reveal rounded-lg border border-[oklch(1_0_0/0.08)] bg-[oklch(0.185_0_0)] px-5 py-4"
+              style={{ animationDelay: `${idx * 30}ms` }}
             >
-              <div className="flex items-start justify-between">
-                <div>
-                  <div className="font-mono text-xs text-[var(--color-muted-foreground)]">
-                    v{item.deployment.version} • {item.deployment.id}
+              {/* Row header */}
+              <div className="flex items-center gap-3">
+                <span
+                  className={`status-dot shrink-0 ${statusDotClass(item.deployment.status)} ${item.deployment.status === "healthy" ? "pulse-dot text-[var(--color-success)]" : ""}`}
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate text-[13px] font-medium text-[oklch(0.97_0_0)]">
+                      v{item.deployment.version}
+                    </span>
+                    <span className="inline-flex items-center rounded-[4px] border border-[oklch(1_0_0/0.08)] bg-[oklch(1_0_0/0.04)] px-1.5 py-px text-[10px] font-medium capitalize text-[oklch(1_0_0/0.5)]">
+                      {item.deployment.status.replace("_", " ")}
+                    </span>
+                    {item.deployment.git_source_id && (
+                      <span className="inline-flex items-center rounded-[4px] border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/10 px-1.5 py-px text-[10px] font-medium text-[var(--color-warning)]">
+                        PREVIEW
+                      </span>
+                    )}
                   </div>
-                  <div className="font-semibold text-xl tracking-tight mt-1">
-                    Deployment
+                  <div className="mt-0.5 flex items-center gap-3 text-[11px] text-[oklch(1_0_0/0.38)]">
+                    <span className="font-mono">
+                      {item.deployment.id.slice(0, 8)}…
+                    </span>
+                    {(item.deployment.spec as any)?.containers?.[0]?.image && (
+                      <span className="font-mono">
+                        {(item.deployment.spec as any).containers[0].image}
+                      </span>
+                    )}
+                    <span>
+                      Updated{" "}
+                      {new Date(item.deployment.updated_at).toLocaleString()}
+                    </span>
                   </div>
                 </div>
-                <div className="inline-flex items-center gap-2 rounded-md border border-border bg-[oklch(1_0_0/0.03)] px-2.5 py-1 text-xs font-medium capitalize">
-                  <span
-                    className={`status-dot ${statusDotClass(item.deployment.status)}`}
-                  />
-                  {item.deployment.status.replace("_", " ")}
-                </div>
-                {item.deployment.git_source_id && (
-                  <div className="ml-2 px-2 py-0.5 rounded bg-[var(--color-warning)]/15 text-[var(--color-warning)] text-[10px] font-medium border border-[var(--color-warning)]/25">
-                    PREVIEW
-                  </div>
-                )}
-              </div>
 
-              <div className="mt-4 text-sm text-[var(--color-muted-foreground)]">
-                Updated {new Date(item.deployment.updated_at).toLocaleString()}
+                {/* Row actions */}
+                <div className="flex shrink-0 items-center gap-2">
+                  <button
+                    onClick={() => {
+                      setSelectedDeployment(item);
+                      setShowLogsDialog(true);
+                      setLogsDeployment(item.deployment);
+                      connectToLogsWS(selectedAppId, item.deployment.id);
+                    }}
+                    className="btn btn-ghost btn-sm"
+                  >
+                    <FileText className="h-3.5 w-3.5" />
+                    Logs
+                  </button>
+                  <button
+                    onClick={async () => {
+                      if (!adminToken) return;
+                      try {
+                        await fetch(
+                          `${API_BASE}/admin/applications/${selectedAppId}/deployments`,
+                          {
+                            method: "POST",
+                            headers,
+                            body: JSON.stringify({
+                              spec: item.deployment.spec,
+                              strategy: item.deployment.strategy || {
+                                type: "rolling",
+                                max_unavailable: 1,
+                                max_surge: 1,
+                              },
+                              targets: createTargetAgent
+                                ? [{ agent_id: createTargetAgent, replicas: 1 }]
+                                : [],
+                            }),
+                          },
+                        );
+                        toast.success("Redeploy dispatched");
+                        await fetchDeployments();
+                      } catch (e: any) {
+                        toast.error(e.message);
+                      }
+                    }}
+                    className="btn btn-ghost btn-sm"
+                  >
+                    Redeploy
+                  </button>
+                  <button
+                    onClick={() => setSelectedDeployment(item)}
+                    className="btn btn-ghost btn-sm"
+                  >
+                    Details
+                  </button>
+                </div>
               </div>
 
               {item.recent_results && item.recent_results.length > 0 && (
-                <div className="mt-6 border-t pt-4">
-                  <div className="flex items-center justify-between mb-3">
-                    <div className="text-xs uppercase tracking-widest text-[var(--color-muted-foreground)] flex items-center gap-2">
-                      <Clock className="w-3.5 h-3.5" /> Status Timeline (real
-                      JobResults)
+                <div className="mt-4 border-t border-[oklch(1_0_0/0.06)] pt-4">
+                  <div className="mb-2 flex items-center justify-between">
+                    <div className="section-label flex items-center gap-1.5">
+                      <Clock className="h-3 w-3" />
+                      Status Timeline
                     </div>
-                    <button
-                      onClick={() => {
-                        setSelectedDeployment(item);
-                        setShowLogsDialog(true);
-                        setLogsDeployment(item.deployment);
-                        connectToLogsWS(selectedAppId, item.deployment.id);
-                      }}
-                      className="text-xs px-3 py-1 rounded border hover:bg-[var(--color-muted)] flex items-center gap-1"
-                    >
-                      <FileText className="w-3.5 h-3.5" /> Stream Logs (WS)
-                    </button>
-
-                    {/* Slice C: Redeploy directly from list */}
-                    <button
-                      onClick={async () => {
-                        if (!adminToken) return;
-                        try {
-                          await fetch(
-                            `${API_BASE}/admin/applications/${selectedAppId}/deployments`,
-                            {
-                              method: "POST",
-                              headers,
-                              body: JSON.stringify({
-                                spec: item.deployment.spec,
-                                strategy: item.deployment.strategy || {
-                                  type: "rolling",
-                                  max_unavailable: 1,
-                                  max_surge: 1,
-                                },
-                                targets: createTargetAgent
-                                  ? [
-                                      {
-                                        agent_id: createTargetAgent,
-                                        replicas: 1,
-                                      },
-                                    ]
-                                  : [],
-                              }),
-                            },
-                          );
-                          toast.success("Redeploy dispatched");
-                          await fetchDeployments();
-                        } catch (e: any) {
-                          toast.error(e.message);
-                        }
-                      }}
-                      className="text-xs px-3 py-1 rounded border hover:bg-[var(--color-muted)]"
-                    >
-                      Redeploy
-                    </button>
-
                     <button
                       onClick={() => testNotification(item.deployment.id)}
                       disabled={!adminToken}
-                      className="text-xs px-3 py-1 rounded border hover:bg-[var(--color-muted)] disabled:opacity-50"
+                      className="btn btn-ghost btn-sm"
                     >
                       Test Notification
                     </button>
                   </div>
-
-                  {/* Real status timeline sourced from /results JobResultRow data */}
                   <StatusTimeline
                     results={item.recent_results as any}
                     max={8}

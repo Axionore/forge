@@ -329,12 +329,12 @@ export default function AccessPage() {
   }
 
   return (
-    <div className="mx-auto max-w-6xl px-6 py-8">
+    <div className="page-root">
       <div className="mb-6">
-        <h1 className="text-2xl font-semibold tracking-tight">
+        <h1 className="text-xl font-semibold tracking-tight">
           Access &amp; RBAC
         </h1>
-        <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
+        <p className="mt-0.5 text-[13px] text-[oklch(1_0_0/0.45)]">
           Principals, roles, and issued admin tokens. Set your admin token in
           the top bar to manage.
         </p>
@@ -417,10 +417,10 @@ export default function AccessPage() {
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
           {/* Principals */}
-          <div className="rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-8">
+          <div className="rounded-lg border border-[oklch(1_0_0/0.08)] bg-[oklch(0.185_0_0)] p-6">
             <div className="flex items-center justify-between mb-6">
               <div>
-                <div className="font-semibold tracking-tighter text-2xl">
+                <div className="text-base font-semibold tracking-tight">
                   Principals
                 </div>
                 <div className="text-sm text-[var(--color-muted-foreground)] mt-1">
@@ -435,13 +435,13 @@ export default function AccessPage() {
                   value={newPrincipalName}
                   onChange={(e) => setNewPrincipalName(e.target.value)}
                   placeholder="alice or ci-deployer"
-                  className="sm:col-span-2 rounded-2xl border border-[var(--color-input)] px-5 py-3 text-[15px] focus:outline-none focus:ring-2 focus:ring-[var(--color-ring)] bg-[var(--color-card)]"
+                  className="input sm:col-span-2"
                   required
                 />
                 <select
                   value={newPrincipalType}
                   onChange={(e) => setNewPrincipalType(e.target.value as any)}
-                  className="rounded-2xl border border-[var(--color-input)] bg-[var(--color-card)] px-5 py-3 text-[15px] focus:outline-none focus:ring-2 focus:ring-[var(--color-ring)]"
+                  className="select"
                 >
                   <option value="user">user</option>
                   <option value="api_key">api_key</option>
@@ -450,7 +450,7 @@ export default function AccessPage() {
               <button
                 type="submit"
                 disabled={isCreatingPrincipal || !hasAdminToken}
-                className="w-full rounded-2xl bg-[var(--color-foreground)] text-[var(--color-background)] py-3 text-sm font-medium disabled:opacity-50 active:opacity-90 transition"
+                className="btn btn-primary w-full justify-center"
               >
                 {isCreatingPrincipal ? "Creating..." : "Create Principal"}
               </button>
@@ -465,7 +465,7 @@ export default function AccessPage() {
               {principals.map((p) => (
                 <div
                   key={p.id}
-                  className="flex items-center justify-between rounded-2xl border border-[var(--color-card-border)] px-4 py-3"
+                  className="flex items-center justify-between rounded-md border border-[oklch(1_0_0/0.07)] px-4 py-2.5"
                 >
                   <div>
                     <span className="font-medium">{p.name}</span>
@@ -482,10 +482,10 @@ export default function AccessPage() {
           </div>
 
           {/* Roles */}
-          <div className="rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-8">
+          <div className="rounded-lg border border-[oklch(1_0_0/0.08)] bg-[oklch(0.185_0_0)] p-6">
             <div className="flex items-center justify-between mb-6">
               <div>
-                <div className="font-semibold tracking-tighter text-2xl">
+                <div className="text-base font-semibold tracking-tight">
                   Roles
                 </div>
                 <div className="text-sm text-[var(--color-muted-foreground)] mt-1">
@@ -499,14 +499,14 @@ export default function AccessPage() {
                 value={newRoleName}
                 onChange={(e) => setNewRoleName(e.target.value)}
                 placeholder="Role name (e.g. deployer)"
-                className="w-full rounded-2xl border border-[var(--color-input)] px-5 py-3 text-[15px] focus:outline-none focus:ring-2 focus:ring-[var(--color-ring)] bg-[var(--color-card)]"
+                className="input"
                 required
               />
               <input
                 value={newRoleDesc}
                 onChange={(e) => setNewRoleDesc(e.target.value)}
                 placeholder="Optional description"
-                className="w-full rounded-2xl border border-[var(--color-input)] px-5 py-3 text-[15px] focus:outline-none focus:ring-2 focus:ring-[var(--color-ring)] bg-[var(--color-card)]"
+                className="input"
               />
               <div>
                 <label className="block text-xs font-medium tracking-widest text-[var(--color-muted-foreground)] mb-1.5">
@@ -516,13 +516,13 @@ export default function AccessPage() {
                   value={newRolePerms}
                   onChange={(e) => setNewRolePerms(e.target.value)}
                   rows={4}
-                  className="w-full font-mono text-sm rounded-2xl border border-[var(--color-input)] px-5 py-3 focus:outline-none focus:ring-2 focus:ring-[var(--color-ring)] bg-[var(--color-card)]"
+                  className="textarea font-mono text-sm"
                 />
               </div>
               <button
                 type="submit"
                 disabled={isCreatingRole || !hasAdminToken}
-                className="w-full rounded-2xl bg-[var(--color-foreground)] text-[var(--color-background)] py-3 text-sm font-medium disabled:opacity-50 active:opacity-90 transition"
+                className="btn btn-primary w-full justify-center"
               >
                 {isCreatingRole ? "Creating..." : "Create Role"}
               </button>
@@ -537,7 +537,7 @@ export default function AccessPage() {
               {roles.map((r) => (
                 <div
                   key={r.id}
-                  className="rounded-2xl border border-[var(--color-card-border)] px-4 py-3"
+                  className="rounded-md border border-[oklch(1_0_0/0.07)] px-4 py-2.5"
                 >
                   <div className="flex items-baseline gap-2">
                     <span className="font-semibold">{r.name}</span>
@@ -557,10 +557,10 @@ export default function AccessPage() {
         </div>
 
         {/* Issued Admin Tokens */}
-        <div className="mt-8 rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-8">
+        <div className="mt-6 rounded-lg border border-[oklch(1_0_0/0.08)] bg-[oklch(0.185_0_0)] p-6">
           <div className="flex items-center justify-between mb-6">
             <div>
-              <div className="font-semibold tracking-tighter text-2xl">
+              <div className="text-base font-semibold tracking-tight">
                 Issued Admin Tokens
               </div>
               <div className="text-sm text-[var(--color-muted-foreground)] mt-1">
@@ -598,7 +598,7 @@ export default function AccessPage() {
                   value={tokenDesc}
                   onChange={(e) => setTokenDesc(e.target.value)}
                   placeholder="ops team — staging"
-                  className="w-full rounded-2xl border border-[var(--color-input)] px-5 py-3 text-[15px] focus:outline-none focus:ring-2 focus:ring-[var(--color-ring)] bg-[var(--color-card)]"
+                  className="input"
                 />
               </div>
               <div>
@@ -627,7 +627,7 @@ export default function AccessPage() {
               disabled={
                 isCreatingToken || !hasAdminToken || !selectedPrincipalId
               }
-              className="w-full rounded-2xl bg-[var(--color-foreground)] text-[var(--color-background)] py-3 text-sm font-medium disabled:opacity-50 active:opacity-90 transition"
+              className="btn btn-primary w-full justify-center"
             >
               {isCreatingToken
                 ? "Issuing token..."
@@ -642,7 +642,7 @@ export default function AccessPage() {
           {/* Tokens table */}
           <div>
             <div className="flex items-center justify-between mb-3 px-1">
-              <div className="font-semibold tracking-tighter text-xl">
+              <div className="text-sm font-semibold">
                 Active &amp; revoked tokens
               </div>
               <button
@@ -664,7 +664,7 @@ export default function AccessPage() {
               {adminTokens.map((t) => (
                 <div
                   key={t.token_hash_prefix}
-                  className="flex items-center justify-between rounded-2xl border border-[var(--color-card-border)] px-4 py-3 text-sm"
+                  className="flex items-center justify-between rounded-md border border-[oklch(1_0_0/0.07)] px-4 py-2.5 text-sm"
                 >
                   <div className="flex items-center gap-4 font-mono">
                     <button

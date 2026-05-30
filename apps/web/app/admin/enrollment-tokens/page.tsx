@@ -448,12 +448,12 @@ export default function EnrollmentTokensPage() {
   const hasAdminToken = adminToken.length >= 12;
 
   return (
-    <div className="mx-auto max-w-6xl px-6 py-8">
+    <div className="page-root">
       <div className="mb-6">
-        <h1 className="text-2xl font-semibold tracking-tight">
+        <h1 className="text-xl font-semibold tracking-tight">
           Enrollment Tokens
         </h1>
-        <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
+        <p className="mt-0.5 text-[13px] text-[oklch(1_0_0/0.45)]">
           Issue one-time enrollment tokens and provision servers. Set your admin
           token in the top bar to manage.
         </p>
@@ -461,12 +461,12 @@ export default function EnrollmentTokensPage() {
 
       <div>
         {/* === Advanced Hetzner Provisioning (A0-4) === */}
-        <div className="mb-10 rounded-3xl border border-violet-500/30 bg-[var(--color-card)] p-6">
+        <div className="mb-8 rounded-lg border border-[oklch(1_0_0/0.1)] bg-[oklch(0.185_0_0)] p-6">
           <div className="flex items-center gap-3 mb-4">
-            <div className="rounded-xl bg-violet-500/10 px-3 py-1 text-xs font-medium tracking-widest text-violet-600">
+            <div className="rounded-[4px] border border-[oklch(1_0_0/0.1)] bg-[oklch(1_0_0/0.05)] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-[oklch(1_0_0/0.55)]">
               NEW
             </div>
-            <div className="font-semibold text-xl tracking-tighter">
+            <div className="text-base font-semibold tracking-tight">
               Provision Hetzner Servers
             </div>
           </div>
@@ -485,7 +485,7 @@ export default function EnrollmentTokensPage() {
                 value={hetznerToken}
                 onChange={(e) => setHetznerToken(e.target.value)}
                 placeholder="hcloud_xxxxxxxxxxxxxxxx"
-                className="mt-1 w-full rounded-xl border px-4 py-2 text-sm font-mono"
+                className="input mt-1 font-mono"
               />
               <label className="mt-2 flex items-center gap-2 text-xs">
                 <input
@@ -507,7 +507,7 @@ export default function EnrollmentTokensPage() {
               <input
                 value={hetznerNamePrefix}
                 onChange={(e) => setHetznerNamePrefix(e.target.value)}
-                className="mt-1 w-full rounded-xl border px-4 py-2 text-sm"
+                className="input mt-1"
                 placeholder="prod-node"
               />
             </div>
@@ -521,7 +521,7 @@ export default function EnrollmentTokensPage() {
                 max={10}
                 value={hetznerCount}
                 onChange={(e) => setHetznerCount(parseInt(e.target.value) || 1)}
-                className="mt-1 w-full rounded-xl border px-4 py-2 text-sm"
+                className="input mt-1"
               />
             </div>
             <div>
@@ -531,7 +531,7 @@ export default function EnrollmentTokensPage() {
               <select
                 value={hetznerServerType}
                 onChange={(e) => setHetznerServerType(e.target.value)}
-                className="mt-1 w-full rounded-xl border px-4 py-2 text-sm"
+                className="input mt-1"
               >
                 <option value="cx22">cx22 (4 vCPU / 8 GB)</option>
                 <option value="cx32">cx32 (8 vCPU / 16 GB)</option>
@@ -546,7 +546,7 @@ export default function EnrollmentTokensPage() {
                 value={hetznerPrivateNetworkName}
                 onChange={(e) => setHetznerPrivateNetworkName(e.target.value)}
                 placeholder="forge-private"
-                className="mt-1 w-full rounded-xl border px-4 py-2 text-sm"
+                className="input mt-1"
               />
               <input
                 value={hetznerPrivateNetworkIpRange}
@@ -554,7 +554,7 @@ export default function EnrollmentTokensPage() {
                   setHetznerPrivateNetworkIpRange(e.target.value)
                 }
                 placeholder="10.0.0.0/16 (optional IP range)"
-                className="mt-1 w-full rounded-xl border px-4 py-2 text-sm font-mono"
+                className="input mt-1 font-mono"
               />
               <div className="text-[10px] text-[var(--color-muted-foreground)] mt-1">
                 Provide a name to create/attach a private network. Optionally
@@ -581,7 +581,7 @@ export default function EnrollmentTokensPage() {
                 <select
                   value={selectedCredentialId}
                   onChange={(e) => setSelectedCredentialId(e.target.value)}
-                  className="mt-1 w-full rounded-xl border px-4 py-2 text-sm"
+                  className="input mt-1"
                 >
                   <option value="">
                     -- Paste token above or select saved --
@@ -609,7 +609,7 @@ export default function EnrollmentTokensPage() {
               <button
                 onClick={saveHetznerCredential}
                 disabled={!hetznerToken}
-                className="rounded-2xl border border-[var(--color-border)] px-6 py-2.5 text-sm hover:bg-[var(--color-muted)]"
+                className="btn btn-ghost"
               >
                 Save as Credential
               </button>
@@ -752,16 +752,14 @@ export default function EnrollmentTokensPage() {
         </div>
 
         {/* Issue form */}
-        <div className="rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-8 mb-8 shadow-sm">
-          <div className="flex items-center justify-between mb-6">
-            <div>
-              <div className="font-semibold tracking-tighter text-2xl">
-                Issue new enrollment token
-              </div>
-              <div className="text-sm text-[var(--color-muted-foreground)] mt-1">
-                Agents use this one-time (or limited-use) secret to join the
-                mesh and receive signed work.
-              </div>
+        <div className="mb-8 rounded-lg border border-[oklch(1_0_0/0.08)] bg-[oklch(0.185_0_0)] p-6">
+          <div className="mb-5">
+            <div className="text-base font-semibold tracking-tight">
+              Issue enrollment token
+            </div>
+            <div className="mt-0.5 text-[13px] text-[oklch(1_0_0/0.45)]">
+              Agents use this one-time (or limited-use) secret to join the mesh
+              and receive signed work.
             </div>
           </div>
 
@@ -775,7 +773,7 @@ export default function EnrollmentTokensPage() {
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
                   placeholder="hetzner node-03 — staging"
-                  className="w-full rounded-2xl border border-[var(--color-input)] px-5 py-3 text-[15px] focus:outline-none focus:ring-2 focus:ring-[var(--color-ring)] bg-[var(--color-card)] placeholder:text-[var(--color-muted-foreground)]/50"
+                  className="input"
                 />
               </div>
 
@@ -790,7 +788,7 @@ export default function EnrollmentTokensPage() {
                       e.target.value === "" ? "" : Number(e.target.value),
                     )
                   }
-                  className="w-full rounded-2xl border border-[var(--color-input)] bg-[var(--color-card)] px-5 py-3 text-[15px] focus:outline-none focus:ring-2 focus:ring-[var(--color-ring)]"
+                  className="select"
                 >
                   <option value="">Never expires</option>
                   <option value={1}>1 day</option>
@@ -820,7 +818,7 @@ export default function EnrollmentTokensPage() {
                         ),
                       )
                     }
-                    className="w-28 rounded-2xl border border-[var(--color-input)] bg-[var(--color-card)] px-5 py-3 text-[15px] tabular-nums focus:outline-none focus:ring-2 focus:ring-[var(--color-ring)]"
+                    className="input w-28 tabular-nums"
                   />
                   <div className="text-xs text-[var(--color-muted-foreground)]">
                     1 = single-use (recommended for production nodes)
@@ -996,12 +994,12 @@ export default function EnrollmentTokensPage() {
 
         {/* Phase 4: Live "Your Servers" — the payoff of the crypto model (ed25519 + age per-agent identity) */}
         <div className="mb-8">
-          <div className="flex items-center justify-between mb-3 px-1">
+          <div className="flex items-center justify-between mb-3">
             <div>
-              <div className="font-semibold tracking-tighter text-xl">
+              <div className="text-base font-semibold tracking-tight">
                 Your Servers
               </div>
-              <div className="text-xs text-[var(--color-muted-foreground)]">
+              <div className="text-[12px] text-[oklch(1_0_0/0.4)]">
                 Agents that have successfully enrolled. Each has its own Ed25519
                 identity + age recipient. Secrets are encrypted to the exact set
                 of agents that need them — never in plaintext on the control
@@ -1022,7 +1020,7 @@ export default function EnrollmentTokensPage() {
               Loading registered agents…
             </div>
           ) : agents.length === 0 ? (
-            <div className="rounded-3xl border border-dashed border-[var(--color-border)] bg-[var(--color-card)] p-10 text-center">
+            <div className="rounded-lg border border-dashed border-[oklch(1_0_0/0.1)] p-10 text-center">
               <div className="font-medium">No servers enrolled yet</div>
               <div className="text-sm text-[var(--color-muted-foreground)] mt-1 max-w-xs mx-auto">
                 Issue a token above, run the one-liner on any Linux box
@@ -1041,7 +1039,7 @@ export default function EnrollmentTokensPage() {
                 return (
                   <div
                     key={a.id || idx}
-                    className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-card)] p-4 flex flex-col gap-2 text-sm"
+                    className="rounded-lg border border-[oklch(1_0_0/0.08)] bg-[oklch(0.185_0_0)] p-4 flex flex-col gap-2 text-sm"
                   >
                     <div className="flex items-start justify-between">
                       <div>
@@ -1093,8 +1091,8 @@ export default function EnrollmentTokensPage() {
 
         {/* List of tokens (kept for operators who want to manage raw tokens) */}
         <div>
-          <div className="flex items-center justify-between mb-3 px-1">
-            <div className="font-semibold tracking-tighter text-xl">
+          <div className="flex items-center justify-between mb-3">
+            <div className="text-base font-semibold tracking-tight">
               All enrollment tokens
             </div>
             <button
@@ -1119,11 +1117,11 @@ export default function EnrollmentTokensPage() {
             </button>
           </div>
 
-          <div className="rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] overflow-hidden shadow-sm">
+          <div className="overflow-hidden rounded-lg border border-[oklch(1_0_0/0.08)] bg-[oklch(0.185_0_0)]">
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
-                  <tr className="border-b border-[var(--color-card-border)] bg-[var(--color-muted)]/40 text-left text-[11px] uppercase tracking-[1px] text-[var(--color-muted-foreground)]">
+                  <tr className="border-b border-[oklch(1_0_0/0.07)] bg-[oklch(1_0_0/0.03)] text-left text-[10px] uppercase tracking-[0.12em] text-[oklch(1_0_0/0.38)]">
                     <th className="pl-6 py-3 font-medium">PREFIX</th>
                     <th className="py-3 font-medium">DESCRIPTION</th>
                     <th className="py-3 font-medium">STATUS</th>
@@ -1133,7 +1131,7 @@ export default function EnrollmentTokensPage() {
                     <th className="pr-6 py-3 w-24"></th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-[var(--color-card-border)]">
+                <tbody className="divide-y divide-[oklch(1_0_0/0.06)]">
                   {isLoading &&
                     tokens.length === 0 &&
                     Array.from({ length: 3 }).map((_, i) => (

@@ -266,13 +266,11 @@ export default function UpdateForgePage() {
   };
 
   return (
-    <div className="mx-auto max-w-6xl px-6 py-8 space-y-8">
+    <div className="page-root space-y-6">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight mb-1">
-            Update Forge
-          </h1>
-          <p className="text-sm text-[var(--color-muted-foreground)] max-w-xl">
+          <h1 className="text-xl font-semibold tracking-tight">Update Forge</h1>
+          <p className="mt-0.5 text-[13px] text-[oklch(1_0_0/0.45)] max-w-xl">
             Self-update the platform exactly like any other application. Same
             strategies, same observability, same zero-downtime guarantees.
           </p>
@@ -289,7 +287,7 @@ export default function UpdateForgePage() {
       </div>
 
       {/* Current System Components */}
-      <div className="rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-6">
+      <div className="rounded-lg border border-[oklch(1_0_0/0.08)] bg-[oklch(0.185_0_0)] p-6">
         <div className="flex items-center justify-between mb-4">
           <div className="font-semibold text-lg">System Components</div>
           <div className="text-xs text-[var(--color-muted-foreground)]">
@@ -301,7 +299,7 @@ export default function UpdateForgePage() {
           {components.map((comp) => (
             <div
               key={comp.id}
-              className="rounded-2xl border border-[var(--color-border)] p-4 bg-[var(--color-card)]/50"
+              className="rounded-md border border-[oklch(1_0_0/0.07)] p-4"
             >
               <div className="flex justify-between items-start">
                 <div>
@@ -342,7 +340,7 @@ export default function UpdateForgePage() {
 
       {/* Richer per-agent / per-cluster update status (real data from phased canary metrics) */}
       {agentStatus.length > 0 && (
-        <div className="rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-6">
+        <div className="rounded-lg border border-[oklch(1_0_0/0.08)] bg-[oklch(0.185_0_0)] p-6">
           <div className="flex items-center justify-between mb-4">
             <div className="font-semibold text-lg">
               Agent Update Status (Phased Canary by Cluster)
@@ -354,7 +352,7 @@ export default function UpdateForgePage() {
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
-                <tr className="text-left text-[var(--color-muted-foreground)] border-b">
+                <tr className="border-b border-[oklch(1_0_0/0.07)] text-left text-[10px] uppercase tracking-[0.12em] text-[oklch(1_0_0/0.38)]">
                   <th className="py-2 pr-4">Cluster</th>
                   <th className="py-2 pr-4">Agents</th>
                   <th className="py-2 pr-4">On Desired Version</th>
@@ -364,7 +362,10 @@ export default function UpdateForgePage() {
               </thead>
               <tbody>
                 {agentStatus.map((a, i) => (
-                  <tr key={i} className="border-b last:border-0">
+                  <tr
+                    key={i}
+                    className="border-b border-[oklch(1_0_0/0.06)] last:border-0"
+                  >
                     <td className="py-2 pr-4 font-mono text-xs">{a.cluster}</td>
                     <td className="py-2 pr-4 font-mono">{a.agents_total}</td>
                     <td className="py-2 pr-4 font-mono">{a.on_desired}</td>
@@ -395,7 +396,7 @@ export default function UpdateForgePage() {
       )}
 
       {/* Trigger Update Form (Radix-powered) */}
-      <div className="rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-6">
+      <div className="rounded-lg border border-[oklch(1_0_0/0.08)] bg-[oklch(0.185_0_0)] p-6">
         <div className="font-semibold text-lg mb-4">
           Trigger Platform Update
         </div>
@@ -408,7 +409,7 @@ export default function UpdateForgePage() {
             <input
               value={targetVersion}
               onChange={(e) => setTargetVersion(e.target.value)}
-              className="w-full rounded-2xl border border-[var(--color-input)] px-4 py-3 font-mono text-sm"
+              className="input font-mono"
             />
           </div>
           <div>
@@ -418,7 +419,7 @@ export default function UpdateForgePage() {
             <input
               value={binaryRef}
               onChange={(e) => setBinaryRef(e.target.value)}
-              className="w-full rounded-2xl border border-[var(--color-input)] px-4 py-3 text-sm"
+              className="input"
             />
           </div>
           <div className="md:col-span-2">
@@ -428,7 +429,7 @@ export default function UpdateForgePage() {
             <input
               value={targetClusters}
               onChange={(e) => setTargetClusters(e.target.value)}
-              className="w-full rounded-2xl border border-[var(--color-input)] px-4 py-3 text-sm"
+              className="input"
               placeholder="cluster-eu,cluster-us,cluster-apac"
             />
           </div>
@@ -442,19 +443,19 @@ export default function UpdateForgePage() {
             value={selectedStrategy}
             onValueChange={(v) => setSelectedStrategy(v as any)}
           >
-            <Select.Trigger className="w-full flex items-center justify-between rounded-2xl border border-[var(--color-input)] bg-[var(--color-card)] px-4 py-3 text-sm">
+            <Select.Trigger className="select flex items-center justify-between">
               <Select.Value />
               <Select.Icon>
                 <ChevronDown className="h-4 w-4" />
               </Select.Icon>
             </Select.Trigger>
             <Select.Portal>
-              <Select.Content className="bg-[var(--color-popover)] border border-[var(--color-border)] rounded-xl shadow-lg p-1 z-50">
+              <Select.Content className="z-[200] overflow-hidden rounded-lg border border-[oklch(1_0_0/0.1)] bg-[oklch(0.2_0_0)] shadow-xl p-1">
                 {(["rolling", "blue_green", "canary"] as const).map((s) => (
                   <Select.Item
                     key={s}
                     value={s}
-                    className="px-3 py-2 text-sm rounded-lg hover:bg-[var(--color-accent)] capitalize flex items-center gap-2 cursor-pointer"
+                    className="flex cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-[13px] capitalize outline-none hover:bg-[oklch(1_0_0/0.07)] focus:bg-[oklch(1_0_0/0.07)]"
                   >
                     <Select.ItemText>{s.replace("_", " ")}</Select.ItemText>
                     <Select.ItemIndicator>
@@ -482,7 +483,7 @@ export default function UpdateForgePage() {
       </div>
 
       {/* Rollout Progress Chart (Recharts + persistent data) */}
-      <div className="rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-6">
+      <div className="rounded-lg border border-[oklch(1_0_0/0.08)] bg-[oklch(0.185_0_0)] p-6">
         <div className="font-semibold text-lg mb-4">
           Live Rollout Progress (from persistent time-series)
         </div>

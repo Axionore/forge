@@ -110,13 +110,11 @@ export default function MetricsDashboard() {
   };
 
   return (
-    <div className="mx-auto max-w-6xl px-6 py-8">
-      <div className="flex items-end justify-between mb-6">
+    <div className="page-root">
+      <div className="mb-6 flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">
-            Persistent Metrics
-          </h1>
-          <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
+          <h1 className="text-xl font-semibold tracking-tight">Metrics</h1>
+          <p className="mt-0.5 text-[13px] text-[oklch(1_0_0/0.45)]">
             Time-series from heartbeats, HealthChecks, and rollout engine
           </p>
         </div>
@@ -132,13 +130,13 @@ export default function MetricsDashboard() {
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Recharts line */}
-        <div className="rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-6">
+        <div className="rounded-lg border border-[oklch(1_0_0/0.08)] bg-[oklch(0.185_0_0)] p-6">
           <div className="flex justify-between items-center mb-4">
             <div className="font-medium">Metric: {selectedMetric}</div>
             <select
               value={selectedMetric}
               onChange={(e) => setSelectedMetric(e.target.value)}
-              className="text-sm border rounded-xl px-3 py-1"
+              className="select h-7 w-auto pr-7 text-[12px]"
             >
               <option value="cpu">CPU %</option>
               <option value="memory">Memory %</option>
@@ -166,7 +164,7 @@ export default function MetricsDashboard() {
         </div>
 
         {/* ECharts area for rollout */}
-        <div className="rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-6">
+        <div className="rounded-lg border border-[oklch(1_0_0/0.08)] bg-[oklch(0.185_0_0)] p-6">
           <div className="font-medium mb-4">Rollout Progress (ECharts)</div>
           <ReactECharts option={echartsOption} style={{ height: 320 }} />
         </div>

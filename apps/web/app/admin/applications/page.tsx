@@ -4,6 +4,7 @@ import React from "react";
 import Link from "next/link";
 import * as Dialog from "@radix-ui/react-dialog";
 import { toast } from "sonner";
+import { Plus, Search, X, ChevronRight, Boxes } from "lucide-react";
 import { useAdminToken } from "../token-store";
 
 const API_BASE = "http://localhost:3000";
@@ -47,9 +48,7 @@ const KINDS: { kind: AppKind; label: string; desc: string }[] = [
 function copyToClipboard(text: string) {
   navigator.clipboard
     .writeText(text)
-    .then(() => {
-      toast.success("Copied to clipboard");
-    })
+    .then(() => toast.success("Copied to clipboard"))
     .catch(() => {
       const ta = document.createElement("textarea");
       ta.value = text;
@@ -61,13 +60,110 @@ function copyToClipboard(text: string) {
     });
 }
 
+function relativeTime(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d ago`;
+}
+
+function kindLabel(kind: string | null): string {
+  switch (kind) {
+    case "git":
+      return "Git";
+    case "dockerfile":
+      return "Dockerfile";
+    case "compose":
+      return "Compose";
+    case "template":
+      return "Template";
+    default:
+      return kind ?? "Git";
+  }
+}
+
+function statusDotClass(status: string | null): string {
+  switch (status) {
+    case "healthy":
+      return "status-dot-healthy";
+    case "in_progress":
+      return "status-dot-progress";
+    case "failed":
+    case "unhealthy":
+      return "status-dot-failed";
+    default:
+      return "status-dot-pending";
+  }
+}
+
+// ---- App Card (Dokploy-style service card) -----------------------------------
+
+function AppCard({
+  app,
+  onQuickDeploy,
+}: {
+  app: Application;
+  onQuickDeploy: (app: Application) => void;
+}) {
+  return (
+    <div className="group relative flex flex-col rounded-lg border border-[oklch(1_0_0/0.08)] bg-[oklch(0.185_0_0)] p-5 transition-all duration-150 hover:-translate-y-px hover:border-[oklch(1_0_0/0.14)] hover:shadow-[0_4px_24px_oklch(0_0_0/0.35)]">
+      {/* Status dot — top-right */}
+      <div className="absolute right-4 top-4">
+        <span
+          className={`status-dot ${statusDotClass(app.status)} ${app.status === "healthy" ? "pulse-dot text-[var(--color-success)]" : ""}`}
+          title={app.status ?? "unknown"}
+        />
+      </div>
+
+      {/* Name + kind chip */}
+      <div className="mb-3 pr-4">
+        <div className="truncate text-[13px] font-semibold tracking-tight text-[oklch(0.97_0_0)]">
+          {app.name}
+        </div>
+        <div className="mt-1.5 inline-flex items-center rounded-[4px] border border-[oklch(1_0_0/0.08)] bg-[oklch(1_0_0/0.04)] px-2 py-px text-[10px] font-medium uppercase tracking-wide text-[oklch(1_0_0/0.45)]">
+          {kindLabel(app.kind)}
+        </div>
+      </div>
+
+      {/* Created */}
+      <div className="mt-auto pt-3 text-[11px] text-[oklch(1_0_0/0.35)]">
+        Created {relativeTime(app.created_at)}
+      </div>
+
+      {/* Actions — shown on hover */}
+      <div className="mt-3 flex items-center gap-2 border-t border-[oklch(1_0_0/0.07)] pt-3">
+        <Link
+          href={`/admin/applications/${app.id}`}
+          className="btn btn-ghost btn-sm flex-1 justify-center"
+        >
+          Open
+          <ChevronRight className="h-3.5 w-3.5 opacity-60" />
+        </Link>
+        <button
+          onClick={() => onQuickDeploy(app)}
+          className="btn btn-primary btn-sm flex-1 justify-center"
+        >
+          Deploy
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---- Page -------------------------------------------------------------------
+
 export default function ApplicationsPage() {
   const [adminToken] = useAdminToken();
   const [applications, setApplications] = React.useState<Application[]>([]);
   const [isLoading, setIsLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const [filter, setFilter] = React.useState("");
 
-  const [oneTimeSecret, setOneTimeSecret] = React.useState<string | null>(null); // preserved for future real one-time secrets (e.g. age enrollment)
+  const [oneTimeSecret, setOneTimeSecret] = React.useState<string | null>(null);
 
   const [isWizardOpen, setIsWizardOpen] = React.useState(false);
   const [wizardStep, setWizardStep] = React.useState<"select" | "details">(
@@ -81,7 +177,6 @@ export default function ApplicationsPage() {
     ageKeyPath?: string;
   }>({});
 
-  // Phase 1 Quick Deploy (real signed job dispatch)
   const [quickDeployApp, setQuickDeployApp] =
     React.useState<Application | null>(null);
   const [quickDeployImage, setQuickDeployImage] =
@@ -89,7 +184,6 @@ export default function ApplicationsPage() {
   const [quickDeployAgent, setQuickDeployAgent] = React.useState("");
   const [isDeploying, setIsDeploying] = React.useState(false);
 
-  // Quick deploy registry support (Slice C polish - consistent with detail page)
   const [quickDeployRegistryServer, setQuickDeployRegistryServer] =
     React.useState("");
   const [quickDeployRegistryUser, setQuickDeployRegistryUser] =
@@ -148,7 +242,6 @@ export default function ApplicationsPage() {
     const body = {
       name: payload.name,
       description: null,
-      // kind and spec are set server-side in Phase 0 foundation; real wizard will send richer payload in Phase 1
     };
 
     try {
@@ -175,10 +268,7 @@ export default function ApplicationsPage() {
       setSelectedKind(null);
       setFormData({});
 
-      toast.success(
-        `Application "${created.name}" created (real backend + RBAC + audit)`,
-      );
-      // In a future slice the response can carry a one-time secret (age enrollment etc.) → setOneTimeSecret here
+      toast.success(`Application "${created.name}" created`);
     } catch (e: unknown) {
       const msg =
         e instanceof Error ? e.message : "Failed to create application";
@@ -189,7 +279,6 @@ export default function ApplicationsPage() {
     }
   };
 
-  // Real Phase 1 deploy — reuses the exact same endpoint + dispatch path the deployments page uses
   async function quickDeploy(app: Application) {
     if (!adminToken) {
       setError("Enter your FORGE_ADMIN_TOKEN first");
@@ -198,7 +287,7 @@ export default function ApplicationsPage() {
     setIsDeploying(true);
     setError(null);
 
-    const container: any = {
+    const container: Record<string, unknown> = {
       name: "app",
       image: quickDeployImage,
       env: [],
@@ -210,19 +299,18 @@ export default function ApplicationsPage() {
       resources: null,
     };
 
-    // Support private registry in quick deploy (consistent with detail page - Phase 1 complete)
     if (
       quickDeployRegistryServer &&
       (quickDeployRegistryUser || quickDeployRegistryPass)
     ) {
-      container.registry_auth = {
+      container["registry_auth"] = {
         serveraddress: quickDeployRegistryServer,
         username: quickDeployRegistryUser || undefined,
         password: quickDeployRegistryPass || undefined,
       };
     }
 
-    const spec: any = {
+    const spec: Record<string, unknown> = {
       containers: [container],
       networks: [],
       network_specs: [],
@@ -233,7 +321,7 @@ export default function ApplicationsPage() {
       quickDeployRegistryServer &&
       (quickDeployRegistryUser || quickDeployRegistryPass)
     ) {
-      spec.registry_credentials = [
+      spec["registry_credentials"] = [
         [
           quickDeployRegistryServer,
           {
@@ -273,12 +361,11 @@ export default function ApplicationsPage() {
       }
 
       toast.success(
-        `Deploy dispatched for ${app.name} — check Deployments page for logs & status`,
+        `Deploy dispatched for ${app.name} — check Deployments page for status`,
       );
       setQuickDeployApp(null);
       setQuickDeployImage("nginx:alpine");
       setQuickDeployAgent("");
-      // Refresh the list so status can update later
       await loadApplications();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Deploy failed";
@@ -298,80 +385,33 @@ export default function ApplicationsPage() {
     });
   };
 
+  const filtered = React.useMemo(() => {
+    if (!filter.trim()) return applications;
+    const q = filter.toLowerCase();
+    return applications.filter(
+      (a) =>
+        a.name.toLowerCase().includes(q) ||
+        (a.kind ?? "").toLowerCase().includes(q),
+    );
+  }, [applications, filter]);
+
   return (
-    <div className="mx-auto max-w-7xl px-6 py-8 space-y-8">
-      <div>
-        <div className="flex items-baseline gap-3">
-          <h1 className="text-2xl font-semibold tracking-tight">
-            Applications
-          </h1>
+    <div className="page-root">
+      {/* Header row */}
+      <div className="mb-6 flex items-center justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-semibold tracking-tight">Applications</h1>
+          <p className="mt-0.5 text-[13px] text-[oklch(1_0_0/0.45)]">
+            Deployable units. Connect Git, Dockerfile, Compose, or templates.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
           <Link
             href="/admin/enrollment-tokens"
-            className="text-xs px-2.5 py-0.5 rounded-full border border-border text-[var(--color-muted-foreground)] hover:bg-[oklch(1_0_0/0.05)]"
+            className="btn btn-ghost btn-sm"
           >
-            Add server →
+            Add server
           </Link>
-        </div>
-        <p className="text-sm text-[var(--color-muted-foreground)] mt-1 max-w-2xl">
-          Catalog of deployable units from Git, Dockerfiles, Compose, and
-          templates. Deployments target real enrolled agents with signed jobs
-          and per-agent age envelopes.
-        </p>
-      </div>
-
-      {/* Error banner (real) */}
-      {error && (
-        <div className="rounded-3xl border border-red-500/30 bg-[var(--color-destructive)]/100/5 p-4 text-sm text-[var(--color-destructive)]">
-          {error}
-          <button onClick={() => setError(null)} className="ml-4 underline">
-            dismiss
-          </button>
-        </div>
-      )}
-
-      {/* Exact amber one-time secret banner (copy-once, dismiss, redacted) */}
-      {oneTimeSecret && (
-        <div className="rounded-lg border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/10 p-6">
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <div className="font-semibold text-amber-600">
-                One-time secret — copy now
-              </div>
-              <p className="text-sm text-amber-600/90 mt-0.5">
-                It will never be shown again.
-              </p>
-            </div>
-            <button
-              onClick={() => setOneTimeSecret(null)}
-              className="text-amber-600/70 hover:text-amber-600 text-2xl leading-none -mt-1"
-            >
-              ×
-            </button>
-          </div>
-          <pre className="mt-4 font-mono text-sm bg-black/60 p-4 rounded-2xl overflow-x-auto whitespace-pre-wrap break-all select-all border border-amber-500/20">
-            {oneTimeSecret}
-          </pre>
-          <div className="mt-4 flex gap-3">
-            <button
-              onClick={() => copyToClipboard(oneTimeSecret)}
-              className="btn btn-primary"
-            >
-              Copy secret
-            </button>
-            <button
-              onClick={() => setOneTimeSecret(null)}
-              className="btn btn-ghost"
-            >
-              Dismiss (never shown again)
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Main catalog card */}
-      <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8">
-        <div className="flex items-center justify-between mb-6">
-          <div className="font-semibold text-lg tracking-tight">Catalog</div>
           <button
             onClick={() => {
               setIsWizardOpen(true);
@@ -379,113 +419,177 @@ export default function ApplicationsPage() {
               setSelectedKind(null);
               setFormData({});
             }}
-            className="px-5 py-2.5 rounded-2xl bg-[var(--color-primary)] text-[var(--color-primary-foreground)] text-sm font-medium hover:opacity-90"
+            className="btn btn-primary btn-sm"
           >
-            Create Application
+            <Plus className="h-3.5 w-3.5" />
+            New Application
           </button>
         </div>
-
-        {/* 4 async states - exact empty p-12, loading skeletons, error banner above, success grid (real API now) */}
-        {isLoading ? (
-          <div className="space-y-3">
-            {[1, 2].map((i) => (
-              <div
-                key={i}
-                className="rounded-2xl border border-[var(--color-border)] p-6 animate-pulse"
-              >
-                <div className="flex justify-between">
-                  <div className="space-y-2 flex-1">
-                    <div className="h-5 bg-[var(--color-muted)] rounded w-2/5" />
-                    <div className="h-3 bg-[var(--color-muted)] rounded w-1/4" />
-                  </div>
-                  <div className="h-6 w-20 bg-[var(--color-muted)] rounded-full" />
-                </div>
-              </div>
-            ))}
-          </div>
-        ) : applications.length === 0 ? (
-          <div className="p-12 text-center">
-            <p className="text-lg text-[var(--color-muted-foreground)]">
-              No applications yet. Create your first from Git, Dockerfile,
-              Compose or Template.
-            </p>
-            <button
-              onClick={() => {
-                setIsWizardOpen(true);
-                setWizardStep("select");
-              }}
-              className="mt-6 px-6 py-3 rounded-2xl bg-[var(--color-primary)] text-[var(--color-primary-foreground)] font-medium text-sm"
-            >
-              Create Application
-            </button>
-          </div>
-        ) : (
-          <div className="grid gap-4 md:grid-cols-2">
-            {applications.map((app) => (
-              <div
-                key={app.id}
-                className="rounded-2xl border border-[var(--color-border)] p-6"
-              >
-                <div className="flex justify-between items-start">
-                  <div>
-                    <div className="font-semibold text-lg tracking-tight">
-                      {app.name}
-                    </div>
-                    <div className="mt-1 text-xs uppercase tracking-widest text-[var(--color-muted-foreground)]">
-                      {app.kind ?? "git"}
-                    </div>
-                  </div>
-                  <div className="text-xs text-[var(--color-muted-foreground)]">
-                    {new Date(app.created_at).toLocaleString()}
-                  </div>
-                </div>
-                {app.status && (
-                  <div className="mt-2 text-xs text-[var(--color-muted-foreground)]">
-                    Status: {app.status}
-                  </div>
-                )}
-
-                <div className="mt-4 flex gap-2">
-                  {/* Primary: go to clean detail page with rich Deploy + live status/logs */}
-                  <Link
-                    href={`/admin/applications/${app.id}`}
-                    className="flex-1 text-center rounded-2xl border border-[var(--color-border)] py-2 text-sm font-medium hover:bg-[var(--color-muted)]"
-                  >
-                    View details
-                  </Link>
-                  {/* Secondary fast path (list-level quick deploy) */}
-                  <button
-                    onClick={() => {
-                      setQuickDeployApp(app);
-                      setQuickDeployImage("nginx:alpine");
-                    }}
-                    className="flex-1 rounded-2xl bg-[var(--color-primary)] text-[var(--color-primary-foreground)] py-2 text-sm font-medium hover:opacity-90"
-                  >
-                    Quick Deploy
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
       </div>
 
-      {/* Wizard Dialog - Radix + Service Catalog grid reuse */}
+      {/* Error banner */}
+      {error && (
+        <div className="mb-5 flex items-center justify-between rounded-md border border-[var(--color-destructive)]/40 bg-[var(--color-destructive)]/10 px-4 py-3 text-sm text-[var(--color-destructive)]">
+          <span>{error}</span>
+          <button
+            onClick={() => setError(null)}
+            className="ml-4 font-medium underline underline-offset-2"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* One-time secret banner */}
+      {oneTimeSecret && (
+        <div className="mb-5 rounded-md border border-[var(--color-warning)]/40 bg-[var(--color-warning)]/10 p-5">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <div className="font-semibold text-[var(--color-warning)]">
+                One-time secret — copy now
+              </div>
+              <p className="mt-0.5 text-sm text-[var(--color-warning)]/80">
+                It will never be shown again.
+              </p>
+            </div>
+            <button
+              onClick={() => setOneTimeSecret(null)}
+              className="text-[var(--color-warning)]/70 hover:text-[var(--color-warning)]"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+          <pre className="mt-3 select-all overflow-x-auto whitespace-pre-wrap break-all rounded-md border border-[var(--color-warning)]/25 bg-black/50 p-4 font-mono text-sm">
+            {oneTimeSecret}
+          </pre>
+          <div className="mt-3 flex gap-2">
+            <button
+              onClick={() => copyToClipboard(oneTimeSecret)}
+              className="btn btn-primary btn-sm"
+            >
+              Copy secret
+            </button>
+            <button
+              onClick={() => setOneTimeSecret(null)}
+              className="btn btn-ghost btn-sm"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Filter + count row */}
+      {applications.length > 0 && (
+        <div className="mb-4 flex items-center gap-3">
+          <div className="relative flex-1 max-w-xs">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[oklch(1_0_0/0.3)]" />
+            <input
+              type="search"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder="Filter applications…"
+              className="input h-8 pl-8 text-[13px]"
+            />
+          </div>
+          <span className="text-[12px] text-[oklch(1_0_0/0.38)] tabular-nums">
+            {filtered.length} of {applications.length}
+          </span>
+        </div>
+      )}
+
+      {/* States */}
+      {isLoading && applications.length === 0 ? (
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {[1, 2, 3].map((i) => (
+            <div
+              key={i}
+              className="h-[156px] animate-pulse rounded-lg border border-[oklch(1_0_0/0.07)] bg-[oklch(0.185_0_0)]"
+            />
+          ))}
+        </div>
+      ) : !adminToken ? (
+        <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-[oklch(1_0_0/0.1)] py-16 text-center">
+          <Boxes className="mb-3 h-8 w-8 text-[oklch(1_0_0/0.2)]" />
+          <div className="text-sm font-medium text-[oklch(1_0_0/0.5)]">
+            Set an admin token to view applications
+          </div>
+          <div className="mt-1 text-[12px] text-[oklch(1_0_0/0.3)]">
+            Enter your token in the top bar
+          </div>
+        </div>
+      ) : filtered.length === 0 ? (
+        <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-[oklch(1_0_0/0.1)] py-16 text-center">
+          <Boxes className="mb-3 h-8 w-8 text-[oklch(1_0_0/0.2)]" />
+          {applications.length === 0 ? (
+            <>
+              <div className="text-sm font-medium text-[oklch(1_0_0/0.5)]">
+                No applications yet
+              </div>
+              <div className="mt-1 text-[12px] text-[oklch(1_0_0/0.3)]">
+                Create your first from Git, Dockerfile, Compose, or a template
+              </div>
+              <button
+                onClick={() => {
+                  setIsWizardOpen(true);
+                  setWizardStep("select");
+                }}
+                className="btn btn-primary btn-sm mt-5"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                New Application
+              </button>
+            </>
+          ) : (
+            <>
+              <div className="text-sm font-medium text-[oklch(1_0_0/0.5)]">
+                No results for &ldquo;{filter}&rdquo;
+              </div>
+              <button
+                onClick={() => setFilter("")}
+                className="btn btn-ghost btn-sm mt-4"
+              >
+                Clear filter
+              </button>
+            </>
+          )}
+        </div>
+      ) : (
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 reveal">
+          {filtered.map((app, i) => (
+            <div
+              key={app.id}
+              className="reveal"
+              style={{ animationDelay: `${i * 40}ms` }}
+            >
+              <AppCard app={app} onQuickDeploy={setQuickDeployApp} />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ---- Create Application Wizard ---- */}
       <Dialog.Root open={isWizardOpen} onOpenChange={setIsWizardOpen}>
         <Dialog.Portal>
-          <Dialog.Overlay className="fixed inset-0 bg-black/70 z-50" />
-          <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-full max-w-3xl -translate-x-1/2 -translate-y-1/2 rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8 shadow-2xl">
-            <div className="flex justify-between mb-6">
-              <Dialog.Title className="text-2xl font-semibold tracking-tight">
-                Create Application
+          <Dialog.Overlay className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm" />
+          <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-full max-w-2xl -translate-x-1/2 -translate-y-1/2 rounded-xl border border-[oklch(1_0_0/0.1)] bg-[oklch(0.185_0_0)] p-7 shadow-2xl focus:outline-none">
+            <div className="mb-5 flex items-center justify-between">
+              <Dialog.Title className="text-lg font-semibold tracking-tight">
+                New Application
               </Dialog.Title>
-              <Dialog.Close className="text-2xl leading-none">×</Dialog.Close>
+              <Dialog.Close asChild>
+                <button className="grid h-7 w-7 place-items-center rounded-md text-[oklch(1_0_0/0.4)] transition-colors hover:bg-[oklch(1_0_0/0.07)] hover:text-[oklch(0.97_0_0)]">
+                  <X className="h-4 w-4" />
+                </button>
+              </Dialog.Close>
             </div>
 
             {wizardStep === "select" && (
               <div>
-                <div className="text-sm font-medium mb-4">Choose source</div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <p className="mb-4 text-[13px] text-[oklch(1_0_0/0.45)]">
+                  Choose your source type
+                </p>
+                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                   {KINDS.map((k) => (
                     <button
                       key={k.kind}
@@ -494,12 +598,12 @@ export default function ApplicationsPage() {
                         setWizardStep("details");
                         setFormData({});
                       }}
-                      className="rounded-2xl border border-[var(--color-border)] p-6 text-left hover:border-[var(--color-primary)]"
+                      className="group flex flex-col rounded-lg border border-[oklch(1_0_0/0.08)] bg-[oklch(1_0_0/0.03)] p-4 text-left transition-colors hover:border-[oklch(1_0_0/0.18)] hover:bg-[oklch(1_0_0/0.05)]"
                     >
-                      <div className="font-semibold text-lg tracking-tight">
+                      <div className="text-[13px] font-semibold text-[oklch(0.97_0_0)]">
                         {k.label}
                       </div>
-                      <div className="text-sm text-[var(--color-muted-foreground)] mt-2">
+                      <div className="mt-1 text-[12px] text-[oklch(1_0_0/0.4)]">
                         {k.desc}
                       </div>
                     </button>
@@ -509,16 +613,16 @@ export default function ApplicationsPage() {
             )}
 
             {wizardStep === "details" && selectedKind && (
-              <div className="space-y-6">
+              <div className="space-y-5">
                 <button
                   onClick={() => setWizardStep("select")}
-                  className="text-sm text-[var(--color-muted-foreground)]"
+                  className="text-[12px] text-[oklch(1_0_0/0.4)] transition-colors hover:text-[oklch(1_0_0/0.7)]"
                 >
                   ← Back
                 </button>
 
                 <div>
-                  <label className="block text-sm font-medium mb-2">
+                  <label className="mb-1.5 block text-[12px] font-medium text-[oklch(1_0_0/0.55)]">
                     Application name
                   </label>
                   <input
@@ -526,15 +630,16 @@ export default function ApplicationsPage() {
                     onChange={(e) =>
                       setFormData({ ...formData, name: e.target.value })
                     }
-                    className="w-full rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-4 py-3 text-sm"
+                    className="input"
                     placeholder="my-service"
+                    autoFocus
                   />
                 </div>
 
                 {selectedKind === "git" && (
                   <>
                     <div>
-                      <label className="block text-sm font-medium mb-2">
+                      <label className="mb-1.5 block text-[12px] font-medium text-[oklch(1_0_0/0.55)]">
                         Repository URL
                       </label>
                       <input
@@ -542,26 +647,32 @@ export default function ApplicationsPage() {
                         onChange={(e) =>
                           setFormData({ ...formData, repoUrl: e.target.value })
                         }
-                        className="w-full rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-4 py-3 text-sm"
+                        className="input"
                         placeholder="https://github.com/org/repo.git"
                       />
                     </div>
-                    <div className="grid grid-cols-2 gap-4">
+                    <div className="grid grid-cols-2 gap-3">
                       <div>
-                        <label className="block text-sm font-medium mb-2">
+                        <label className="mb-1.5 block text-[12px] font-medium text-[oklch(1_0_0/0.55)]">
                           Branch
                         </label>
                         <input
                           value={formData.branch || "main"}
                           onChange={(e) =>
-                            setFormData({ ...formData, branch: e.target.value })
+                            setFormData({
+                              ...formData,
+                              branch: e.target.value,
+                            })
                           }
-                          className="w-full rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-4 py-3 text-sm"
+                          className="input"
                         />
                       </div>
                       <div>
-                        <label className="block text-sm font-medium mb-2">
-                          Age key path (optional)
+                        <label className="mb-1.5 block text-[12px] font-medium text-[oklch(1_0_0/0.55)]">
+                          Age key path{" "}
+                          <span className="font-normal text-[oklch(1_0_0/0.3)]">
+                            (optional)
+                          </span>
                         </label>
                         <input
                           value={formData.ageKeyPath || ""}
@@ -571,7 +682,7 @@ export default function ApplicationsPage() {
                               ageKeyPath: e.target.value,
                             })
                           }
-                          className="w-full rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-4 py-3 text-sm"
+                          className="input"
                           placeholder="~/.config/forge/age.key"
                         />
                       </div>
@@ -579,16 +690,16 @@ export default function ApplicationsPage() {
                   </>
                 )}
 
-                <div className="pt-4 flex justify-end gap-3">
-                  <Dialog.Close className="px-5 py-2.5 rounded-2xl border border-[var(--color-border)]">
-                    Cancel
+                <div className="flex justify-end gap-2 border-t border-[oklch(1_0_0/0.07)] pt-4">
+                  <Dialog.Close asChild>
+                    <button className="btn btn-ghost btn-sm">Cancel</button>
                   </Dialog.Close>
                   <button
                     onClick={submitWizard}
-                    disabled={!formData.name?.trim()}
-                    className="px-6 py-2.5 rounded-2xl bg-[var(--color-primary)] text-[var(--color-primary-foreground)] disabled:opacity-60"
+                    disabled={!formData.name?.trim() || isLoading}
+                    className="btn btn-primary btn-sm"
                   >
-                    Create Application
+                    {isLoading ? "Creating…" : "Create Application"}
                   </button>
                 </div>
               </div>
@@ -597,50 +708,56 @@ export default function ApplicationsPage() {
         </Dialog.Portal>
       </Dialog.Root>
 
-      {/* Phase 1 Quick Deploy Modal — real signed Job::Deploy dispatch */}
+      {/* ---- Quick Deploy Modal ---- */}
       <Dialog.Root
         open={!!quickDeployApp}
         onOpenChange={(o) => !o && setQuickDeployApp(null)}
       >
         <Dialog.Portal>
-          <Dialog.Overlay className="fixed inset-0 bg-black/70 z-50" />
-          <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 -translate-y-1/2 rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8 shadow-2xl">
-            <Dialog.Title className="text-xl font-semibold tracking-tight mb-2">
-              Quick Deploy — {quickDeployApp?.name}
-            </Dialog.Title>
-            <p className="text-sm text-[var(--color-muted-foreground)] mb-6">
-              This will create a Deployment and send a real signed Job::Deploy
-              to a connected agent (if any).
-            </p>
+          <Dialog.Overlay className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm" />
+          <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 -translate-y-1/2 rounded-xl border border-[oklch(1_0_0/0.1)] bg-[oklch(0.185_0_0)] p-7 shadow-2xl focus:outline-none">
+            <div className="mb-5 flex items-center justify-between">
+              <Dialog.Title className="text-base font-semibold tracking-tight">
+                Deploy — {quickDeployApp?.name}
+              </Dialog.Title>
+              <Dialog.Close asChild>
+                <button className="grid h-7 w-7 place-items-center rounded-md text-[oklch(1_0_0/0.4)] transition-colors hover:bg-[oklch(1_0_0/0.07)] hover:text-[oklch(0.97_0_0)]">
+                  <X className="h-4 w-4" />
+                </button>
+              </Dialog.Close>
+            </div>
 
             <div className="space-y-4">
               <div>
-                <label className="block text-sm font-medium mb-1.5">
-                  Container Image
+                <label className="mb-1.5 block text-[12px] font-medium text-[oklch(1_0_0/0.55)]">
+                  Container image
                 </label>
                 <input
                   value={quickDeployImage}
                   onChange={(e) => setQuickDeployImage(e.target.value)}
-                  className="w-full rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-4 py-2.5 text-sm font-mono"
+                  className="input font-mono"
                   placeholder="nginx:alpine or ghcr.io/you/app:v1"
+                  autoFocus
                 />
               </div>
 
               <div>
-                <label className="block text-sm font-medium mb-1.5">
-                  Target Agent ID (optional — leave empty for any connected)
+                <label className="mb-1.5 block text-[12px] font-medium text-[oklch(1_0_0/0.55)]">
+                  Target agent ID{" "}
+                  <span className="font-normal text-[oklch(1_0_0/0.3)]">
+                    (optional — any connected if empty)
+                  </span>
                 </label>
                 <input
                   value={quickDeployAgent}
                   onChange={(e) => setQuickDeployAgent(e.target.value)}
-                  className="w-full rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-4 py-2.5 text-sm font-mono"
+                  className="input font-mono"
                   placeholder="uuid of enrolled agent"
                 />
               </div>
 
-              {/* Registry support for quick deploy - consistent Phase 1 polish */}
-              <div className="pt-2 border-t border-[var(--color-border)]">
-                <div className="text-xs font-medium text-[var(--color-muted-foreground)] mb-1.5">
+              <div className="rounded-md border border-[oklch(1_0_0/0.08)] p-3">
+                <div className="section-label mb-2">
                   Private Registry (optional)
                 </div>
                 <div className="grid grid-cols-3 gap-2">
@@ -649,44 +766,39 @@ export default function ApplicationsPage() {
                     onChange={(e) =>
                       setQuickDeployRegistryServer(e.target.value)
                     }
-                    className="rounded-xl border px-3 py-1.5 text-sm"
+                    className="input text-[12px]"
                     placeholder="registry host"
                   />
                   <input
                     value={quickDeployRegistryUser}
                     onChange={(e) => setQuickDeployRegistryUser(e.target.value)}
-                    className="rounded-xl border px-3 py-1.5 text-sm"
-                    placeholder="user"
+                    className="input text-[12px]"
+                    placeholder="username"
                   />
                   <input
                     type="password"
                     value={quickDeployRegistryPass}
                     onChange={(e) => setQuickDeployRegistryPass(e.target.value)}
-                    className="rounded-xl border px-3 py-1.5 text-sm"
-                    placeholder="pass/token"
+                    className="input text-[12px]"
+                    placeholder="token"
                   />
                 </div>
               </div>
             </div>
 
-            <div className="mt-8 flex justify-end gap-3">
-              <Dialog.Close className="px-5 py-2.5 rounded-2xl border border-[var(--color-border)]">
-                Cancel
+            <div className="mt-6 flex justify-end gap-2">
+              <Dialog.Close asChild>
+                <button className="btn btn-ghost btn-sm">Cancel</button>
               </Dialog.Close>
               <button
-                onClick={() => quickDeployApp && quickDeploy(quickDeployApp)}
+                onClick={() =>
+                  quickDeployApp && void quickDeploy(quickDeployApp)
+                }
                 disabled={isDeploying || !quickDeployImage.trim()}
-                className="px-6 py-2.5 rounded-2xl bg-[var(--color-primary)] text-[var(--color-primary-foreground)] disabled:opacity-60 font-medium"
+                className="btn btn-primary btn-sm"
               >
-                {isDeploying
-                  ? "Dispatching signed job..."
-                  : "Deploy Now (real)"}
+                {isDeploying ? "Dispatching…" : "Deploy Now"}
               </button>
-            </div>
-
-            <div className="mt-4 text-[10px] text-[var(--color-muted-foreground)] text-center">
-              Uses the same dispatch path as /debug/send-job and the Deployments
-              page.
             </div>
           </Dialog.Content>
         </Dialog.Portal>
