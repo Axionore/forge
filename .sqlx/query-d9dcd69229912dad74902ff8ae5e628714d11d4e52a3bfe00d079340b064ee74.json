@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE admin_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE token_hash = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d9dcd69229912dad74902ff8ae5e628714d11d4e52a3bfe00d079340b064ee74"
+}

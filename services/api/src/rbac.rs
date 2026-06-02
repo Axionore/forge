@@ -382,6 +382,38 @@ impl RbacService {
         Ok(())
     }
 
+    /// Resolve a presented raw admin token to the principal it belongs to.
+    ///
+    /// The token is SHA-256 hashed and looked up by its `BYTEA` primary key (constant-time
+    /// is unnecessary here — a hash preimage lookup leaks nothing, and the bootstrap token
+    /// never reaches this path). Returns `Ok(Some(principal_id))` only when the token exists,
+    /// is not revoked, and is not expired. Any other case (unknown / revoked / expired) returns
+    /// `Ok(None)` so the auth layer can reject with a single, enumeration-resistant 401.
+    ///
+    /// Fail-closed: never logs the token or its hash.
+    pub async fn lookup_principal_for_token(
+        &self,
+        raw_token: &str,
+    ) -> Result<Option<Uuid>, RbacError> {
+        let token_hash = Sha256::digest(raw_token.as_bytes()).to_vec();
+
+        let row = sqlx::query!(
+            r#"
+            SELECT principal_id
+            FROM admin_tokens
+            WHERE token_hash = $1
+              AND revoked_at IS NULL
+              AND (expires_at IS NULL OR expires_at > NOW())
+            "#,
+            token_hash
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .context("admin token lookup")?;
+
+        Ok(row.map(|r| r.principal_id))
+    }
+
     /// Load all active (non-revoked) role permissions JSONB for a principal.
     /// Used by middleware / guards for issued-token checks.
     pub async fn get_principal_permissions(
@@ -403,6 +435,36 @@ impl RbacService {
         .context("load principal permissions")?;
 
         Ok(rows.into_iter().map(|r| r.permissions).collect())
+    }
+
+    /// Grant a role to a principal (idempotent). The admin UI uses this to compose a
+    /// principal's effective permissions; tests use it to construct least-privilege fixtures.
+    pub async fn assign_role(
+        &self,
+        principal_id: Uuid,
+        role_id: Uuid,
+        granted_by: Option<&str>,
+    ) -> Result<(), RbacError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO principal_roles (principal_id, role_id, granted_by)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (principal_id, role_id) DO NOTHING
+            "#,
+            principal_id,
+            role_id,
+            granted_by
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| match e {
+            // FK violation → unknown principal or role.
+            sqlx::Error::Database(ref db) if db.code().as_deref() == Some("23503") => {
+                RbacError::NotFound
+            }
+            other => RbacError::Internal(other.into()),
+        })?;
+        Ok(())
     }
 
     /// High-level convenience: does this principal (via any of its roles) allow the action?
@@ -496,5 +558,120 @@ mod tests {
     fn action_allowed_malformed_is_deny() {
         assert!(!action_allowed(&json!(null), "x"));
         assert!(!action_allowed(&json!(["a"]), "a"));
+    }
+}
+
+// =============================================================================
+// Integration tests against real Postgres (`#[sqlx::test]` → isolated DB + migrations).
+// These prove the auth-layer token→principal resolution and per-principal permission
+// checks that constrain issued admin tokens (the A01 per-action RBAC fix).
+// =============================================================================
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+    use serde_json::json;
+    use sqlx::PgPool;
+
+    async fn principal_with_role(
+        svc: &RbacService,
+        perms: serde_json::Value,
+    ) -> (Uuid, CreatedAdminToken) {
+        let principal = svc
+            .create_principal("op", "user", Some("test"))
+            .await
+            .unwrap();
+        // Role name is UNIQUE; derive a fresh one per call so a test can mint several.
+        let role = svc
+            .create_role(
+                &format!("scoped-{}", Uuid::now_v7().simple()),
+                None,
+                perms,
+                Some("test"),
+            )
+            .await
+            .unwrap();
+        svc.assign_role(principal.id, role.id, Some("test"))
+            .await
+            .unwrap();
+        let token = svc
+            .create_admin_token(principal.id, None, None, Some("test"))
+            .await
+            .unwrap();
+        (principal.id, token)
+    }
+
+    #[sqlx::test]
+    async fn lookup_resolves_valid_token_to_principal(pool: PgPool) {
+        let svc = RbacService::new(pool);
+        let (pid, token) = principal_with_role(&svc, json!({"deployments:read": true})).await;
+
+        let resolved = svc
+            .lookup_principal_for_token(&token.raw_token)
+            .await
+            .unwrap();
+        assert_eq!(resolved, Some(pid), "valid token resolves to its principal");
+    }
+
+    #[sqlx::test]
+    async fn lookup_rejects_unknown_revoked_and_expired(pool: PgPool) {
+        let svc = RbacService::new(pool.clone());
+
+        // Unknown token → None (no leak of existence).
+        assert_eq!(
+            svc.lookup_principal_for_token("not-a-real-token")
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Revoked token → None.
+        let (_pid, token) = principal_with_role(&svc, json!({"*": true})).await;
+        let prefix: String = {
+            let h = Sha256::digest(token.raw_token.as_bytes());
+            h.iter().take(4).map(|b| format!("{b:02x}")).collect()
+        };
+        svc.revoke_admin_token(&prefix).await.unwrap();
+        assert_eq!(
+            svc.lookup_principal_for_token(&token.raw_token)
+                .await
+                .unwrap(),
+            None,
+            "revoked token must not resolve"
+        );
+
+        // Expired token → None (set expires_at in the past directly).
+        let (_pid2, token2) = principal_with_role(&svc, json!({"*": true})).await;
+        let hash = Sha256::digest(token2.raw_token.as_bytes()).to_vec();
+        sqlx::query!(
+            "UPDATE admin_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE token_hash = $1",
+            hash
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.lookup_principal_for_token(&token2.raw_token)
+                .await
+                .unwrap(),
+            None,
+            "expired token must not resolve"
+        );
+    }
+
+    #[sqlx::test]
+    async fn principal_can_is_default_deny_through_real_roles(pool: PgPool) {
+        let svc = RbacService::new(pool);
+        // A principal holding only deployments:read.
+        let (pid, _token) = principal_with_role(&svc, json!({"deployments:read": true})).await;
+
+        assert!(svc.principal_can(pid, "deployments:read").await.unwrap());
+        assert!(
+            !svc.principal_can(pid, "cloud:provision").await.unwrap(),
+            "no grant for cloud:provision → denied"
+        );
+        assert!(
+            !svc.principal_can(pid, "secrets:use").await.unwrap(),
+            "no grant for secrets:use → denied"
+        );
     }
 }

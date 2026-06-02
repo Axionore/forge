@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT principal_id\n            FROM admin_tokens\n            WHERE token_hash = $1\n              AND revoked_at IS NULL\n              AND (expires_at IS NULL OR expires_at > NOW())\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "principal_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1dfa2694ab678d8316961d04e37b65b769dfde6a7472f0f44d1b6a4228ec351a"
+}

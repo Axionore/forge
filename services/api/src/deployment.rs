@@ -3859,3 +3859,154 @@ mod rollback_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod per_principal_rbac_tests {
+    //! A01 per-action RBAC — proves that an issued admin token (a real principal) is
+    //! constrained by its roles on mutating service paths, while the bootstrap path
+    //! (`principal_id = None`) is unconstrained. Integration tests against real Postgres.
+    use super::*;
+    use crate::rbac::RbacService;
+    use serde_json::json;
+    use sqlx::PgPool;
+    use std::sync::Arc;
+
+    fn svc_with(pool: PgPool) -> (DeploymentService, Arc<RbacService>) {
+        let rbac = Arc::new(RbacService::new(pool.clone()));
+        (DeploymentService::new(pool, rbac.clone()), rbac)
+    }
+
+    /// Create a principal holding exactly `perms` and return its id.
+    async fn principal_holding(rbac: &RbacService, perms: serde_json::Value) -> Uuid {
+        let p = rbac.create_principal("op", "user", None).await.unwrap();
+        let role = rbac.create_role("scoped", None, perms, None).await.unwrap();
+        rbac.assign_role(p.id, role.id, None).await.unwrap();
+        p.id
+    }
+
+    // --- enforce_action: the gate every handler calls ---
+
+    #[sqlx::test]
+    async fn enforce_action_denies_principal_without_grant(pool: PgPool) {
+        let (svc, rbac) = svc_with(pool);
+        let pid = principal_holding(&rbac, json!({"deployments:read": true})).await;
+
+        // Lacks cloud:provision → Forbidden.
+        let err = svc
+            .enforce_action(Some(pid), "cloud:provision")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DeploymentError::Forbidden));
+
+        // Lacks deployments:write → Forbidden.
+        let err = svc
+            .enforce_action(Some(pid), "deployments:write")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DeploymentError::Forbidden));
+
+        // Lacks secrets:use → Forbidden.
+        let err = svc
+            .enforce_action(Some(pid), "secrets:use")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DeploymentError::Forbidden));
+    }
+
+    #[sqlx::test]
+    async fn enforce_action_allows_bootstrap_none(pool: PgPool) {
+        let (svc, _rbac) = svc_with(pool);
+        // None = bootstrap superuser → allowed for any action.
+        svc.enforce_action(None, "cloud:provision").await.unwrap();
+        svc.enforce_action(None, "deployments:write").await.unwrap();
+        svc.enforce_action(None, "secrets:use").await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn enforce_action_allows_principal_with_grant(pool: PgPool) {
+        let (svc, rbac) = svc_with(pool);
+        // Wildcard namespace grant covers cloud:provision; exact grants for the rest.
+        let pid = principal_holding(
+            &rbac,
+            json!({"cloud:*": true, "deployments:write": true, "secrets:use": true}),
+        )
+        .await;
+
+        svc.enforce_action(Some(pid), "cloud:provision")
+            .await
+            .unwrap();
+        svc.enforce_action(Some(pid), "deployments:write")
+            .await
+            .unwrap();
+        svc.enforce_action(Some(pid), "secrets:use").await.unwrap();
+    }
+
+    // --- create_application: enforces applications:create inside the service ---
+
+    #[sqlx::test]
+    async fn create_application_rejects_principal_without_permission(pool: PgPool) {
+        let (svc, rbac) = svc_with(pool);
+        let pid = principal_holding(&rbac, json!({"deployments:read": true})).await;
+
+        let err = svc
+            .create_application("app", None, Some(pid))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DeploymentError::Forbidden),
+            "principal without applications:create is rejected"
+        );
+    }
+
+    #[sqlx::test]
+    async fn create_application_allows_bootstrap_and_granted_principal(pool: PgPool) {
+        let (svc, rbac) = svc_with(pool);
+
+        // Bootstrap (None) is allowed.
+        svc.create_application("boot-app", None, None)
+            .await
+            .unwrap();
+
+        // A principal holding applications:create is allowed.
+        let pid = principal_holding(&rbac, json!({"applications:create": true})).await;
+        let app = svc
+            .create_application("op-app", None, Some(pid))
+            .await
+            .unwrap();
+        assert_eq!(app.created_by_principal_id, Some(pid), "audit attribution");
+    }
+
+    // --- create_build: enforces builds:create inside the service ---
+
+    #[sqlx::test]
+    async fn create_build_rejects_principal_without_permission(pool: PgPool) {
+        let (svc, rbac) = svc_with(pool);
+        // Seed an application as bootstrap so the build has a valid anchor.
+        let app = svc.create_application("b-app", None, None).await.unwrap();
+        let pid = principal_holding(&rbac, json!({"deployments:read": true})).await;
+
+        let sha = "a".repeat(40);
+        let err = svc
+            .create_build(app.id, None, &sha, None, "dockerfile", "img:tag", Some(pid))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DeploymentError::Forbidden),
+            "principal without builds:create is rejected before any DB write"
+        );
+    }
+
+    #[sqlx::test]
+    async fn create_build_allows_granted_principal(pool: PgPool) {
+        let (svc, rbac) = svc_with(pool);
+        let app = svc.create_application("b-app2", None, None).await.unwrap();
+        let pid = principal_holding(&rbac, json!({"builds:create": true})).await;
+
+        let sha = "b".repeat(40);
+        let record = svc
+            .create_build(app.id, None, &sha, None, "dockerfile", "img:tag", Some(pid))
+            .await
+            .unwrap();
+        assert_eq!(record.created_by_principal_id, Some(pid));
+    }
+}

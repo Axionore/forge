@@ -468,6 +468,7 @@ async fn main() {
         .route("/roles", post(create_role))
         .route("/principals", get(list_principals))
         .route("/principals", post(create_principal))
+        .route("/principals/{id}/roles", post(assign_principal_role))
         .route("/admin-tokens", get(list_admin_tokens))
         .route("/admin-tokens", post(create_admin_token))
         .route("/admin-tokens/{prefix}", delete(revoke_admin_token))
@@ -732,8 +733,48 @@ fn load_static_rustls_config(
 }
 
 // =============================================================================
-// Admin auth (function-level + simple constant-time token check)
+// Admin auth (function-level + constant-time bootstrap check + issued-token lookup)
 // =============================================================================
+
+/// The authenticated principal for an `/admin/*` request, resolved by `require_admin_auth`
+/// and carried in request extensions for handlers to extract.
+///
+/// - `AuthPrincipal(None)` = the bootstrap `FORGE_ADMIN_TOKEN` superuser. It is NOT subject
+///   to per-action RBAC (it predates the role system and is the break-glass operator). It is
+///   the ONLY value that maps to an unconstrained `None` principal downstream.
+/// - `AuthPrincipal(Some(pid))` = an issued admin token resolved to a real principal. Every
+///   mutating action is gated by that principal's roles via `enforce_action` (default-deny).
+#[derive(Debug, Clone, Copy)]
+struct AuthPrincipal(Option<Uuid>);
+
+impl AuthPrincipal {
+    /// The principal id to thread into RBAC checks. Bootstrap → `None` (allowed everywhere);
+    /// a real principal → `Some(pid)` (must hold the action).
+    fn principal_id(self) -> Option<Uuid> {
+        self.0
+    }
+}
+
+#[axum::async_trait]
+impl<S> axum::extract::FromRequestParts<S> for AuthPrincipal
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        // Set unconditionally by `require_admin_auth` before the handler runs. Its absence
+        // means the route was reached without the auth middleware — fail closed.
+        parts
+            .extensions
+            .get::<AuthPrincipal>()
+            .copied()
+            .ok_or(ApiError::Unauthorized)
+    }
+}
 
 // Uses ring's (now-deprecated) constant_time compare for the bootstrap admin token.
 // The migration to `subtle` is owned by the security pass; behavior is unchanged.
@@ -741,7 +782,7 @@ fn load_static_rustls_config(
 async fn require_admin_auth(
     State(state): State<AppState>,
     headers: HeaderMap,
-    request: axum::http::Request<axum::body::Body>,
+    mut request: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Result<Response, ApiError> {
     let provided = headers
@@ -749,17 +790,41 @@ async fn require_admin_auth(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let expected = state.admin_token.as_bytes();
     let provided_bytes = provided.as_bytes();
+    let expected = state.admin_token.as_bytes();
 
-    let ok = verify_slices_are_equal(provided_bytes, expected).is_ok();
-
-    if !ok {
-        warn!("Admin auth failed: invalid or missing X-Admin-Token");
-        return Err(ApiError::Unauthorized);
+    // 1. Bootstrap superuser: constant-time compare against FORGE_ADMIN_TOKEN.
+    //    Match → principal = None (unconstrained). This path is unchanged and fast.
+    if verify_slices_are_equal(provided_bytes, expected).is_ok() {
+        request.extensions_mut().insert(AuthPrincipal(None));
+        return Ok(next.run(request).await);
     }
 
-    Ok(next.run(request).await)
+    // 2. Issued admin token: hash + DB lookup → its principal id. Rejected (401) if the
+    //    token is empty, unknown, revoked, or expired — a single enumeration-resistant error.
+    if !provided.is_empty() {
+        match state
+            .rbac_service
+            .lookup_principal_for_token(provided)
+            .await
+        {
+            Ok(Some(principal_id)) => {
+                request
+                    .extensions_mut()
+                    .insert(AuthPrincipal(Some(principal_id)));
+                return Ok(next.run(request).await);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                // Fail closed on any RBAC/DB error — never fall through to allow.
+                warn!("Admin auth: token lookup failed; denying");
+                return Err(ApiError::Unauthorized);
+            }
+        }
+    }
+
+    warn!("Admin auth failed: invalid or missing X-Admin-Token");
+    Err(ApiError::Unauthorized)
 }
 
 // =============================================================================
@@ -1172,14 +1237,18 @@ struct CreateDeploymentRequest {
 
 async fn create_application(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Json(req): Json<CreateApplicationRequest>,
 ) -> Result<(StatusCode, Json<forge_core::Application>), ApiError> {
-    // principal_id=None: bootstrap X-Admin-Token path (FORGE_ADMIN_TOKEN constant-time).
-    // Future: middleware will resolve issued admin_token -> principal_id and pass Some(pid)
-    // so RbacService.principal_can("applications:create") + audit attribution works for operators.
+    // Bootstrap (None) is allowed; an issued principal must hold applications:create.
+    // create_application enforces this via the threaded principal_id (default-deny).
     match state
         .deployment_service
-        .create_application(&req.name, req.description.as_deref(), None)
+        .create_application(
+            &req.name,
+            req.description.as_deref(),
+            principal.principal_id(),
+        )
         .await
     {
         Ok(app) => Ok((StatusCode::CREATED, Json(app))),
@@ -1228,11 +1297,18 @@ async fn get_application(
 // Phase 0 Services handlers (minimal foundation, same RBAC/audit contract as applications)
 async fn create_service(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Json(req): Json<CreateServiceRequest>,
 ) -> Result<(StatusCode, Json<deployment::Service>), ApiError> {
     match state
         .deployment_service
-        .create_service(req.project_id, &req.name, &req.engine, req.spec, None)
+        .create_service(
+            req.project_id,
+            &req.name,
+            &req.engine,
+            req.spec,
+            principal.principal_id(),
+        )
         .await
     {
         Ok(svc) => Ok((StatusCode::CREATED, Json(svc))),
@@ -1357,9 +1433,18 @@ async fn dispatch_deployment(
 #[axum::debug_handler]
 async fn create_deployment(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(app_id): Path<Uuid>,
     Json(req): Json<CreateDeploymentRequest>,
 ) -> Result<(StatusCode, Json<forge_core::Deployment>), ApiError> {
+    // RBAC default-deny: creating a deployment requires deployments:write. Bootstrap (None)
+    // is allowed; an issued principal without the action is rejected 403 before any dispatch.
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "deployments:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     // 1. Persist the desired state and dispatch to connected agents.
     let deployment = match state
         .deployment_service
@@ -1733,12 +1818,13 @@ fn builder_from_tag(tag: &str) -> forge_agent::job::Builder {
 /// POST /admin/applications/{id}/builds — trigger a build. RBAC `builds:create` (default-deny).
 async fn create_build_handler(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(app_id): Path<Uuid>,
     Json(req): Json<CreateBuildRequest>,
 ) -> Result<(StatusCode, Json<deployment::BuildRecord>), ApiError> {
-    // principal_id=None → bootstrap X-Admin-Token path (already authenticated). When issued
-    // tokens resolve to a principal, builds:create is enforced inside create_build.
-    let record = trigger_build(&state, app_id, req, None).await?;
+    // Bootstrap (None) is allowed; an issued principal must hold builds:create (and
+    // secrets:use if the build embeds named secrets) — both enforced inside trigger_build.
+    let record = trigger_build(&state, app_id, req, principal.principal_id()).await?;
     Ok((StatusCode::CREATED, Json(record)))
 }
 
@@ -2677,9 +2763,17 @@ async fn list_catalog(
 
 async fn deploy_from_catalog(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(app_id): Path<Uuid>,
     Json(req): Json<DeployFromCatalogRequest>,
 ) -> Result<(StatusCode, Json<forge_core::Deployment>), ApiError> {
+    // Catalog deploy creates a real deployment → gate on deployments:write (default-deny).
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "deployments:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     match state
         .deployment_service
         .deploy_from_catalog(
@@ -2717,19 +2811,25 @@ async fn deploy_from_catalog(
 // resolves to a real principal without the permission is rejected with 403.
 // =====================================================================
 
-/// Default-deny gate shared by every provisioning handler. `None` principal = bootstrap.
-async fn require_cloud_provision(state: &AppState) -> Result<(), ApiError> {
+/// Default-deny gate shared by every provisioning handler. Bootstrap (`None`) is allowed; an
+/// issued principal must hold `cloud:provision`. The resolved principal flows from the auth
+/// layer — there is no hardcoded bypass.
+async fn require_cloud_provision(
+    state: &AppState,
+    principal: AuthPrincipal,
+) -> Result<(), ApiError> {
     state
         .deployment_service
-        .enforce_action(None, "cloud:provision")
+        .enforce_action(principal.principal_id(), "cloud:provision")
         .await
         .map_err(|_| ApiError::Forbidden)
 }
 
 async fn list_providers(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_cloud_provision(&state).await?;
+    require_cloud_provision(&state, principal).await?;
     Ok(Json(serde_json::json!({
         "providers": state.provisioning_service.list_providers(),
     })))
@@ -2743,10 +2843,11 @@ struct CatalogQuery {
 
 async fn provider_catalog(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(provider): Path<String>,
     Query(q): Query<CatalogQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_cloud_provision(&state).await?;
+    require_cloud_provision(&state, principal).await?;
     let catalog = state
         .provisioning_service
         .catalog(&provider, q.credential_id)
@@ -2770,10 +2871,11 @@ struct ProvisionServerBody {
 
 async fn provision_server(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(provider): Path<String>,
     Json(body): Json<ProvisionServerBody>,
 ) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
-    require_cloud_provision(&state).await?;
+    require_cloud_provision(&state, principal).await?;
 
     let mut spec = body.spec;
 
@@ -2800,7 +2902,12 @@ async fn provision_server(
 
     let resource = state
         .provisioning_service
-        .provision_server(&provider, body.credential_id, spec, None)
+        .provision_server(
+            &provider,
+            body.credential_id,
+            spec,
+            principal.principal_id(),
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(resource)))
 }
@@ -2818,10 +2925,11 @@ struct ProvisionFirewallBody {
 
 async fn provision_firewall(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(provider): Path<String>,
     Json(body): Json<ProvisionFirewallBody>,
 ) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
-    require_cloud_provision(&state).await?;
+    require_cloud_provision(&state, principal).await?;
     let resource = state
         .provisioning_service
         .create_firewall(
@@ -2830,7 +2938,7 @@ async fn provision_firewall(
             &body.name,
             body.rules,
             body.application_id,
-            None,
+            principal.principal_id(),
         )
         .await?;
     Ok((StatusCode::CREATED, Json(resource)))
@@ -2848,10 +2956,11 @@ struct ProvisionNetworkBody {
 
 async fn provision_network(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(provider): Path<String>,
     Json(body): Json<ProvisionNetworkBody>,
 ) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
-    require_cloud_provision(&state).await?;
+    require_cloud_provision(&state, principal).await?;
     let resource = state
         .provisioning_service
         .create_network(
@@ -2860,7 +2969,7 @@ async fn provision_network(
             &body.name,
             &body.ip_range,
             body.application_id,
-            None,
+            principal.principal_id(),
         )
         .await?;
     Ok((StatusCode::CREATED, Json(resource)))
@@ -2879,10 +2988,11 @@ struct ProvisionVolumeBody {
 
 async fn provision_volume(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(provider): Path<String>,
     Json(body): Json<ProvisionVolumeBody>,
 ) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
-    require_cloud_provision(&state).await?;
+    require_cloud_provision(&state, principal).await?;
     let resource = state
         .provisioning_service
         .create_volume(
@@ -2892,7 +3002,7 @@ async fn provision_volume(
             body.size_gb,
             &body.region,
             body.application_id,
-            None,
+            principal.principal_id(),
         )
         .await?;
     Ok((StatusCode::CREATED, Json(resource)))
@@ -2912,10 +3022,11 @@ struct ProvisionLoadBalancerBody {
 
 async fn provision_load_balancer(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(provider): Path<String>,
     Json(body): Json<ProvisionLoadBalancerBody>,
 ) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
-    require_cloud_provision(&state).await?;
+    require_cloud_provision(&state, principal).await?;
     let resource = state
         .provisioning_service
         .create_load_balancer(
@@ -2925,7 +3036,7 @@ async fn provision_load_balancer(
             &body.region,
             body.services,
             body.application_id,
-            None,
+            principal.principal_id(),
         )
         .await?;
     Ok((StatusCode::CREATED, Json(resource)))
@@ -2944,10 +3055,11 @@ struct ProvisionIpBody {
 
 async fn provision_ip(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(provider): Path<String>,
     Json(body): Json<ProvisionIpBody>,
 ) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
-    require_cloud_provision(&state).await?;
+    require_cloud_provision(&state, principal).await?;
     let resource = state
         .provisioning_service
         .allocate_ip(
@@ -2956,7 +3068,7 @@ async fn provision_ip(
             &body.region,
             body.ipv6,
             body.application_id,
-            None,
+            principal.principal_id(),
         )
         .await?;
     Ok((StatusCode::CREATED, Json(resource)))
@@ -2979,10 +3091,11 @@ struct ProvisionDnsBody {
 
 async fn provision_dns_record(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(provider): Path<String>,
     Json(body): Json<ProvisionDnsBody>,
 ) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
-    require_cloud_provision(&state).await?;
+    require_cloud_provision(&state, principal).await?;
     let resource = state
         .provisioning_service
         .dns_upsert(
@@ -2994,7 +3107,7 @@ async fn provision_dns_record(
             &body.value,
             body.ttl,
             body.application_id,
-            None,
+            principal.principal_id(),
         )
         .await?;
     Ok((StatusCode::CREATED, Json(resource)))
@@ -3002,9 +3115,10 @@ async fn provision_dns_record(
 
 async fn list_provider_resources(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(provider): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_cloud_provision(&state).await?;
+    require_cloud_provision(&state, principal).await?;
     let resources = state.provisioning_service.list_resources(&provider).await?;
     Ok(Json(serde_json::json!({ "resources": resources })))
 }
@@ -3017,10 +3131,11 @@ struct DeleteResourceQuery {
 
 async fn delete_provider_resource(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path((provider, id)): Path<(String, Uuid)>,
     Query(q): Query<DeleteResourceQuery>,
 ) -> Result<Json<provisioning::ProvisionedResource>, ApiError> {
-    require_cloud_provision(&state).await?;
+    require_cloud_provision(&state, principal).await?;
     let resource = state
         .provisioning_service
         .delete_resource(&provider, id, q.credential_id)
@@ -3070,13 +3185,15 @@ fn decrypt_hetzner_credential(
 
 async fn create_hetzner_server(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Json(req): Json<CreateHetznerServerRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    // RBAC default-deny: provisioning infra requires `cloud:provision`. The bootstrap
-    // X-Admin-Token path passes principal_id=None and is already authenticated upstream.
+    // RBAC default-deny: provisioning infra requires `cloud:provision`. Bootstrap (None) is
+    // allowed; an issued principal without the action is rejected 403. The principal is the
+    // resolved actor from the auth layer — no hardcoded bypass.
     state
         .deployment_service
-        .enforce_action(None, "cloud:provision")
+        .enforce_action(principal.principal_id(), "cloud:provision")
         .await
         .map_err(|_| ApiError::Forbidden)?;
 
@@ -4091,8 +4208,16 @@ struct CreateSecretBody {
 
 async fn create_secret(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Json(body): Json<CreateSecretBody>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // Creating named secret material is gated on secrets:use (default-deny). Bootstrap allowed.
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "secrets:use")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     if body.plaintext.is_empty() {
         return Err(ApiError::BadRequest("plaintext is required".into()));
     }
@@ -4142,9 +4267,17 @@ struct RotateSecretBody {
 
 async fn rotate_secret(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(secret_id): Path<Uuid>,
     Json(body): Json<RotateSecretBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Rotating secret material is gated on secrets:use (default-deny). Bootstrap allowed.
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "secrets:use")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     if body.plaintext.is_empty() {
         return Err(ApiError::BadRequest("plaintext is required".into()));
     }
@@ -4163,8 +4296,16 @@ async fn rotate_secret(
 
 async fn delete_secret(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(secret_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    // Deleting secret material is gated on secrets:use (default-deny). Bootstrap allowed.
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "secrets:use")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     match state.deployment_service.delete_secret(secret_id).await {
         Ok(()) => Ok(StatusCode::NO_CONTENT),
         Err(e) => {
@@ -4178,8 +4319,16 @@ async fn delete_secret(
 /// Private key is stored encrypted via the secret system. Only public key is returned.
 async fn generate_ssh_key(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Json(body): Json<CreateSecretBody>, // reuse name + description
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // Generating + storing a private key is secret material → gated on secrets:use (default-deny).
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "secrets:use")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     match state
         .deployment_service
         .generate_ssh_key(&body.name, body.description.as_deref())
@@ -4312,6 +4461,35 @@ async fn create_principal(
     }
 }
 
+#[derive(Deserialize)]
+struct AssignRoleRequest {
+    role_id: Uuid,
+}
+
+/// POST /admin/principals/{id}/roles — grant a role to a principal. Without this an issued
+/// admin token's principal would hold no permissions and be denied every action (default-deny),
+/// so this is the operator path that makes per-principal RBAC usable.
+async fn assign_principal_role(
+    State(state): State<AppState>,
+    Path(principal_id): Path<Uuid>,
+    Json(body): Json<AssignRoleRequest>,
+) -> Result<StatusCode, ApiError> {
+    match state
+        .rbac_service
+        .assign_role(principal_id, body.role_id, None)
+        .await
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(rbac::RbacError::NotFound) => Err(ApiError::BadRequest(
+            "principal or role does not exist".into(),
+        )),
+        Err(e) => {
+            warn!(error = %e, "assign_role failed");
+            Err(ApiError::Internal)
+        }
+    }
+}
+
 async fn list_admin_tokens(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<rbac::AdminTokenSummary>>, ApiError> {
@@ -4432,8 +4610,15 @@ async fn list_git_sources(
 // Phase 2 manual promote (for any deployment, including Canary full promotion)
 async fn promote_deployment(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(dep_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "deployments:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     let dep = state
         .deployment_service
         .promote_deployment(dep_id)
@@ -4469,8 +4654,15 @@ async fn promote_deployment(
 // Phase 2 manual rollback — restores the previous version's spec as a new deployment.
 async fn rollback_deployment(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(dep_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "deployments:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     let new_dep = state
         .deployment_service
         .rollback_deployment(dep_id)
@@ -4490,8 +4682,15 @@ async fn rollback_deployment(
 // Slice D criterion 6: first-class redeploy — re-ship the current spec as a new version.
 async fn redeploy_deployment(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(dep_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "deployments:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     let new_dep = state
         .deployment_service
         .redeploy_deployment(dep_id)
@@ -4510,8 +4709,15 @@ async fn redeploy_deployment(
 
 async fn promote_preview_deployment(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(dep_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "deployments:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     let preview = state
         .deployment_service
         .get_deployment(dep_id)
@@ -4587,8 +4793,15 @@ async fn promote_preview_deployment(
 /// then mark the deployment destroyed. Real cleanup of containers on the agent side.
 async fn destroy_preview_deployment(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(dep_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "deployments:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     let preview = state
         .deployment_service
         .get_deployment(dep_id)
