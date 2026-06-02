@@ -12,6 +12,7 @@ pub mod health;
 pub mod identity;
 pub mod job;
 pub mod receiver;
+pub mod supplychain;
 pub mod verification;
 pub mod wireguard;
 

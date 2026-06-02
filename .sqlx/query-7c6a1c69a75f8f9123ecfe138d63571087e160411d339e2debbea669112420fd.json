@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT after as \"after!\" FROM audit_logs\n               WHERE action = 'supplychain:build_attested' AND resource_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "after!",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "7c6a1c69a75f8f9123ecfe138d63571087e160411d339e2debbea669112420fd"
+}

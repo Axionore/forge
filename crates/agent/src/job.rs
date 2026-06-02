@@ -7,6 +7,7 @@ use uuid::Uuid;
 // This must be early so the Job enum below can use DeploymentSpec, BuildSpec,
 // RegistryAuth, etc. by name.
 pub use forge_core::spec::*;
+pub use forge_core::supplychain::SupplyChainPolicy;
 
 use std::io::{Read, Write};
 
@@ -354,6 +355,12 @@ pub enum Job {
         /// Optional registry auth for push (if the target_image requires it).
         #[serde(default)]
         registry_auth: Option<RegistryAuth>,
+        /// Supply-chain enforcement policy (Phase C). Resolved by the control plane from the
+        /// app/global setting and whether a cosign key is configured. Governs whether the agent
+        /// signs + attests the produced image. Defaults to the strict policy when absent so an
+        /// old/tampered job without this field does not silently skip signing.
+        #[serde(default)]
+        supply_chain_policy: SupplyChainPolicy,
     },
 }
 
@@ -431,6 +438,14 @@ pub enum JobResultDetails {
         image_digest: Option<String>,
         /// Whether the image was pushed to the configured registry.
         pushed: bool,
+        /// Whether the image was cosign-signed + provenance-attested (Phase C). When false under
+        /// a signing policy the control plane treats the build as supply-chain-incomplete.
+        #[serde(default)]
+        signed: bool,
+        /// Compact, non-secret SLSA provenance summary (subject digest + commit + builder) for
+        /// the `builds.provenance` column and the audit chain. `None` when signing was off/failed.
+        #[serde(default)]
+        provenance: Option<serde_json::Value>,
         /// Sanitized failure reason (never contains secrets or host paths).
         error_message: Option<String>,
     },

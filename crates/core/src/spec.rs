@@ -245,6 +245,20 @@ pub struct DeploymentSpec {
 
     #[serde(default)]
     pub git_checkout: Option<GitCheckout>,
+
+    /// Supply-chain enforcement policy for this deployment (Phase C). Threaded from the control
+    /// plane so the agent knows whether to verify images before running them. Defaults to the
+    /// strict policy when absent (a tampered/old spec without this field still fails closed if
+    /// it carries [`Self::verify_images`]).
+    #[serde(default)]
+    pub supply_chain_policy: crate::supplychain::SupplyChainPolicy,
+
+    /// Image digest references (`name@sha256:...`) that the agent MUST cosign-verify before
+    /// running, when the policy requires verification. These are exactly the images Forge built
+    /// and signed; an externally-supplied `image:` not built by Forge is governed by the policy,
+    /// not forced into this list. Empty → nothing to verify.
+    #[serde(default)]
+    pub verify_images: Vec<String>,
 }
 
 /// Simplified container spec.

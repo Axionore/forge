@@ -192,6 +192,24 @@ async fn main() {
         "Control plane Ed25519 signing key ready"
     );
 
+    // Phase C — resolve + announce the supply-chain enforcement policy at startup. When no
+    // cosign key is configured the policy resolves to `disabled` and we emit a LOUD warning so
+    // an operator never assumes images are being signed/verified when they are not.
+    let supply_chain_policy = resolve_supply_chain_policy();
+    if matches!(
+        supply_chain_policy,
+        forge_core::supplychain::SupplyChainPolicy::Disabled
+    ) {
+        warn!(
+            policy = "disabled",
+            "SUPPLY-CHAIN ENFORCEMENT IS OFF — built images will NOT be cosign-signed and agents \
+             will NOT verify image provenance before run. Set FORGE_COSIGN_KEY (signing) + \
+             FORGE_COSIGN_PUBLIC_KEY (verify) on agents to enable the signed-artifact root of trust."
+        );
+    } else {
+        info!(policy = %supply_chain_policy.as_str(), "Supply-chain enforcement policy resolved");
+    }
+
     let agent_registry = crate::agent_ws::AgentRegistry::new();
 
     let metrics = Arc::new(ControlPlaneMetrics::new());
@@ -544,6 +562,31 @@ async fn main() {
 /// to agents at enrollment, so a per-restart key would invalidate every enrollment and
 /// make signed jobs unverifiable (OWASP A08/A04). When we have to generate-and-persist
 /// we log a loud warning so operators know to provision a managed secret instead.
+/// Resolve the control plane's supply-chain enforcement policy (Phase C).
+///
+/// Precedence:
+/// 1. `FORGE_SUPPLY_CHAIN_POLICY` env (`disabled` | `sign` | `sign-and-require-verify`) — an
+///    explicit operator override. An unknown value fails closed to the strict default rather
+///    than silently disabling enforcement.
+/// 2. Otherwise the default: strict (`sign-and-require-verify`) when a cosign signing key is
+///    configured (`FORGE_COSIGN_KEY`), else `disabled` (the caller emits a loud warning).
+///
+/// The policy is threaded onto every dispatched `Job::Build` (governs signing) and onto the
+/// `DeploymentSpec` of every `Job::Deploy` (governs verify-before-run on the agent).
+fn resolve_supply_chain_policy() -> forge_core::supplychain::SupplyChainPolicy {
+    use forge_core::supplychain::SupplyChainPolicy;
+    if let Ok(explicit) = std::env::var("FORGE_SUPPLY_CHAIN_POLICY") {
+        let explicit = explicit.trim();
+        if !explicit.is_empty() {
+            return SupplyChainPolicy::from_str_or_strict(explicit);
+        }
+    }
+    let has_key = std::env::var(forge_agent::supplychain::COSIGN_KEY_ENV)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    SupplyChainPolicy::resolve_default(has_key)
+}
+
 fn load_or_create_signing_key() -> ed25519_dalek::SigningKey {
     use base64::Engine as _;
 
@@ -1426,6 +1469,7 @@ async fn trigger_build(
         spec,
         target_image,
         registry_auth: None,
+        supply_chain_policy: resolve_supply_chain_policy(),
     };
     let signed = signer.sign(job);
 
@@ -3006,6 +3050,7 @@ async fn git_webhook_handler(
                     spec,
                     target_image: image,
                     registry_auth: None,
+                    supply_chain_policy: resolve_supply_chain_policy(),
                 };
                 let signed = signer.sign(job);
                 for agent_id in state.agent_registry.connected_agents().await {

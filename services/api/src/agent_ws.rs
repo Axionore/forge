@@ -844,13 +844,23 @@ async fn handle_build_result(
         success,
         image,
         image_digest,
+        signed,
+        provenance,
         error_message,
         ..
     } = details
     else {
         // Build job with a non-Build detail payload — record a generic failure.
         let _ = deployment_service
-            .record_build_result(build_id, false, None, None, Some("malformed build result"))
+            .record_build_result(
+                build_id,
+                false,
+                None,
+                None,
+                false,
+                None,
+                Some("malformed build result"),
+            )
             .await;
         return;
     };
@@ -861,6 +871,8 @@ async fn handle_build_result(
             *success,
             image.as_deref(),
             image_digest.as_deref(),
+            *signed,
+            provenance.as_ref(),
             error_message.as_deref(),
         )
         .await
@@ -886,6 +898,38 @@ async fn handle_build_result(
         return;
     };
 
+    // Phase C — resolve the supply-chain policy and the verify-before-run target. When the
+    // policy requires verification and the build was signed, we hand the agent the IMMUTABLE
+    // digest reference (`name@sha256:...`) to cosign-verify before it runs the container. The
+    // policy travels on the DeploymentSpec (no Job::Deploy signature change needed).
+    let policy = crate::resolve_supply_chain_policy();
+    let mut verify_images: Vec<String> = Vec::new();
+    if policy.requires_verify() {
+        if let Some(digest) = record.image_digest.as_deref() {
+            if let Some(reference) = forge_agent::supplychain::digest_reference(&image_ref, digest)
+            {
+                verify_images.push(reference);
+            }
+        }
+        // Fail-closed: a require-verify policy with a signed build but no resolvable digest
+        // reference must not deploy an unverifiable image.
+        if verify_images.is_empty() {
+            warn!(%build_id, "require-verify policy but no verifiable image digest — not deploying (fail-closed)");
+            let _ = deployment_service
+                .write_supply_chain_audit(
+                    record.created_by_principal_id,
+                    build_id,
+                    &record.commit_sha,
+                    record.image_digest.as_deref(),
+                    None,
+                    false,
+                    "deploy_refused_no_digest",
+                )
+                .await;
+            return;
+        }
+    }
+
     // Create a deployment for the build's application using the produced image. The spec is
     // minimal and deliberately conservative (no host mounts / privileged); the build's
     // commit_sha + image flow into the deployment's git/commit columns for the audit chain.
@@ -895,7 +939,9 @@ async fn handle_build_result(
             "image": image_ref,
             "ports": ["80:80"],
             "restart_policy": "always"
-        }]
+        }],
+        "supply_chain_policy": policy.as_str(),
+        "verify_images": verify_images,
     });
 
     let deployment = match deployment_service
@@ -933,15 +979,29 @@ async fn handle_build_result(
         )
         .await;
 
+    // Write the verifiable supply-chain audit row: principal → commit → image digest →
+    // deployment. This is the chain the differentiator promises (threat-model Repudiation).
+    let _ = deployment_service
+        .write_supply_chain_audit(
+            record.created_by_principal_id,
+            build_id,
+            &record.commit_sha,
+            record.image_digest.as_deref(),
+            Some(deployment.id),
+            *signed,
+            "build_signed_and_deployed",
+        )
+        .await;
+
     // Dispatch the Deploy to connected agents (same pattern as the webhook quick path).
     if let Ok(deploy_spec) = serde_json::from_value::<DeploymentSpec>(spec) {
         let job = Job::Deploy {
             deployment_id: deployment.id,
             spec: deploy_spec,
         };
-        let signed = signer.sign(job);
+        let signed_job = signer.sign(job);
         for agent_id in registry.connected_agents().await {
-            let _ = registry.send_job(agent_id, signed.clone()).await;
+            let _ = registry.send_job(agent_id, signed_job.clone()).await;
         }
         info!(%build_id, deployment_id = %deployment.id, "Dispatched Deploy for successful build (source-to-deploy)");
     }

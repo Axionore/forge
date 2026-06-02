@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO audit_logs (id, principal_id, action, resource_type, resource_id, after)\n            VALUES ($1, $2, 'supplychain:build_attested', 'build', $3, $4)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ca929dee4eb3b167ffef59a76922804d1d8d659b4b27871c99aadc9b74b4fdcf"
+}

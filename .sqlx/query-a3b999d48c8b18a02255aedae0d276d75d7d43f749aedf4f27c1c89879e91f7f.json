@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, application_id, git_source_id, commit_sha, git_ref, builder, status,\n                   image, image_digest, started_at, finished_at, error,\n                   created_by_principal_id, deployment_id, created_at, updated_at\n            FROM builds WHERE application_id = $1\n            ORDER BY created_at DESC LIMIT 100\n            ",
+  "query": "\n            SELECT id, application_id, git_source_id, commit_sha, git_ref, builder, status,\n                   image, image_digest, started_at, finished_at, error,\n                   created_by_principal_id, deployment_id, signed, provenance,\n                   created_at, updated_at\n            FROM builds WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -75,11 +75,21 @@
       },
       {
         "ordinal": 14,
+        "name": "signed",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 15,
+        "name": "provenance",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 16,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 15,
+        "ordinal": 17,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -105,8 +115,10 @@
       true,
       true,
       false,
+      true,
+      false,
       false
     ]
   },
-  "hash": "8873830b1a1223d127d5a4135d05119ff12b74b10aa95150e3bb2f8475f8873a"
+  "hash": "a3b999d48c8b18a02255aedae0d276d75d7d43f749aedf4f27c1c89879e91f7f"
 }

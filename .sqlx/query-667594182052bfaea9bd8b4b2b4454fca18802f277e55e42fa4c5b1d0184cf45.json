@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE builds\n            SET status = $1, image = COALESCE($2, image), image_digest = $3,\n                signed = $4, provenance = $5, error = $6, finished_at = NOW(), updated_at = NOW()\n            WHERE id = $7\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Bool",
+        "Jsonb",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "667594182052bfaea9bd8b4b2b4454fca18802f277e55e42fa4c5b1d0184cf45"
+}

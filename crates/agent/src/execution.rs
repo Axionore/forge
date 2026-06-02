@@ -40,12 +40,14 @@ pub async fn execute_job(
         spec,
         target_image,
         registry_auth: _registry_auth,
+        supply_chain_policy,
     } = &job
     {
         return execute_build_job(
             *build_id,
             spec.clone(),
             target_image.clone(),
+            *supply_chain_policy,
             docker,
             exec_output_tx,
             age_identity,
@@ -275,6 +277,27 @@ async fn execute_deploy(
     docker: Option<&DockerClient>,
     age_identity: Option<&age::x25519::Identity>,
 ) -> Result<()> {
+    // Phase C — verify before run (fail-closed). BEFORE any Docker work (pull/create/start), if
+    // the policy requires verification, every Forge-built image referenced in `verify_images`
+    // must pass cosign signature + provenance verification against the trusted public key. Any
+    // failure REFUSES the deploy (OWASP A10 / A08). This runs regardless of the `docker` feature
+    // so a dry-run deploy is held to the same gate.
+    if spec.supply_chain_policy.requires_verify() && !spec.verify_images.is_empty() {
+        let public_key = crate::supplychain::resolve_public_key()
+            .map_err(|e| crate::AgentError::Internal(anyhow::anyhow!(e.to_string())))?;
+        let Some(public_key) = public_key else {
+            error!(
+                deployment_id = %deployment_id,
+                "supply-chain policy requires verify-before-run but no trusted cosign public key is configured — refusing deploy (fail-closed)"
+            );
+            return Err(crate::AgentError::Internal(anyhow::anyhow!(
+                crate::supplychain::SupplyChainError::NoPublicKey.to_string()
+            )));
+        };
+        let verifier = crate::supplychain::CosignVerifier::new(public_key);
+        verify_images_before_run(deployment_id, &spec.verify_images, &verifier).await?;
+    }
+
     #[cfg(feature = "docker")]
     {
         use bollard::container::{Config, CreateContainerOptions, StartContainerOptions};
@@ -1587,6 +1610,33 @@ static_resources:
         );
         Ok(())
     }
+}
+
+/// Verify every image reference with `verifier` before it is run; refuse the deploy on the first
+/// failure (fail-closed, A10). Factored out and taking a `&dyn ArtifactVerifier` so it can be
+/// unit-tested with a mock verifier (accept/reject) without the real cosign binary or a registry.
+async fn verify_images_before_run(
+    deployment_id: uuid::Uuid,
+    verify_images: &[String],
+    verifier: &dyn crate::supplychain::ArtifactVerifier,
+) -> Result<()> {
+    for image_ref in verify_images {
+        match verifier.verify(image_ref).await {
+            Ok(()) => {
+                info!(deployment_id = %deployment_id, image = %image_ref, "image verified before run");
+            }
+            Err(e) => {
+                error!(
+                    deployment_id = %deployment_id,
+                    image = %image_ref,
+                    error = %e,
+                    "image failed signature/provenance verification — refusing to run (fail-closed)"
+                );
+                return Err(crate::AgentError::Internal(anyhow::anyhow!(e.to_string())));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn execute_system_update(
@@ -2982,6 +3032,7 @@ async fn execute_build_job(
     build_id: Uuid,
     spec: crate::job::BuildSpec,
     target_image: String,
+    supply_chain_policy: forge_core::supplychain::SupplyChainPolicy,
     docker: Option<&DockerClient>,
     exec_output_tx: Option<tokio::sync::mpsc::Sender<crate::receiver::AgentMessage>>,
     age_identity: Option<&age::x25519::Identity>,
@@ -3030,20 +3081,51 @@ async fn execute_build_job(
     match outcome {
         Ok(o) => {
             info!(build_id = %build_id, image = %o.image, digest = ?o.image_digest, pushed = o.pushed, "Build job succeeded");
-            JobResult {
-                correlation_id,
-                job_type: "build".to_string(),
-                success: true,
-                error: None,
-                started_at,
-                finished_at,
-                details: JobResultDetails::Build {
+
+            // Phase C: sign + attest the produced image per the supply-chain policy. On a
+            // require-verify policy a signing failure FAILS the build (a deployable image must be
+            // signed), so the control plane never deploys an unsigned artifact (fail-closed, A10).
+            let sign_res =
+                sign_build_outcome(build_id, &spec, &o, supply_chain_policy, age_identity).await;
+
+            match sign_res {
+                Ok((signed, provenance)) => JobResult {
+                    correlation_id,
+                    job_type: "build".to_string(),
                     success: true,
-                    image: Some(o.image),
-                    image_digest: o.image_digest,
-                    pushed: o.pushed,
-                    error_message: None,
+                    error: None,
+                    started_at,
+                    finished_at,
+                    details: JobResultDetails::Build {
+                        success: true,
+                        image: Some(o.image),
+                        image_digest: o.image_digest,
+                        pushed: o.pushed,
+                        signed,
+                        provenance,
+                        error_message: None,
+                    },
                 },
+                Err(msg) => {
+                    warn!(build_id = %build_id, error = %msg, "Build signing failed under require-verify policy (fail-closed: no deploy)");
+                    JobResult {
+                        correlation_id,
+                        job_type: "build".to_string(),
+                        success: false,
+                        error: Some(msg.clone()),
+                        started_at,
+                        finished_at,
+                        details: JobResultDetails::Build {
+                            success: false,
+                            image: None,
+                            image_digest: None,
+                            pushed: false,
+                            signed: false,
+                            provenance: None,
+                            error_message: Some(msg),
+                        },
+                    }
+                }
             }
         }
         Err(e) => {
@@ -3062,10 +3144,100 @@ async fn execute_build_job(
                     image: None,
                     image_digest: None,
                     pushed: false,
+                    signed: false,
+                    provenance: None,
                     error_message: Some(msg),
                 },
             }
         }
+    }
+}
+
+/// Sign + attest a successfully built image per `policy` (Phase C).
+///
+/// Returns `Ok((signed, provenance_summary))`:
+/// - `signed` is whether a cosign signature + provenance attestation were produced.
+/// - `provenance_summary` is the non-secret summary for the audit chain (`None` if unsigned).
+///
+/// Fail-closed semantics:
+/// - `Disabled` → never signs; returns `Ok((false, None))`.
+/// - `Sign` → best-effort; a signing failure is logged but does NOT fail the build.
+/// - `SignAndRequireVerify` → signing is mandatory; a missing key, missing `cosign`, an
+///   unresolved digest, or a cosign failure returns `Err(sanitized message)` so the BUILD fails
+///   and nothing deployable is produced.
+async fn sign_build_outcome(
+    build_id: Uuid,
+    spec: &crate::job::BuildSpec,
+    outcome: &crate::build::BuildOutcome,
+    policy: forge_core::supplychain::SupplyChainPolicy,
+    age_identity: Option<&age::x25519::Identity>,
+) -> std::result::Result<(bool, Option<serde_json::Value>), String> {
+    use crate::supplychain::{
+        ArtifactSigner, COSIGN_PASSWORD_ENV, CosignSigner, SupplyChainError, digest_reference,
+        resolve_signing_key,
+    };
+    use forge_core::supplychain::{BuilderType, SlsaProvenance};
+
+    type SignResult = std::result::Result<(bool, Option<serde_json::Value>), String>;
+
+    if !policy.requires_signing() {
+        return Ok((false, None));
+    }
+    let require = policy.requires_verify();
+
+    // Map a fatal SupplyChainError to either a hard build failure (require) or a soft skip (sign).
+    let soft_or_hard = |e: SupplyChainError| -> SignResult {
+        if require {
+            Err(e.to_string())
+        } else {
+            warn!(build_id = %build_id, error = %e, "signing skipped under non-strict policy");
+            Ok((false, None))
+        }
+    };
+
+    // 1. Need an immutable digest to sign by.
+    let Some(digest) = outcome.image_digest.as_deref() else {
+        return soft_or_hard(SupplyChainError::NoDigest);
+    };
+    let Some(reference) = digest_reference(&outcome.image, digest) else {
+        return soft_or_hard(SupplyChainError::NoDigest);
+    };
+
+    // 2. Resolve the signing key (env or age secret). Absent key under require → fail closed.
+    let key = match resolve_signing_key(None, age_identity) {
+        Ok(Some(k)) => k,
+        Ok(None) => return soft_or_hard(SupplyChainError::NoSigningKey),
+        Err(e) => return soft_or_hard(e),
+    };
+    let password = std::env::var(COSIGN_PASSWORD_ENV)
+        .ok()
+        .filter(|p| !p.is_empty());
+
+    // 3. Build the provenance statement bound to the digest + pinned commit.
+    let commit = spec.source.commit_sha.as_deref().unwrap_or_default();
+    let now = chrono::Utc::now().to_rfc3339();
+    let Some(provenance) = SlsaProvenance::new(
+        &outcome.image,
+        digest,
+        &spec.source.url,
+        commit,
+        Some(&spec.source.r#ref)
+            .filter(|r| !r.is_empty())
+            .map(String::as_str),
+        BuilderType::from_builder(&spec.builder),
+        &now,
+    ) else {
+        return soft_or_hard(SupplyChainError::NoDigest);
+    };
+
+    // 4. Sign + attest.
+    let signer = CosignSigner::new(key, password);
+    match signer.sign_and_attest(&reference, &provenance).await {
+        Ok(()) => {
+            info!(build_id = %build_id, image = %reference, "image signed + attested");
+            Ok((true, Some(provenance.summary_json())))
+        }
+        Err(e) => soft_or_hard(e),
     }
 }
 
@@ -3180,6 +3352,7 @@ mod dispatcher_coverage_tests {
                 spec: _,
                 target_image: _,
                 registry_auth: _,
+                supply_chain_policy: _,
             } => "build",
         }
     }
@@ -3294,5 +3467,96 @@ mod dispatcher_coverage_tests {
                 "classifier disagreed for {expected}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod verify_before_run_tests {
+    //! Phase C — the deploy/run path MUST verify Forge-built images before running them and
+    //! REFUSE on failure (fail-closed). These tests inject a mock [`ArtifactVerifier`] so they
+    //! exercise the real wiring (`verify_images_before_run`) without the cosign binary.
+
+    use super::*;
+    use crate::supplychain::{ArtifactVerifier, SupplyChainError};
+    use std::sync::Mutex;
+
+    struct MockVerifier {
+        accept: bool,
+        seen: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ArtifactVerifier for MockVerifier {
+        async fn verify(&self, image_ref: &str) -> std::result::Result<(), SupplyChainError> {
+            self.seen.lock().unwrap().push(image_ref.to_string());
+            if self.accept {
+                Ok(())
+            } else {
+                Err(SupplyChainError::VerifyFailed)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_run_when_verification_fails() {
+        let verifier = MockVerifier {
+            accept: false,
+            seen: Mutex::new(vec![]),
+        };
+        let images = vec![format!("app@sha256:{}", "a".repeat(64))];
+        let res = verify_images_before_run(Uuid::nil(), &images, &verifier).await;
+        assert!(
+            res.is_err(),
+            "an unsigned/altered image MUST be refused (fail-closed)"
+        );
+        // The image was actually handed to the verifier (proves it isn't a no-op pass-through).
+        assert_eq!(verifier.seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn allows_run_when_all_images_verify() {
+        let verifier = MockVerifier {
+            accept: true,
+            seen: Mutex::new(vec![]),
+        };
+        let images = vec![
+            format!("a@sha256:{}", "a".repeat(64)),
+            format!("b@sha256:{}", "b".repeat(64)),
+        ];
+        let res = verify_images_before_run(Uuid::nil(), &images, &verifier).await;
+        assert!(res.is_ok(), "verified images may run");
+        // Every image was verified before run.
+        assert_eq!(verifier.seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stops_at_first_failure() {
+        // A failing first image must short-circuit — the second is never reached, and the deploy
+        // is refused. This pins the fail-closed loop semantics.
+        struct FailFirst {
+            calls: Mutex<usize>,
+        }
+        #[async_trait::async_trait]
+        impl ArtifactVerifier for FailFirst {
+            async fn verify(&self, _image_ref: &str) -> std::result::Result<(), SupplyChainError> {
+                let mut n = self.calls.lock().unwrap();
+                *n += 1;
+                Err(SupplyChainError::VerifyFailed)
+            }
+        }
+        let v = FailFirst {
+            calls: Mutex::new(0),
+        };
+        let images = vec!["a@sha256:x".to_string(), "b@sha256:y".to_string()];
+        assert!(
+            verify_images_before_run(Uuid::nil(), &images, &v)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            *v.calls.lock().unwrap(),
+            1,
+            "must short-circuit on first failure"
+        );
     }
 }

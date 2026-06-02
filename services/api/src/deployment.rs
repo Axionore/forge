@@ -83,6 +83,10 @@ pub struct BuildRecord {
     pub error: Option<String>,
     pub created_by_principal_id: Option<Uuid>,
     pub deployment_id: Option<Uuid>,
+    /// Phase C: whether the produced image was cosign-signed + provenance-attested.
+    pub signed: bool,
+    /// Phase C: non-secret SLSA provenance summary (subject digest + commit + builder).
+    pub provenance: Option<serde_json::Value>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -2596,7 +2600,8 @@ impl DeploymentService {
             r#"
             SELECT id, application_id, git_source_id, commit_sha, git_ref, builder, status,
                    image, image_digest, started_at, finished_at, error,
-                   created_by_principal_id, deployment_id, created_at, updated_at
+                   created_by_principal_id, deployment_id, signed, provenance,
+                   created_at, updated_at
             FROM builds WHERE id = $1
             "#,
             id
@@ -2620,6 +2625,8 @@ impl DeploymentService {
             error: r.error,
             created_by_principal_id: r.created_by_principal_id,
             deployment_id: r.deployment_id,
+            signed: r.signed,
+            provenance: r.provenance,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }))
@@ -2634,7 +2641,8 @@ impl DeploymentService {
             r#"
             SELECT id, application_id, git_source_id, commit_sha, git_ref, builder, status,
                    image, image_digest, started_at, finished_at, error,
-                   created_by_principal_id, deployment_id, created_at, updated_at
+                   created_by_principal_id, deployment_id, signed, provenance,
+                   created_at, updated_at
             FROM builds WHERE application_id = $1
             ORDER BY created_at DESC LIMIT 100
             "#,
@@ -2661,6 +2669,8 @@ impl DeploymentService {
                 error: r.error,
                 created_by_principal_id: r.created_by_principal_id,
                 deployment_id: r.deployment_id,
+                signed: r.signed,
+                provenance: r.provenance,
                 created_at: r.created_at,
                 updated_at: r.updated_at,
             })
@@ -2684,12 +2694,15 @@ impl DeploymentService {
     /// On success records the image + digest and returns the [`BuildRecord`] so the caller
     /// can dispatch a Deploy. On failure records the sanitized error and returns the record
     /// with status `failed` — the caller MUST NOT deploy a failed build (fail-closed, A10).
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_build_result(
         &self,
         id: Uuid,
         success: bool,
         image: Option<&str>,
         image_digest: Option<&str>,
+        signed: bool,
+        provenance: Option<&serde_json::Value>,
         error: Option<&str>,
     ) -> Result<Option<BuildRecord>, DeploymentError> {
         let status = if success { "succeeded" } else { "failed" };
@@ -2700,12 +2713,14 @@ impl DeploymentService {
             r#"
             UPDATE builds
             SET status = $1, image = COALESCE($2, image), image_digest = $3,
-                error = $4, finished_at = NOW(), updated_at = NOW()
-            WHERE id = $5
+                signed = $4, provenance = $5, error = $6, finished_at = NOW(), updated_at = NOW()
+            WHERE id = $7
             "#,
             status,
             image,
             image_digest,
+            signed,
+            provenance,
             error_trunc,
             id
         )
@@ -2714,6 +2729,46 @@ impl DeploymentService {
         .map_err(|e| DeploymentError::Internal(e.into()))?;
 
         self.get_build(id).await
+    }
+
+    /// Write the supply-chain audit row (Phase C): the verifiable chain
+    /// principal → commit → image digest → deployment. NO secret material is stored — only the
+    /// public attestation summary (OWASP A09). `event` is a short machine label (e.g.
+    /// `build_signed_and_deployed`, `deploy_refused_no_digest`). Best-effort: a failure to audit
+    /// is logged by the caller and never blocks the deploy decision (which is already made).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_supply_chain_audit(
+        &self,
+        principal_id: Option<Uuid>,
+        build_id: Uuid,
+        commit_sha: &str,
+        image_digest: Option<&str>,
+        deployment_id: Option<Uuid>,
+        signed: bool,
+        event: &str,
+    ) -> Result<(), DeploymentError> {
+        let after = serde_json::json!({
+            "event": event,
+            "build_id": build_id,
+            "commit_sha": commit_sha,
+            "image_digest": image_digest,
+            "deployment_id": deployment_id,
+            "signed": signed,
+        });
+        sqlx::query!(
+            r#"
+            INSERT INTO audit_logs (id, principal_id, action, resource_type, resource_id, after)
+            VALUES ($1, $2, 'supplychain:build_attested', 'build', $3, $4)
+            "#,
+            Uuid::now_v7(),
+            principal_id,
+            build_id,
+            after,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+        Ok(())
     }
 
     /// Stamp git provenance (source, commit, ref) onto a deployment — the deploy end of the
@@ -3362,19 +3417,39 @@ mod build_pipeline_tests {
         // Mock the agent: it ran the build and reported success with an image + digest.
         // The WS layer would call record_build_result then create+dispatch a deployment;
         // here we drive those service calls directly (dispatch is mocked away).
+        let digest = format!("sha256:{}", "d".repeat(64));
+        let provenance = serde_json::json!({
+            "predicate_type": forge_core::supplychain::FORGE_PREDICATE_TYPE,
+            "builder_id": forge_core::supplychain::FORGE_BUILDER_ID,
+            "source_commit": sha,
+            "image_digest": digest,
+        });
         let updated = svc
             .record_build_result(
                 build_id,
                 true,
                 Some("acme/app:bbbbbbbbbbbb"),
-                Some("sha256:deadbeef"),
+                Some(&digest),
+                true,
+                Some(&provenance),
                 None,
             )
             .await
             .unwrap()
             .unwrap();
         assert_eq!(updated.status, "succeeded");
-        assert_eq!(updated.image_digest.as_deref(), Some("sha256:deadbeef"));
+        assert_eq!(updated.image_digest.as_deref(), Some(digest.as_str()));
+        // Phase C: signing + provenance persisted on the build record.
+        assert!(updated.signed, "build should be recorded as signed");
+        assert_eq!(
+            updated
+                .provenance
+                .as_ref()
+                .and_then(|p| p.get("builder_id")),
+            Some(&serde_json::json!(
+                forge_core::supplychain::FORGE_BUILDER_ID
+            ))
+        );
 
         // On success → a deployment is created from the produced image, then linked.
         let deployment = svc
@@ -3410,6 +3485,35 @@ mod build_pipeline_tests {
         .await
         .unwrap();
         assert_eq!(dep_commit.as_deref(), Some(sha.as_str()));
+
+        // Phase C: the verifiable supply-chain audit row (principal → commit → digest → deploy)
+        // is written and queryable.
+        svc.write_supply_chain_audit(
+            None,
+            build_id,
+            &sha,
+            Some(&digest),
+            Some(deployment.id),
+            true,
+            "build_signed_and_deployed",
+        )
+        .await
+        .unwrap();
+        let audit_after: serde_json::Value = sqlx::query_scalar!(
+            r#"SELECT after as "after!" FROM audit_logs
+               WHERE action = 'supplychain:build_attested' AND resource_id = $1"#,
+            build_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit_after["commit_sha"], serde_json::json!(sha));
+        assert_eq!(audit_after["image_digest"], serde_json::json!(digest));
+        assert_eq!(
+            audit_after["deployment_id"],
+            serde_json::json!(deployment.id)
+        );
+        assert_eq!(audit_after["signed"], serde_json::json!(true));
     }
 
     #[sqlx::test]
@@ -3437,6 +3541,8 @@ mod build_pipeline_tests {
                 build.id,
                 false,
                 None,
+                None,
+                false,
                 None,
                 Some("docker build returned non-zero"),
             )
