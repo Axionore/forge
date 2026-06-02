@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Forge • Access & RBAC (Demo)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600&display=swap');
+    
+    :root {
+      --color-background: #0a0a0a;
+      --color-foreground: #ededed;
+      --color-card: #111111;
+      --color-card-border: #222222;
+      --color-muted-foreground: #888888;
+      --color-primary: #3b82f6;
+      --color-ring: #3b82f6;
+      --color-input: #222222;
+      --color-success: #22c55e;
+    }
+    
+    body {
+      font-family: 'Inter', system_ui, sans-serif;
+    }
+    
+    .font-display {
+      font-family: 'Space Grotesk', 'Inter', system_ui, sans-serif;
+      font-weight: 600;
+      letter-spacing: -0.025em;
+    }
+
+    .admin-card {
+      background-color: var(--color-card);
+      border: 1px solid var(--color-card-border);
+    }
+
+    .section-title {
+      font-size: 1.5rem;
+      line-height: 1.2;
+      font-weight: 600;
+      letter-spacing: -0.04em;
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+
+    .amber-banner {
+      background-color: #fefce8;
+      border-color: #facc15;
+      color: #713f12;
+    }
+
+    .status-pill {
+      font-size: 10px;
+      padding: 1px 8px;
+      border-radius: 9999px;
+      border: 1px solid;
+    }
+
+    .forge-header {
+      background-color: rgba(17, 17, 17, 0.8);
+      backdrop-filter: blur(12px);
+    }
+  </style>
+</head>
+<body class="bg-[#0a0a0a] text-[#ededed] min-h-screen">
+  <header class="border-b border-[#222] bg-[#111]/80 backdrop-blur sticky top-0 z-50">
+    <div class="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="h-8 w-8 rounded bg-blue-600 flex items-center justify-center">
+          <i class="fa-solid fa-hammer text-white"></i>
+        </div>
+        <div>
+          <div class="font-semibold tracking-tighter text-lg">Forge</div>
+          <div class="text-[10px] text-[#888] -mt-1">CONTROL PLANE</div>
+        </div>
+        <div class="ml-4 text-sm font-medium text-[#888]">Access &amp; RBAC</div>
+      </div>
+      <div class="flex items-center gap-3 text-sm">
+        <a href="#" class="text-[#888] hover:text-[#ededed] transition">← Admin</a>
+        <a href="#" class="text-[#888] hover:text-[#ededed] transition">Home</a>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-6xl mx-auto px-6 py-10">
+    <!-- Admin Token Bootstrap -->
+    <div class="mb-8 rounded-2xl border border-[#222] bg-[#111] p-5">
+      <div class="flex items-start justify-between gap-6">
+        <div class="flex-1">
+          <div class="text-xs uppercase tracking-[0.5px] font-medium text-[#888] mb-1">OPERATOR AUTH</div>
+          <div class="font-semibold tracking-tight">Admin Token</div>
+          <p class="mt-1 text-sm text-[#888] max-w-md">
+            Paste your <code class="font-mono text-xs bg-[#222] px-1 py-px rounded">FORGE_ADMIN_TOKEN</code>. Stored only in memory for this session.
+          </p>
+        </div>
+        <div class="w-80">
+          <div class="relative">
+            <input 
+              id="admin-token-input"
+              type="password" 
+              value="rbac-demo-token-super-secure-1234567890ABCDEF"
+              class="w-full rounded-xl border border-[#222] bg-white text-black px-4 py-2.5 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-blue-600 placeholder:text-[#888]/60"
+              placeholder="forge_admin_xxxxxxxxxxxxxxxx"
+            >
+            <button 
+              onclick="toggleAdminTokenVisibility()"
+              class="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-medium text-[#888] hover:text-black">
+              SHOW
+            </button>
+          </div>
+          <div class="mt-1.5 text-[10px] text-[#888]">Required for all RBAC management actions.</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="error-banner" class="hidden mb-6 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 flex items-center justify-between">
+      <span id="error-text"></span>
+      <button onclick="dismissError()" class="font-medium underline">Dismiss</button>
+    </div>
+
+    <div id="success-banner" class="hidden mb-6 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700 flex items-center justify-between">
+      <span id="success-text"></span>
+      <button onclick="dismissSuccess()" class="font-medium underline">Dismiss</button>
+    </div>
+
+    <!-- One-time Token Reveal Banner (hidden by default) -->
+    <div id="one-time-banner" class="hidden mb-8 rounded-3xl border-2 border-amber-400/70 bg-amber-50/60 p-6">
+      <div class="flex items-start gap-4">
+        <div class="mt-0.5 text-amber-500">
+          <i class="fa-solid fa-exclamation-triangle text-2xl"></i>
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="font-semibold tracking-tight text-amber-950">One-time admin token — copy immediately</div>
+          <div class="text-sm text-amber-900/80 mt-0.5">
+            This value is never stored or shown again. Use it in <code class="font-mono">X-Admin-Token</code> for any /admin route.
+          </div>
+
+          <div id="one-time-token-value" 
+               class="mt-4 flex items-center gap-3 rounded-2xl bg-white px-5 py-4 font-mono text-[15px] border border-amber-200 tracking-[0.5px] break-all select-all cursor-pointer"
+               onclick="copyTokenValue()">
+          </div>
+
+          <div class="mt-3 flex items-center gap-3">
+            <button onclick="copyTokenValue()"
+                    class="inline-flex items-center gap-2 rounded-2xl bg-white border border-amber-200 px-6 h-10 text-sm font-medium active:bg-amber-100 transition">
+              <i class="fa-solid fa-copy mr-2"></i>
+              <span id="copy-button-text">Copy secret</span>
+            </button>
+            <button onclick="dismissOneTimeBanner()" 
+                    class="text-sm text-amber-950/70 hover:text-amber-950 underline underline-offset-2">
+              Dismiss
+            </button>
+            <div id="token-prefix-display" class="text-[10px] text-amber-900/60 ml-auto font-mono tracking-[1px]"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+      <!-- Principals -->
+      <div class="rounded-3xl border border-[#222] bg-[#111] p-8">
+        <div class="flex items-center justify-between mb-6">
+          <div>
+            <div class="font-semibold tracking-tighter text-2xl">Principals</div>
+            <div class="text-sm text-[#888] mt-1">Human operators or API keys that can hold roles.</div>
+          </div>
+        </div>
+
+        <form id="create-principal-form" onsubmit="createPrincipal(event)" class="space-y-4 mb-6">
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <input 
+              id="principal-name"
+              type="text" 
+              placeholder="alice or ci-deployer" 
+              class="sm:col-span-2 rounded-2xl border border-[#222] bg-white text-black px-5 py-3 text-[15px] focus:outline-none focus:ring-2 focus:ring-blue-600" 
+              required>
+            <select id="principal-type" class="rounded-2xl border border-[#222] bg-white text-black px-5 py-3 text-[15px] focus:outline-none focus:ring-2 focus:ring-blue-600">
+              <option value="user">user</option>
+              <option value="api_key">api_key</option>
+            </select>
+          </div>
+          <button type="submit" 
+                  class="w-full rounded-2xl bg-white text-black py-3 text-sm font-medium active:bg-gray-100 transition">
+            Create Principal
+          </button>
+        </form>
+
+        <div class="space-y-2 text-sm" id="principals-list">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+
+      <!-- Roles -->
+      <div class="rounded-3xl border border-[#222] bg-[#111] p-8">
+        <div class="flex items-center justify-between mb-6">
+          <div>
+            <div class="font-semibold tracking-tighter text-2xl">Roles</div>
+            <div class="text-sm text-[#888] mt-1">JSONB permissions. * and ns:* wildcards supported.</div>
+          </div>
+        </div>
+
+        <form id="create-role-form" onsubmit="createRole(event)" class="space-y-4 mb-6">
+          <input id="role-name" type="text" placeholder="Role name (e.g. deployer)" 
+                 class="w-full rounded-2xl border border-[#222] bg-white text-black px-5 py-3 text-[15px] focus:outline-none focus:ring-2 focus:ring-blue-600" required>
+          <input id="role-desc" type="text" placeholder="Optional description" 
+                 class="w-full rounded-2xl border border-[#222] bg-white text-black px-5 py-3 text-[15px] focus:outline-none focus:ring-2 focus:ring-blue-600">
+          
+          <div>
+            <label class="block text-xs font-medium tracking-widest text-[#888] mb-1.5">PERMISSIONS (JSON object)</label>
+            <textarea id="role-permissions" rows="3" 
+                      class="w-full font-mono text-sm rounded-2xl border border-[#222] bg-white text-black px-5 py-3 focus:outline-none focus:ring-2 focus:ring-blue-600">{
+  "deployments:read": true,
+  "secrets:read": true
+}</textarea>
+          </div>
+          
+          <button type="submit" 
+                  class="w-full rounded-2xl bg-white text-black py-3 text-sm font-medium active:bg-gray-100 transition">
+            Create Role
+          </button>
+        </form>
+
+        <div class="space-y-2 text-sm" id="roles-list">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+    </div>
+
+    <!-- Issued Admin Tokens -->
+    <div class="mt-8 rounded-3xl border border-[#222] bg-[#111] p-8">
+      <div class="flex items-center justify-between mb-6">
+        <div>
+          <div class="font-semibold tracking-tighter text-2xl">Issued Admin Tokens</div>
+          <div class="text-sm text-[#888] mt-1">These tokens can be used in X-Admin-Token for any admin operation.</div>
+        </div>
+      </div>
+
+      <form id="create-token-form" onsubmit="createAdminToken(event)" class="space-y-4 mb-8">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div>
+            <label class="block text-xs font-medium tracking-widest text-[#888] mb-1.5">PRINCIPAL</label>
+            <select id="token-principal" class="w-full rounded-2xl border border-[#222] bg-white text-black px-5 py-3 text-[15px] focus:outline-none focus:ring-2 focus:ring-blue-600" required>
+              <option value="">Select principal…</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs font-medium tracking-widest text-[#888] mb-1.5">DESCRIPTION</label>
+            <input id="token-desc" type="text" placeholder="ops team — staging" 
+                   class="w-full rounded-2xl border border-[#222] bg-white text-black px-5 py-3 text-[15px] focus:outline-none focus:ring-2 focus:ring-blue-600">
+          </div>
+          <div>
+            <label class="block text-xs font-medium tracking-widest text-[#888] mb-1.5">EXPIRES</label>
+            <select id="token-expires" class="w-full rounded-2xl border border-[#222] bg-white text-black px-5 py-3 text-[15px] focus:outline-none focus:ring-2 focus:ring-blue-600">
+              <option value="">Never</option>
+              <option value="7">7 days</option>
+              <option value="30">30 days</option>
+              <option value="90">90 days</option>
+              <option value="365">1 year</option>
+            </select>
+          </div>
+        </div>
+        <button type="submit" 
+                class="w-full rounded-2xl bg-white text-black py-3 text-sm font-medium active:bg-gray-100 transition">
+          Issue Admin Token (one-time secret)
+        </button>
+        <p class="text-[10px] text-[#888]">The raw token is returned only once. It is stored hashed in the database.</p>
+      </form>
+
+      <div>
+        <div class="flex items-center justify-between mb-3 px-1">
+          <div class="font-semibold tracking-tighter text-xl">Active &amp; revoked tokens</div>
+          <button onclick="refreshTokens()" class="text-sm underline underline-offset-2">Refresh</button>
+        </div>
+
+        <div class="space-y-2" id="tokens-list">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+    </div>
+
+    <div class="mt-10 text-[10px] text-[#888] px-1">
+      This is a <strong>visual demo</strong> of the RBAC UI delivered in the Forge RBAC scaffolding. 
+      All data is stored in-memory for this page only. In the real app it talks to the Rust control plane.
+    </div>
+  </main>
+
+  <script>
+    // Tailwind script config
+    function initTailwind() {
+      // Already using CDN with some custom styles above
+    }
+
+    let principals = [];
+    let roles = [];
+    let tokens = [];
+    let justCreatedToken = null;
+
+    function showError(msg) {
+      const banner = document.getElementById('error-banner');
+      document.getElementById('error-text').textContent = msg;
+      banner.classList.remove('hidden');
+      banner.classList.add('flex');
+    }
+
+    function dismissError() {
+      const banner = document.getElementById('error-banner');
+      banner.classList.add('hidden');
+      banner.classList.remove('flex');
+    }
+
+    function showSuccess(msg) {
+      const banner = document.getElementById('success-banner');
+      document.getElementById('success-text').textContent = msg;
+      banner.classList.remove('hidden');
+      banner.classList.add('flex');
+    }
+
+    function dismissSuccess() {
+      const banner = document.getElementById('success-banner');
+      banner.classList.add('hidden');
+      banner.classList.remove('flex');
+    }
+
+    function toggleAdminTokenVisibility() {
+      const input = document.getElementById('admin-token-input');
+      if (input.type === 'password') {
+        input.type = 'text';
+      } else {
+        input.type = 'password';
+      }
+    }
+
+    // Demo data seeding
+    function seedDemoData() {
+      principals = [
+        { id: 'p-001', name: 'alice', principal_type: 'user', created_at: new Date().toISOString() },
+        { id: 'p-002', name: 'ci-pipeline', principal_type: 'api_key', created_at: new Date().toISOString() }
+      ];
+      
+      roles = [
+        { 
+          id: 'r-001', 
+          name: 'viewer', 
+          description: 'Read-only access', 
+          permissions: { "deployments:read": true, "agents:read": true, "secrets:read": true }
+        },
+        { 
+          id: 'r-002', 
+          name: 'operator', 
+          description: 'Deploy + limited write', 
+          permissions: { "deployments:*": true, "git-sources:write": true, "secrets:read": true }
+        },
+        { 
+          id: 'r-003', 
+          name: 'admin', 
+          description: 'Full access', 
+          permissions: { "*": true }
+        }
+      ];
+
+      renderPrincipals();
+      renderRoles();
+      updatePrincipalSelect();
+    }
+
+    function renderPrincipals() {
+      const container = document.getElementById('principals-list');
+      container.innerHTML = principals.map(p => `
+        <div class="flex items-center justify-between rounded-2xl border border-[#222] px-4 py-3">
+          <div>
+            <span class="font-medium">${p.name} (${p.principal_type})</span>
+          </div>
+          <div class="font-mono text-[10px] text-[#888]">${p.id}</div>
+        </div>
+      `).join('');
+    }
+
+    function renderRoles() {
+      const container = document.getElementById('roles-list');
+      container.innerHTML = roles.map(r => `
+        <div class="rounded-2xl border border-[#222] px-4 py-3">
+          <div class="flex items-baseline gap-2">
+            <span class="font-semibold">${r.name}</span>
+            ${r.description ? `<span class="text-[#888] text-xs">— ${r.description}</span>` : ''}
+          </div>
+          <pre class="mt-2 text-[10px] bg-black/30 p-2 rounded-xl overflow-auto text-emerald-300">${JSON.stringify(r.permissions, null, 2)}</pre>
+        </div>
+      `).join('');
+    }
+
+    function updatePrincipalSelect() {
+      const select = document.getElementById('token-principal');
+      select.innerHTML = '<option value="">Select principal…</option>' + 
+        principals.map(p => `<option value="${p.id}">${p.name} (${p.principal_type})</option>`).join('');
+    }
+
+    async function createPrincipal(e) {
+      e.preventDefault();
+      
+      const name = document.getElementById('principal-name').value.trim();
+      const type = document.getElementById('principal-type').value;
+      
+      if (!name) return;
+
+      const newPrincipal = {
+        id: 'p-' + Date.now().toString(36),
+        name,
+        principal_type: type,
+        created_at: new Date().toISOString()
+      };
+      
+      principals.unshift(newPrincipal);
+      renderPrincipals();
+      updatePrincipalSelect();
+      
+      document.getElementById('principal-name').value = '';
+      showSuccess('Principal created (demo)');
+    }
+
+    async function createRole(e) {
+      e.preventDefault();
+      
+      const name = document.getElementById('role-name').value.trim();
+      const desc = document.getElementById('role-desc').value.trim();
+      let perms;
+      
+      try {
+        perms = JSON.parse(document.getElementById('role-permissions').value);
+      } catch {
+        showError('Invalid JSON in permissions');
+        return;
+      }
+
+      const newRole = {
+        id: 'r-' + Date.now().toString(36),
+        name,
+        description: desc || null,
+        permissions: perms
+      };
+      
+      roles.unshift(newRole);
+      renderRoles();
+      
+      document.getElementById('role-name').value = '';
+      document.getElementById('role-desc').value = '';
+      document.getElementById('role-permissions').value = '{\n  "deployments:read": true\n}';
+      
+      showSuccess('Role created (demo)');
+    }
+
+    async function createAdminToken(e) {
+      e.preventDefault();
+      
+      const principalId = document.getElementById('token-principal').value;
+      const desc = document.getElementById('token-desc').value.trim();
+      const expires = document.getElementById('token-expires').value;
+      
+      if (!principalId) {
+        showError('Please select a principal');
+        return;
+      }
+
+      // Generate a realistic looking token
+      const rawToken = 'at_' + Array.from({length: 48}, () => 
+        'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'.charAt(Math.floor(Math.random() * 62))
+      ).join('');
+
+      const prefix = rawToken.substring(0, 8);
+
+      const newToken = {
+        token_hash_prefix: prefix,
+        principal_id: principalId,
+        description: desc || null,
+        expires_at: expires ? new Date(Date.now() + parseInt(expires) * 86400000).toISOString() : null,
+        revoked_at: null,
+        created_at: new Date().toISOString()
+      };
+
+      tokens.unshift(newToken);
+      renderTokens();
+
+      // Show the critical one-time reveal banner
+      showOneTimeTokenBanner(rawToken, prefix, newToken);
+      
+      // Clear form
+      document.getElementById('token-desc').value = '';
+      document.getElementById('token-expires').value = '';
+      document.getElementById('token-principal').value = '';
+    }
+
+    function showOneTimeTokenBanner(rawToken, prefix, tokenInfo) {
+      const banner = document.getElementById('one-time-banner');
+      const valueEl = document.getElementById('one-time-token-value');
+      const prefixEl = document.getElementById('token-prefix-display');
+
+      valueEl.textContent = rawToken;
+      prefixEl.textContent = prefix + '••••';
+      
+      // Store for copy
+      window.currentOneTimeToken = rawToken;
+      
+      banner.classList.remove('hidden');
+      banner.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+
+    function copyTokenValue() {
+      if (!window.currentOneTimeToken) return;
+      
+      navigator.clipboard.writeText(window.currentOneTimeToken).then(() => {
+        const btnText = document.getElementById('copy-button-text');
+        const original = btnText.textContent;
+        btnText.textContent = 'Copied!';
+        
+        setTimeout(() => {
+          btnText.textContent = original;
+        }, 1800);
+      });
+    }
+
+    function dismissOneTimeBanner() {
+      const banner = document.getElementById('one-time-banner');
+      banner.classList.add('hidden');
+      window.currentOneTimeToken = null;
+      
+      // Show a reminder
+      showSuccess('Token copied? It will never be shown again in the real app.');
+    }
+
+    function renderTokens() {
+      const container = document.getElementById('tokens-list');
+      
+      if (tokens.length === 0) {
+        container.innerHTML = `<div class="text-sm text-[#888] px-1">No admin tokens issued yet in this demo.</div>`;
+        return;
+      }
+      
+      container.innerHTML = tokens.map(t => {
+        const principal = principals.find(p => p.id === t.principal_id);
+        const principalName = principal ? principal.name : 'unknown';
+        
+        return `
+          <div class="flex items-center justify-between rounded-2xl border border-[#222] px-4 py-3 text-sm">
+            <div class="flex items-center gap-4 font-mono">
+              <span class="cursor-pointer hover:underline" onclick="navigator.clipboard.writeText('${t.token_hash_prefix}')">${t.token_hash_prefix}••••</span>
+              <span class="text-[#888]">→ ${principalName}</span>
+              ${t.description ? `<span class="text-[#888]">· ${t.description}</span>` : ''}
+            </div>
+            
+            <div class="flex items-center gap-4 text-xs text-[#888]">
+              ${t.expires_at ? `<span>expires ${new Date(t.expires_at).toLocaleDateString()}</span>` : ''}
+              ${t.revoked_at ? 
+                `<span class="text-red-400">revoked</span>` : 
+                `<button onclick="revokeToken('${t.token_hash_prefix}')" class="text-red-400 hover:text-red-300 underline">Revoke</button>`
+              }
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function revokeToken(prefix) {
+      if (!confirm(`Revoke token ${prefix}*?`)) return;
+      
+      const token = tokens.find(t => t.token_hash_prefix === prefix);
+      if (token) {
+        token.revoked_at = new Date().toISOString();
+      }
+      renderTokens();
+      showSuccess(`Token ${prefix}* revoked (demo)`);
+    }
+
+    function refreshTokens() {
+      renderTokens();
+    }
+
+    // Initialize everything
+    function init() {
+      initTailwind();
+      seedDemoData();
+      
+      // Seed a couple tokens for visual interest
+      setTimeout(() => {
+        tokens = [
+          {
+            token_hash_prefix: 'at_9f3k2m',
+            principal_id: 'p-001',
+            description: 'Alice laptop',
+            expires_at: null,
+            revoked_at: null,
+            created_at: new Date(Date.now() - 1000 * 60 * 60 * 2).toISOString()
+          }
+        ];
+        renderTokens();
+      }, 400);
+      
+      // Make the one-time banner copyable
+      console.log('%c[Forge RBAC Demo] Ready. All data is client-side only.', 'color:#666');
+    }
+
+    // Boot
+    window.onload = init;
+  </script>
+</body>
+</html>

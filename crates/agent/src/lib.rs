@@ -8,10 +8,10 @@ pub mod config;
 pub mod error;
 pub mod execution;
 pub mod health;
+pub mod identity;
 pub mod job;
 pub mod receiver;
 pub mod verification;
 pub mod wireguard;
-pub mod identity;
 
 pub use error::AgentError;

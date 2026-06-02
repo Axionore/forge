@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT r.permissions\n            FROM principal_roles pr\n            JOIN roles r ON r.id = pr.role_id\n            WHERE pr.principal_id = $1\n              AND r.revoked_at IS NULL\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "permissions",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6bf14d79a4a3ec9a79961dc51bb71c15228913caa7bc2c41bb2f5487d8560997"
+}

@@ -1,0 +1,82 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, name, db_type, database_name, schedule_type, schedule_value,\n                   retention_days, s3_bucket, enabled, last_run_at, created_at\n            FROM backup_schedules\n            WHERE deployment_id = $1\n            ORDER BY created_at DESC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "db_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "database_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "schedule_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "schedule_value",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "retention_days",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "s3_bucket",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 9,
+        "name": "last_run_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "adb635572cb882ecc88225dfd417c4f8d3fa00cb4de975908562585a0b7eaff3"
+}

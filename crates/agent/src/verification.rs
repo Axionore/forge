@@ -11,8 +11,8 @@ use ed25519_dalek::{Signature, VerifyingKey};
 /// This must succeed before the job is considered for execution.
 pub fn verify_signed_job(job: &SignedJob, public_key: &VerifyingKey) -> Result<()> {
     // Serialize the job payload exactly as it was signed on the control plane side.
-    let payload = serde_json::to_vec(&job.job)
-        .map_err(|e| crate::AgentError::Internal(e.into()))?;
+    let payload =
+        serde_json::to_vec(&job.job).map_err(|e| crate::AgentError::Internal(e.into()))?;
 
     let signature = Signature::from_slice(&job.signature)
         .map_err(|_| crate::AgentError::SignatureVerification)?;

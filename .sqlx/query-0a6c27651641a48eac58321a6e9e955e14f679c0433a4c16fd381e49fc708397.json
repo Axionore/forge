@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO pending_dispatches (id, deployment_id, agent_id, signed_job, created_at)\n            VALUES ($1, $2, $3, $4, NOW())\n            ON CONFLICT DO NOTHING\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0a6c27651641a48eac58321a6e9e955e14f679c0433a4c16fd381e49fc708397"
+}

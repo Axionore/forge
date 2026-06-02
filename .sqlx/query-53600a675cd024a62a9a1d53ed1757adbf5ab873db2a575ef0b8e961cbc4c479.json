@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO git_sources (id, name, provider, installation_id, config, access_token, enabled, created_at, updated_at)\n            VALUES ($1, $2, $3, $4, $5, $6, true, $7, $7)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "53600a675cd024a62a9a1d53ed1757adbf5ab873db2a575ef0b8e961cbc4c479"
+}

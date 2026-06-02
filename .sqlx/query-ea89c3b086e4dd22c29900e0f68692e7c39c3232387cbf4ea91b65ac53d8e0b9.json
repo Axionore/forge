@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO backup_executions (\n                id, schedule_id, deployment_id, status, db_type,\n                started_at, created_at\n            ) VALUES ($1, $2, $3, 'pending', $4, $5, $5)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ea89c3b086e4dd22c29900e0f68692e7c39c3232387cbf4ea91b65ac53d8e0b9"
+}

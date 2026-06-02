@@ -7,7 +7,9 @@ use crate::config::AgentConfig;
 use tracing::warn;
 
 #[cfg(feature = "wireguard")]
-use defguard_wireguard_rs::{host::Peer, key::Key, net::IpAddrMask, InterfaceConfiguration, WGApi, WireguardInterfaceApi};
+use defguard_wireguard_rs::{
+    InterfaceConfiguration, WGApi, WireguardInterfaceApi, host::Peer, key::Key, net::IpAddrMask,
+};
 
 pub fn initialize_wireguard(config: &AgentConfig) -> anyhow::Result<()> {
     if !config.enable_wireguard {
@@ -15,13 +17,18 @@ pub fn initialize_wireguard(config: &AgentConfig) -> anyhow::Result<()> {
     }
 
     if config.wireguard_private_key.is_empty() {
-        warn!("WireGuard enabled but no private key provided — skipping interface creation (will be populated during enrollment)");
+        warn!(
+            "WireGuard enabled but no private key provided — skipping interface creation (will be populated during enrollment)"
+        );
         return Ok(());
     }
 
     #[cfg(all(feature = "wireguard", target_os = "linux"))]
     {
-        use defguard_wireguard_rs::{host::Peer, key::Key, net::IpAddrMask, InterfaceConfiguration, WGApi, WireguardInterfaceApi};
+        use defguard_wireguard_rs::{
+            InterfaceConfiguration, WGApi, WireguardInterfaceApi, host::Peer, key::Key,
+            net::IpAddrMask,
+        };
 
         info!(
             interface = %config.wireguard_interface,
@@ -63,7 +70,10 @@ pub fn initialize_wireguard(config: &AgentConfig) -> anyhow::Result<()> {
             api.configure_peer(first_peer)?;
         }
 
-        info!("WireGuard interface {} created successfully", config.wireguard_interface);
+        info!(
+            "WireGuard interface {} created successfully",
+            config.wireguard_interface
+        );
     }
 
     #[cfg(not(all(feature = "wireguard", target_os = "linux")))]

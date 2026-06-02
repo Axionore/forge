@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO job_results (\n                id, deployment_id, agent_id, job_type, correlation_id,\n                success, error, started_at, finished_at, details, received_at\n            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Bool",
+        "Text",
+        "Timestamptz",
+        "Timestamptz",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a2b919f674b93dcc6dc0a8465cf210e36dd24147043d3d3ed52fdcdf90cb8866"
+}

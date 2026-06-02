@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 forge-core = { path = "../../crates/core" }
 forge-agent = { path = "../../crates/agent" }   # For SignedJob, Job, etc. during Slice 2 (will move to forge-core)
+forge-provider-hetzner = { path = "../../crates/providers/hetzner" }
 
 tokio.workspace = true
 axum.workspace = true
@@ -47,6 +48,7 @@ base64 = "0.22"
 # gRPC + xDS ADS server (true dynamic L7 for canary)
 tonic.workspace = true
 prost.workspace = true
+prost-types = { version = "0.14", features = ["std"] }
 envoy-types.workspace = true
 tokio-stream = "0.1"
 
@@ -56,6 +58,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-acme.workspace = true
 tokio-rustls.workspace = true
 hyper-util.workspace = true
+futures-util.workspace = true
 rustls-pemfile.workspace = true
 
 [dev-dependencies]

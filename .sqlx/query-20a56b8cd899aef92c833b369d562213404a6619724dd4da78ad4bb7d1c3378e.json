@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO notification_channels (id, name, channel_type, config, enabled, created_at, updated_at)\n            VALUES ($1, $2, $3, $4, true, $5, $5)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "20a56b8cd899aef92c833b369d562213404a6619724dd4da78ad4bb7d1c3378e"
+}

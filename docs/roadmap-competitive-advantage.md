@@ -4,6 +4,8 @@
 **Audience**: Core team + stakeholders  
 **Goal**: Define the shortest path from "technically impressive agent + enrollment system" to "the deployment platform serious teams choose when they care about security, zero-downtime, and operational honesty."
 
+> **Related**: See the detailed [Gap Analysis vs Coolify, Dokploy & Caddy (2026)](./gap-analysis-coolify-dokploy-caddy-2026.md) for the current competitive landscape.
+
 ## Current Position (Brutally Honest)
 
 As of today, Forge has made **excellent** progress on the hardest parts of the original vision:

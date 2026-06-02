@@ -19,6 +19,9 @@ serde_json.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 
+# Shared domain types (DeploymentSpec / ContainerSpec family moved here in Phase 1 Slice A)
+forge-core = { path = "../../crates/core" }
+
 # Cryptography for job verification + secret envelope decryption (age)
 ed25519-dalek = { workspace = true, features = ["rand_core", "pkcs8"] }
 age = { workspace = true }

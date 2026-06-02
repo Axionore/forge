@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE admin_tokens\n            SET revoked_at = NOW()\n            WHERE encode(token_hash, 'hex') LIKE $1 || '%'\n              AND revoked_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a583ed85eb45bf83d5022db9102d8c4d0d29a94ecba6b05b67418cd06e9bed24"
+}
