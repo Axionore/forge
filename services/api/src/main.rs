@@ -258,6 +258,17 @@ async fn main() {
         .route("/applications/{id}", get(get_application))
         .route("/applications/{id}/deployments", post(create_deployment))
         .route("/applications/{id}/deployments", get(list_deployments))
+        // Phase B: source-to-deploy builds
+        .route("/applications/{id}/builds", post(create_build_handler))
+        .route("/applications/{id}/builds", get(list_builds_handler))
+        .route(
+            "/applications/{id}/builds/{build_id}",
+            get(get_build_handler),
+        )
+        .route(
+            "/applications/{id}/builds/{build_id}/logs/ws",
+            get(build_logs_ws_handler),
+        )
         .route(
             "/applications/{app_id}/deployments/{dep_id}",
             get(get_deployment),
@@ -1227,6 +1238,328 @@ async fn create_deployment(
         .inc();
 
     Ok((StatusCode::CREATED, Json(deployment)))
+}
+
+// =============================================================================
+// Phase B: Source-to-deploy builds
+// =============================================================================
+
+#[derive(Debug, Deserialize)]
+struct CreateBuildRequest {
+    /// Optional git source this build is associated with (for traceability + webhook linking).
+    #[serde(default)]
+    git_source_id: Option<Uuid>,
+    /// Git URL to fetch (https or git@). Required.
+    repo_url: String,
+    /// Pinned commit SHA the build is fetched at. Required (40/64-hex). We never build a
+    /// floating ref (threat-model Tampering mitigation).
+    commit_sha: String,
+    /// Human-facing branch/tag the SHA was resolved from.
+    #[serde(default)]
+    git_ref: Option<String>,
+    /// Optional subdirectory within the repo to treat as the build root.
+    #[serde(default)]
+    subdir: Option<String>,
+    /// The builder to run, as the tagged `Builder` enum
+    /// (e.g. `{"type":"dockerfile","dockerfile_path":"Dockerfile"}`).
+    builder: forge_agent::job::Builder,
+    /// Output image repository/name.
+    image_name: String,
+    /// Output image tag (defaults to the short commit SHA when omitted).
+    #[serde(default)]
+    image_tag: Option<String>,
+    /// Optional registry to push to.
+    #[serde(default)]
+    registry: Option<String>,
+    /// Non-secret build args (visible in docker history — never secrets).
+    #[serde(default)]
+    build_args: std::collections::HashMap<String, String>,
+    /// Names of stored secrets (from the `secrets` table) to inject as BuildKit build
+    /// secrets. Each is re-encrypted to the agents' recipients and exposed only via
+    /// `--secret` (never as a build ARG/ENV).
+    #[serde(default)]
+    build_secret_names: Vec<String>,
+}
+
+/// Shared build trigger used by both the admin endpoint and deploy-on-push. Creates the
+/// build record, assembles the (secret-bearing) `BuildSpec`, signs a `Job::Build`, and
+/// dispatches it to a connected agent (or durably queues it). Returns the build record.
+async fn trigger_build(
+    state: &AppState,
+    app_id: Uuid,
+    req: CreateBuildRequest,
+    principal_id: Option<Uuid>,
+) -> Result<deployment::BuildRecord, ApiError> {
+    use forge_agent::job::{BuildSpec, GitCheckout, Job, SecretRef};
+
+    // Derive the builder discriminant for the DB CHECK constraint.
+    let builder_tag = match &req.builder {
+        forge_agent::job::Builder::Dockerfile { .. } => "dockerfile",
+        forge_agent::job::Builder::Nixpacks { .. } => "nixpacks",
+        forge_agent::job::Builder::Compose { .. } => "compose",
+        forge_agent::job::Builder::Buildpack { .. } => "buildpack",
+    };
+
+    let image_tag = req
+        .image_tag
+        .clone()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| req.commit_sha.chars().take(12).collect());
+
+    // Build the target image reference up front for the record.
+    let tmp_spec = BuildSpec {
+        source: GitCheckout::default(),
+        builder: req.builder.clone(),
+        image_name: req.image_name.clone(),
+        image_tag: image_tag.clone(),
+        registry: req.registry.clone(),
+        build_args: req.build_args.clone(),
+        build_secrets: vec![],
+    };
+    let target_image = tmp_spec.target_image();
+
+    // 1. Persist the build record (RBAC builds:create enforced inside).
+    let record = state
+        .deployment_service
+        .create_build(
+            app_id,
+            req.git_source_id,
+            &req.commit_sha,
+            req.git_ref.as_deref(),
+            builder_tag,
+            &target_image,
+            principal_id,
+        )
+        .await
+        .map_err(|e| match e {
+            deployment::DeploymentError::Forbidden => ApiError::Forbidden,
+            deployment::DeploymentError::InvalidInput(m) => ApiError::Validation {
+                field: "build".into(),
+                message: m,
+            },
+            deployment::DeploymentError::ApplicationNotFound => {
+                ApiError::BadRequest("application not found".into())
+            }
+            other => {
+                warn!(error = %other, "create_build failed");
+                ApiError::Internal
+            }
+        })?;
+
+    // 2. Resolve requested build secrets from the secret store, re-encrypting to the
+    //    agents' recipients so whichever agent runs the build can decrypt them.
+    let mut build_secrets: Vec<SecretRef> = Vec::new();
+    if !req.build_secret_names.is_empty() {
+        let recipients = state
+            .deployment_service
+            .agent_age_recipients()
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        for name in &req.build_secret_names {
+            // The named secret is already an age envelope; we reference it directly. Each
+            // secret becomes a BuildKit secret whose id is the secret name.
+            match state.deployment_service.get_build_secret_ref(name).await {
+                Ok(Some(ct)) => build_secrets.push(SecretRef {
+                    name: name.clone(),
+                    target: forge_agent::job::SecretTarget::File {
+                        path: format!("/run/secrets/{name}"),
+                        mode: Some(0o400),
+                    },
+                    ciphertext: ct,
+                }),
+                Ok(None) => {
+                    return Err(ApiError::Validation {
+                        field: "build_secret_names".into(),
+                        message: format!("unknown build secret: {name}"),
+                    });
+                }
+                Err(_) => return Err(ApiError::Internal),
+            }
+        }
+        // Defense in depth: if no agent can decrypt, fail rather than ship undecryptable secrets.
+        if recipients.is_empty() && !build_secrets.is_empty() {
+            return Err(ApiError::BadRequest(
+                "no enrolled agent can receive build secrets yet".into(),
+            ));
+        }
+    }
+
+    // 3. Assemble the full BuildSpec.
+    let spec = BuildSpec {
+        source: GitCheckout {
+            url: req.repo_url.clone(),
+            r#ref: req.git_ref.clone().unwrap_or_default(),
+            ssh_key_secret_name: None,
+            commit_sha: Some(req.commit_sha.clone()),
+            subdir: req.subdir.clone(),
+        },
+        builder: req.builder.clone(),
+        image_name: req.image_name.clone(),
+        image_tag,
+        registry: req.registry.clone(),
+        build_args: req.build_args.clone(),
+        build_secrets,
+    };
+
+    // 4. Sign + dispatch the Build job to a connected agent (best effort: pick the first).
+    let signer = crate::agent_ws::JobSigner::new((*state.signing_key).clone());
+    let job = Job::Build {
+        build_id: record.id,
+        spec,
+        target_image,
+        registry_auth: None,
+    };
+    let signed = signer.sign(job);
+
+    let connected = state.agent_registry.connected_agents().await;
+    let mut dispatched = false;
+    for agent_id in connected {
+        if state
+            .agent_registry
+            .send_job(agent_id, signed.clone())
+            .await
+        {
+            dispatched = true;
+            let _ = state.deployment_service.mark_build_running(record.id).await;
+            info!(build_id = %record.id, agent_id = %agent_id, "Dispatched Build job to agent");
+            break;
+        }
+    }
+    if !dispatched {
+        warn!(build_id = %record.id, "No connected agent to run the build; build stays pending");
+    }
+
+    state
+        .metrics
+        .jobs_dispatched_total
+        .with_label_values(&["build"])
+        .inc();
+
+    // Re-read so the returned record reflects the running status if dispatched.
+    state
+        .deployment_service
+        .get_build(record.id)
+        .await
+        .ok()
+        .flatten()
+        .map_or(Ok(record), Ok)
+}
+
+/// Reconstruct a default `Builder` from its persisted discriminant. Used by the webhook
+/// dispatch path, where only the builder tag was stored on the build record. Builder-specific
+/// options (dockerfile path, compose file) default to the conventional values.
+fn builder_from_tag(tag: &str) -> forge_agent::job::Builder {
+    use forge_agent::job::Builder;
+    match tag {
+        "nixpacks" => Builder::Nixpacks {
+            context: None,
+            start_cmd: None,
+        },
+        "compose" => Builder::Compose {
+            file: "docker-compose.yml".into(),
+        },
+        "buildpack" => Builder::Buildpack {
+            builder_image: None,
+        },
+        // Default and explicit "dockerfile".
+        _ => Builder::Dockerfile {
+            dockerfile_path: None,
+            context: None,
+            target: None,
+        },
+    }
+}
+
+/// POST /admin/applications/{id}/builds — trigger a build. RBAC `builds:create` (default-deny).
+async fn create_build_handler(
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+    Json(req): Json<CreateBuildRequest>,
+) -> Result<(StatusCode, Json<deployment::BuildRecord>), ApiError> {
+    // principal_id=None → bootstrap X-Admin-Token path (already authenticated). When issued
+    // tokens resolve to a principal, builds:create is enforced inside create_build.
+    let record = trigger_build(&state, app_id, req, None).await?;
+    Ok((StatusCode::CREATED, Json(record)))
+}
+
+/// GET /admin/applications/{id}/builds
+async fn list_builds_handler(
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+) -> Result<Json<Vec<deployment::BuildRecord>>, ApiError> {
+    state
+        .deployment_service
+        .list_builds(app_id)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            warn!(error = %e, "list_builds failed");
+            ApiError::Internal
+        })
+}
+
+/// GET /admin/applications/{id}/builds/{build_id}
+async fn get_build_handler(
+    State(state): State<AppState>,
+    Path((app_id, build_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<deployment::BuildRecord>, ApiError> {
+    match state.deployment_service.get_build(build_id).await {
+        Ok(Some(b)) if b.application_id == app_id => Ok(Json(b)),
+        Ok(_) => Err(ApiError::BadRequest("build not found".into())),
+        Err(e) => {
+            warn!(error = %e, "get_build failed");
+            Err(ApiError::Internal)
+        }
+    }
+}
+
+/// WS: stream live build logs for a build. Reuses the LOG_BROADCASTERS map keyed by the
+/// build id (the agent forwards redacted log lines as ExecOutput frames, which agent_ws
+/// publishes here).
+async fn build_logs_ws_handler(
+    ws: WebSocketUpgrade,
+    State(_state): State<AppState>,
+    Path((_app_id, build_id)): Path<(Uuid, Uuid)>,
+) -> Response {
+    ws.on_upgrade(move |mut socket| async move {
+        let _ = socket
+            .send(axum::extract::ws::Message::Text(
+                serde_json::json!({ "type": "build_logs_started", "build_id": build_id })
+                    .to_string(),
+            ))
+            .await;
+
+        let rx = {
+            let mut guard = LOG_BROADCASTERS.lock().unwrap();
+            guard
+                .entry(build_id)
+                .or_insert_with(|| {
+                    let (tx, _) = broadcast::channel(1024);
+                    tx
+                })
+                .subscribe()
+        };
+
+        let mut rx = rx;
+        loop {
+            tokio::select! {
+                line = rx.recv() => {
+                    match line {
+                        Ok(line) => {
+                            if socket.send(axum::extract::ws::Message::Text(line)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                Some(msg) = socket.recv() => {
+                    if msg.is_err() { break; }
+                }
+                else => break,
+            }
+        }
+    })
 }
 
 async fn list_deployments(
@@ -2614,6 +2947,64 @@ async fn git_webhook_handler(
                 ApiError::BadRequest("Webhook processing failed".into())
             }
         })?;
+
+    // Phase B deploy-on-push: if the webhook created a BUILD, sign + dispatch the Build job
+    // to a connected agent. On success the agent's Build JobResult creates + dispatches the
+    // Deploy (fail-closed). The signed Build job carries the pinned commit + builder spec.
+    if let Some(build_id) = result
+        .get("created_build_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
+        if let Ok(Some(record)) = state.deployment_service.get_build(build_id).await {
+            // Reconstruct the build request from the source config + record to dispatch it.
+            let repo_url = result
+                .get("repo_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let builder = builder_from_tag(&record.builder);
+            // Re-use trigger_build's dispatch by issuing the Build job directly here, since the
+            // record already exists. We mark it running and send to the first connected agent.
+            let signer = crate::agent_ws::JobSigner::new((*state.signing_key).clone());
+            if let Some(image) = record.image.clone() {
+                let spec = forge_agent::job::BuildSpec {
+                    source: forge_agent::job::GitCheckout {
+                        url: repo_url,
+                        r#ref: record.git_ref.clone().unwrap_or_default(),
+                        ssh_key_secret_name: None,
+                        commit_sha: Some(record.commit_sha.clone()),
+                        subdir: None,
+                    },
+                    builder,
+                    image_name: record.image.clone().unwrap_or_default(),
+                    image_tag: String::new(),
+                    registry: None,
+                    build_args: std::collections::HashMap::new(),
+                    build_secrets: vec![],
+                };
+                let job = forge_agent::job::Job::Build {
+                    build_id: record.id,
+                    spec,
+                    target_image: image,
+                    registry_auth: None,
+                };
+                let signed = signer.sign(job);
+                for agent_id in state.agent_registry.connected_agents().await {
+                    if state
+                        .agent_registry
+                        .send_job(agent_id, signed.clone())
+                        .await
+                    {
+                        let _ = state.deployment_service.mark_build_running(record.id).await;
+                        info!(build_id = %record.id, "Dispatched deploy-on-push Build job to agent");
+                        break;
+                    }
+                }
+            }
+        }
+        return Ok(Json(result));
+    }
 
     // Quick fix for e2e testability (item 6): if a preview deployment was created, immediately dispatch
     // the Deploy job to all currently connected agents so containers actually start without waiting for

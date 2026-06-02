@@ -711,6 +711,22 @@ async fn handle_incoming_message(
                 }
             }
 
+            // Phase B: terminal Build result. Record the image/digest/error, then — and ONLY
+            // on success — dispatch a Deploy using the produced image (fail-closed: a failed
+            // build never deploys, threat-model A10).
+            if result.job_type == "build" {
+                if let Ok(build_id) = Uuid::parse_str(&result.correlation_id) {
+                    handle_build_result(
+                        build_id,
+                        &result.details,
+                        deployment_service,
+                        signer,
+                        registry,
+                    )
+                    .await;
+                }
+            }
+
             // Feature 1: trigger notifications for this JobResult (audit + future real delivery)
             if let Ok(dep_id) = Uuid::parse_str(&result.correlation_id) {
                 let _ = deployment_service
@@ -790,9 +806,144 @@ async fn handle_incoming_message(
                 }
             }
         }
-        AgentMessage::ExecOutput { .. } => {
-            // Terminal/PTY output is streamed via dedicated WS sessions (handled outside this heartbeat path).
+        AgentMessage::ExecOutput {
+            session_id,
+            data,
+            stream,
+        } => {
+            // Build-log frames (stream == "build") use the build id as the session id; we
+            // publish each redacted line to that build's LOG_BROADCASTERS topic so the
+            // build-log WS subscribers receive it live. Terminal/PTY output (other streams)
+            // is handled by dedicated interactive sessions elsewhere.
+            if stream == "build" {
+                if let Ok(build_id) = Uuid::parse_str(&session_id) {
+                    let line = String::from_utf8_lossy(&data).into_owned();
+                    let guard = LOG_BROADCASTERS.lock().unwrap();
+                    if let Some(tx) = guard.get(&build_id) {
+                        let _ = tx.send(line);
+                    }
+                }
+            }
         }
+    }
+}
+
+/// Apply a terminal Build job result: persist image/digest/error, and on success create a
+/// Deployment from the built image and dispatch it to connected agents. Fail-closed — a
+/// failed build records the error and never deploys (threat-model A10).
+async fn handle_build_result(
+    build_id: Uuid,
+    details: &forge_agent::job::JobResultDetails,
+    deployment_service: &Arc<crate::deployment::DeploymentService>,
+    signer: &JobSigner,
+    registry: &AgentRegistry,
+) {
+    use forge_agent::job::JobResultDetails;
+
+    let JobResultDetails::Build {
+        success,
+        image,
+        image_digest,
+        error_message,
+        ..
+    } = details
+    else {
+        // Build job with a non-Build detail payload — record a generic failure.
+        let _ = deployment_service
+            .record_build_result(build_id, false, None, None, Some("malformed build result"))
+            .await;
+        return;
+    };
+
+    let record = match deployment_service
+        .record_build_result(
+            build_id,
+            *success,
+            image.as_deref(),
+            image_digest.as_deref(),
+            error_message.as_deref(),
+        )
+        .await
+    {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            warn!(%build_id, "build result for unknown build id");
+            return;
+        }
+        Err(e) => {
+            warn!(error = %e, %build_id, "failed to record build result");
+            return;
+        }
+    };
+
+    // Fail-closed: only a succeeded build with an image proceeds to deploy.
+    if !*success {
+        info!(%build_id, "build failed — not deploying (fail-closed)");
+        return;
+    }
+    let Some(image_ref) = record.image.clone() else {
+        warn!(%build_id, "succeeded build has no image — not deploying");
+        return;
+    };
+
+    // Create a deployment for the build's application using the produced image. The spec is
+    // minimal and deliberately conservative (no host mounts / privileged); the build's
+    // commit_sha + image flow into the deployment's git/commit columns for the audit chain.
+    let spec = serde_json::json!({
+        "containers": [{
+            "name": format!("app-{}", &record.commit_sha.chars().take(12).collect::<String>()),
+            "image": image_ref,
+            "ports": ["80:80"],
+            "restart_policy": "always"
+        }]
+    });
+
+    let deployment = match deployment_service
+        .create_deployment(
+            record.application_id,
+            spec.clone(),
+            DeploymentStrategy::Rolling(forge_core::RollingConfig {
+                max_unavailable: 0,
+                max_surge: 1,
+                health_check_grace_period_secs: 10,
+                rollback_on_failure: true,
+                failure_threshold: 2,
+            }),
+            vec![],
+        )
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(error = %e, %build_id, "failed to create deployment from successful build");
+            return;
+        }
+    };
+
+    // Link build → deployment + carry git provenance onto the deployment.
+    let _ = deployment_service
+        .link_build_deployment(build_id, deployment.id)
+        .await;
+    let _ = deployment_service
+        .set_deployment_git_metadata(
+            deployment.id,
+            record.git_source_id,
+            Some(&record.commit_sha),
+            record.git_ref.as_deref(),
+        )
+        .await;
+
+    // Dispatch the Deploy to connected agents (same pattern as the webhook quick path).
+    if let Ok(deploy_spec) = serde_json::from_value::<DeploymentSpec>(spec) {
+        let job = Job::Deploy {
+            deployment_id: deployment.id,
+            spec: deploy_spec,
+        };
+        let signed = signer.sign(job);
+        for agent_id in registry.connected_agents().await {
+            let _ = registry.send_job(agent_id, signed.clone()).await;
+        }
+        info!(%build_id, deployment_id = %deployment.id, "Dispatched Deploy for successful build (source-to-deploy)");
     }
 }
 

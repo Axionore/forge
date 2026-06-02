@@ -61,6 +61,11 @@ bytes = "1.10"
 # Docker (for agent)
 bollard = { version = "0.18", features = ["rustls"] }
 
+# Build executor (agent): secure temp dirs + bounded build-context walk + compose YAML parsing
+tempfile = "3.10"
+walkdir = "2.5"
+serde_yaml_ng = "0.10"
+
 # Hetzner
 hcloud = "0.25"
 

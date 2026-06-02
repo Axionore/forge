@@ -44,6 +44,11 @@ tokio-util = { version = "0.7", features = ["io"] }
 bollard = { workspace = true, optional = true }
 futures-util = "0.3"
 
+# Build executor (Phase B source-to-deploy): secure temp dirs + bounded context walk + compose YAML
+tempfile = { workspace = true }
+walkdir = { workspace = true }
+serde_yaml_ng = { workspace = true }
+
 # Real control plane communication
 tokio-tungstenite = { version = "0.23", features = ["rustls-tls-native-roots"] }
 

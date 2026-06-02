@@ -32,6 +32,28 @@ pub async fn execute_job(
 ) -> JobResult {
     let started_at = chrono::Utc::now().timestamp();
 
+    // Build jobs produce a rich `JobResultDetails::Build` and stream their own logs, so they
+    // are handled before the generic Ok(())/Err(()) dispatch below (which only yields a
+    // Generic detail). This keeps the image/digest/error reporting first-class.
+    if let Job::Build {
+        build_id,
+        spec,
+        target_image,
+        registry_auth: _registry_auth,
+    } = &job
+    {
+        return execute_build_job(
+            *build_id,
+            spec.clone(),
+            target_image.clone(),
+            docker,
+            exec_output_tx,
+            age_identity,
+            started_at,
+        )
+        .await;
+    }
+
     // Determine correlation + type for reporting
     let (correlation_id, job_type) = match &job {
         Job::Deploy { deployment_id, .. } => (deployment_id.to_string(), "deploy".to_string()),
@@ -2981,115 +3003,104 @@ async fn execute_backup(
     }
 }
 
-/// Execute a Build job (Phase 4 Source-to-Deploy core).
-/// For v1 we support "dockerfile" type with optional prior git_checkout.
-/// Produces a real image and reports it via the result channel so the control plane
-/// can then dispatch a normal Deploy using that image.
+/// Execute a Build job (Phase B Source-to-Deploy core).
 ///
-/// Allowed as dead code during Phase 1 (Build is Phase 4 scoped per spec).
-#[allow(dead_code)]
-async fn execute_build(
+/// Delegates the actual work to [`crate::build::run_build`], which fetches the pinned
+/// commit, runs the selected builder in a sandboxed workspace, streams redacted logs, and
+/// records the image digest. This function adapts that to a [`JobResult`], streaming each
+/// log line to the control plane over the existing `ExecOutput` WS mechanism (keyed by the
+/// build id as the session id), and returns the rich `JobResultDetails::Build`.
+///
+/// Fail-closed: any build error yields `success: false` with a sanitized message and NO
+/// image, so the control plane never deploys a failed build (threat-model A10).
+#[allow(clippy::too_many_arguments)]
+async fn execute_build_job(
     build_id: Uuid,
     spec: crate::job::BuildSpec,
-    git_checkout: Option<crate::job::GitCheckout>,
     target_image: String,
-    _registry_auth: (),
-    _docker: DockerClient,
-) -> crate::error::Result<()> {
-    let started = chrono::Utc::now();
+    docker: Option<&DockerClient>,
+    exec_output_tx: Option<tokio::sync::mpsc::Sender<crate::receiver::AgentMessage>>,
+    age_identity: Option<&age::x25519::Identity>,
+    started_at: i64,
+) -> JobResult {
+    info!(build_id = %build_id, target = %target_image, "Starting Build job");
 
-    info!(build_id = %build_id, target = %target_image, build_type = %spec.r#type, "Starting Build job");
-
-    let workspace = "/workspace-build";
-    let _ = std::fs::create_dir_all(workspace);
-
-    // 1. Git checkout if requested (reuses the same SSH secret injection pattern as Deploy)
-    if let Some(checkout) = &git_checkout {
-        if let Some(_key_name) = &checkout.ssh_key_secret_name {
-            // For build jobs we expect the secret to already be prepared by the caller if needed.
-            // In v1 we do a best-effort clone; full secret wiring for Build will be tightened in next slice.
-            let ssh_cmd = "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null";
-            let status = std::process::Command::new("git")
-                .args([
-                    "clone",
-                    "--depth",
-                    "1",
-                    "--branch",
-                    &checkout.r#ref,
-                    &checkout.url,
-                    workspace,
-                ])
-                .env("GIT_SSH_COMMAND", ssh_cmd)
-                .status();
-
-            if let Ok(s) = status {
-                if !s.success() {
-                    warn!(build_id = %build_id, "git clone for build failed");
-                }
+    // Bridge the build executor's line sink to the WS ExecOutput channel. We forward each
+    // redacted log line as an ExecOutput frame whose session_id is the build id, so the
+    // control plane can publish it to build-log subscribers using the same path as
+    // container logs. Bounded channel → backpressure, never unbounded.
+    let (log_tx, mut log_rx) = tokio::sync::mpsc::channel::<String>(256);
+    let forward_task = exec_output_tx.clone().map(|ws| {
+        tokio::spawn(async move {
+            while let Some(line) = log_rx.recv().await {
+                let _ = ws
+                    .send(crate::receiver::AgentMessage::ExecOutput {
+                        session_id: build_id.to_string(),
+                        data: line.into_bytes(),
+                        stream: "build".to_string(),
+                    })
+                    .await;
             }
-        } else {
-            // Public repo
-            let _ = std::process::Command::new("git")
-                .args([
-                    "clone",
-                    "--depth",
-                    "1",
-                    "--branch",
-                    &checkout.r#ref,
-                    &checkout.url,
-                    workspace,
-                ])
-                .status();
+        })
+    });
+
+    let outcome = crate::build::run_build(
+        build_id,
+        &spec,
+        &target_image,
+        age_identity,
+        Some(log_tx),
+        docker,
+    )
+    .await;
+
+    // The log sink (log_tx) was moved into run_build and is dropped when it returns, which
+    // closes log_rx and lets the forward task finish draining.
+    if let Some(handle) = forward_task {
+        let _ = handle.await;
+    }
+
+    let finished_at = chrono::Utc::now().timestamp();
+    let correlation_id = build_id.to_string();
+
+    match outcome {
+        Ok(o) => {
+            info!(build_id = %build_id, image = %o.image, digest = ?o.image_digest, pushed = o.pushed, "Build job succeeded");
+            JobResult {
+                correlation_id,
+                job_type: "build".to_string(),
+                success: true,
+                error: None,
+                started_at,
+                finished_at,
+                details: JobResultDetails::Build {
+                    success: true,
+                    image: Some(o.image),
+                    image_digest: o.image_digest,
+                    pushed: o.pushed,
+                    error_message: None,
+                },
+            }
         }
-    }
-
-    // 2. Actual build
-    let build_context = if git_checkout.is_some() {
-        workspace
-    } else {
-        "."
-    };
-
-    let mut cmd = std::process::Command::new("docker");
-    cmd.args(["build", "-t", &target_image, build_context]);
-
-    if spec.r#type == "dockerfile" {
-        // dockerfile is the default context build
-    } else {
-        // buildpack case can be added later; for now fall back to docker build semantics
-    }
-
-    info!(build_id = %build_id, cmd = ?cmd, "Running docker build");
-
-    let status = cmd.status();
-
-    let success = match status {
-        Ok(s) => s.success(),
         Err(e) => {
-            error!(build_id = %build_id, error = ?e, "docker build command failed to start");
-            false
+            // `BuildError`'s Display is already sanitized (no secrets / host paths).
+            let msg = e.to_string();
+            warn!(build_id = %build_id, error = %msg, "Build job failed (fail-closed: no deploy)");
+            JobResult {
+                correlation_id,
+                job_type: "build".to_string(),
+                success: false,
+                error: Some(msg.clone()),
+                started_at,
+                finished_at,
+                details: JobResultDetails::Build {
+                    success: false,
+                    image: None,
+                    image_digest: None,
+                    pushed: false,
+                    error_message: Some(msg),
+                },
+            }
         }
-    };
-
-    let finished = chrono::Utc::now();
-    let duration = (finished - started).num_seconds();
-
-    // 3. Report structured result (the caller in main loop will turn this into full JobResult)
-    // We use tracing for now; full result reporting for Build will be wired in the same way
-    // as Backup/Deploy once the result channel is extended (next micro-edit).
-    if success {
-        info!(
-            build_id = %build_id,
-            image = %target_image,
-            duration_secs = duration,
-            "Build completed successfully. Image ready for deploy."
-        );
-    } else {
-        warn!(build_id = %build_id, "Build failed");
     }
-
-    // For this slice the higher-level job loop still needs the result sent.
-    // We return Ok so the generic success path can be extended; real Build result details
-    // will be emitted in the immediate follow-up edit to the result construction site.
-    Ok(())
 }

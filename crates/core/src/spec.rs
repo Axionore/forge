@@ -55,21 +55,135 @@ pub struct IpamPool {
     pub aux_addresses: Vec<(String, String)>,
 }
 
-/// Build specification for Tier 2 buildpack parity (and future Dockerfile builds).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Source-to-deploy build specification (Phase B).
+///
+/// A `BuildSpec` fully describes one build: where the source comes from (git, pinned
+/// to a commit SHA), how it is built ([`Builder`]), what the output image is named, and
+/// any build-time arguments / secrets. It is pure data + serde — the agent's build
+/// executor turns it into Docker/BuildKit calls.
+///
+/// Security (threat-model `specs/threat-model-source-to-deploy.md`):
+/// - `build_secrets` are [`SecretRef`]s (age envelopes). They are decrypted on the agent
+///   to a tmpfs file and exposed to the build ONLY via BuildKit `--secret` (never as a
+///   build ARG/ENV that would persist in an image layer).
+/// - `build_args` are NOT secret — they are visible in `docker history`. The control
+///   plane must never route secret material through `build_args`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildSpec {
-    pub r#type: String,
-    pub builder: Option<String>,
+    /// Where the source comes from. Reuses [`GitCheckout`], which now carries the
+    /// resolved commit SHA the build is pinned to.
+    pub source: GitCheckout,
+
+    /// Which builder to run.
+    pub builder: Builder,
+
+    /// Output image repository/name (e.g. `registry.example.com/app`). The tag is in
+    /// [`Self::image_tag`]; the agent combines them as `image_name:image_tag`.
+    pub image_name: String,
+
+    /// Output image tag (e.g. a short commit SHA). Defaults to `latest` if empty.
     #[serde(default)]
-    pub env: HashMap<String, String>,
+    pub image_tag: String,
+
+    /// Optional registry host the image will be pushed to. When `None` the image stays
+    /// local to the build agent (still usable by a same-host Deploy).
+    #[serde(default)]
+    pub registry: Option<String>,
+
+    /// Non-secret build-time arguments. Visible in `docker history` — never secrets.
+    #[serde(default)]
+    pub build_args: HashMap<String, String>,
+
+    /// Build-time secrets (age-encrypted). Injected via BuildKit `--secret`, never baked
+    /// into a layer. Each secret's [`SecretRef::name`] is the BuildKit secret `id`.
+    #[serde(default)]
+    pub build_secrets: Vec<SecretRef>,
 }
 
-/// Git checkout configuration for private repo builds using SSH keys (Tier 3 SSH feature).
+impl BuildSpec {
+    /// The fully-qualified target image reference the agent tags and (optionally) pushes.
+    pub fn target_image(&self) -> String {
+        let tag = if self.image_tag.is_empty() {
+            "latest"
+        } else {
+            &self.image_tag
+        };
+        match &self.registry {
+            Some(reg) if !reg.is_empty() => format!("{reg}/{}:{tag}", self.image_name),
+            _ => format!("{}:{tag}", self.image_name),
+        }
+    }
+}
+
+/// The build strategy. Tagged so the wire format is explicit and forward-compatible.
+///
+/// Builder matrix (Phase B):
+/// - [`Builder::Dockerfile`] — fully implemented (BuildKit, supports build secrets).
+/// - [`Builder::Nixpacks`] — implemented via the `nixpacks` CLI; fails closed with a
+///   clear, actionable error if the binary is absent.
+/// - [`Builder::Compose`] — implemented via `docker compose build`; rejects unsafe
+///   Compose directives (privileged / host bind-mounts / docker-socket mounts).
+/// - [`Builder::Buildpack`] — SCAFFOLD ONLY. Returns a clear "not yet implemented" error
+///   at execution time (no silent fake). Wired so the type and API exist; the Paketo
+///   lifecycle integration is deliberately deferred (see spec parity matrix: ⏭ scaffold).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Builder {
+    /// Build from a Dockerfile via BuildKit. Fully working, supports build secrets.
+    Dockerfile {
+        /// Path to the Dockerfile, relative to the build context. Defaults to `Dockerfile`.
+        #[serde(default)]
+        dockerfile_path: Option<String>,
+        /// Build context directory, relative to the checked-out repo root. Defaults to `.`.
+        #[serde(default)]
+        context: Option<String>,
+        /// Optional target stage for multi-stage builds (`--target`).
+        #[serde(default)]
+        target: Option<String>,
+    },
+
+    /// Build via the Nixpacks CLI (auto-detects language/framework).
+    Nixpacks {
+        /// Subdirectory of the repo to build, relative to the repo root. Defaults to `.`.
+        #[serde(default)]
+        context: Option<String>,
+        /// Optional explicit start command override (`--start-cmd`).
+        #[serde(default)]
+        start_cmd: Option<String>,
+    },
+
+    /// Build via `docker compose build`.
+    Compose {
+        /// Path to the compose file, relative to the repo root (e.g. `docker-compose.yml`).
+        file: String,
+    },
+
+    /// SCAFFOLD: Cloud Native Buildpacks (Paketo). Not yet implemented — see [`Builder`] docs.
+    Buildpack {
+        /// The builder image that would be used (e.g. `paketobuildpacks/builder-jammy-base`).
+        #[serde(default)]
+        builder_image: Option<String>,
+    },
+}
+
+/// Git checkout configuration. Reused by both the Deploy SSH-clone path (Tier 3) and the
+/// Phase B build executor.
+///
+/// For builds, `commit_sha` MUST be set: the build executor checks out the repo and then
+/// resets HARD to this exact commit, so the build is pinned and reproducible (threat-model
+/// Tampering mitigation — no floating refs at build time). `r#ref` is the human-facing
+/// branch/tag the SHA was resolved from.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GitCheckout {
     pub url: String,
     pub r#ref: String,
     pub ssh_key_secret_name: Option<String>,
+    /// Resolved, pinned commit SHA the build is fetched at. Required for builds.
+    #[serde(default)]
+    pub commit_sha: Option<String>,
+    /// Optional subdirectory within the repo to treat as the build root.
+    #[serde(default)]
+    pub subdir: Option<String>,
 }
 
 /// Serializable registry credentials for private image pulls.
@@ -379,4 +493,112 @@ pub struct DeviceRequest {
     pub device_ids: Vec<String>,
     pub capabilities: Vec<Vec<String>>,
     pub options: Vec<(String, String)>,
+}
+
+#[cfg(test)]
+mod build_spec_tests {
+    use super::*;
+
+    fn dockerfile_spec() -> BuildSpec {
+        BuildSpec {
+            source: GitCheckout {
+                url: "https://github.com/acme/app.git".into(),
+                r#ref: "main".into(),
+                ssh_key_secret_name: None,
+                commit_sha: Some("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0".into()),
+                subdir: None,
+            },
+            builder: Builder::Dockerfile {
+                dockerfile_path: Some("Dockerfile".into()),
+                context: Some(".".into()),
+                target: None,
+            },
+            image_name: "registry.example.com/acme/app".into(),
+            image_tag: "a1b2c3d".into(),
+            registry: Some("registry.example.com".into()),
+            build_args: HashMap::from([("RUST_VERSION".into(), "1.95".into())]),
+            build_secrets: vec![],
+        }
+    }
+
+    #[test]
+    fn dockerfile_builder_round_trips() {
+        let spec = dockerfile_spec();
+        let json = serde_json::to_string(&spec).unwrap();
+        // The builder is tagged, so the discriminant is explicit on the wire.
+        assert!(json.contains(r#""type":"dockerfile""#));
+        let back: BuildSpec = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back.builder, Builder::Dockerfile { .. }));
+        assert_eq!(back.image_name, spec.image_name);
+    }
+
+    #[test]
+    fn each_builder_variant_tag_is_stable() {
+        for (builder, tag) in [
+            (
+                Builder::Dockerfile {
+                    dockerfile_path: None,
+                    context: None,
+                    target: None,
+                },
+                "dockerfile",
+            ),
+            (
+                Builder::Nixpacks {
+                    context: None,
+                    start_cmd: None,
+                },
+                "nixpacks",
+            ),
+            (
+                Builder::Compose {
+                    file: "docker-compose.yml".into(),
+                },
+                "compose",
+            ),
+            (
+                Builder::Buildpack {
+                    builder_image: None,
+                },
+                "buildpack",
+            ),
+        ] {
+            let json = serde_json::to_value(&builder).unwrap();
+            assert_eq!(json["type"], tag, "tag for {builder:?} must be {tag}");
+        }
+    }
+
+    #[test]
+    fn target_image_composes_registry_name_and_tag() {
+        let mut spec = dockerfile_spec();
+        assert_eq!(
+            spec.target_image(),
+            "registry.example.com/registry.example.com/acme/app:a1b2c3d"
+        );
+
+        // No registry → name:tag only.
+        spec.registry = None;
+        spec.image_name = "app".into();
+        spec.image_tag = "v1".into();
+        assert_eq!(spec.target_image(), "app:v1");
+
+        // Empty tag → latest.
+        spec.image_tag = String::new();
+        assert_eq!(spec.target_image(), "app:latest");
+    }
+
+    #[test]
+    fn build_secrets_default_to_empty_when_absent() {
+        // A minimal spec without the optional fields must still deserialize.
+        let json = r#"{
+            "source": { "url": "https://x/y.git", "ref": "main", "commit_sha": "abc123" },
+            "builder": { "type": "nixpacks" },
+            "image_name": "y"
+        }"#;
+        let spec: BuildSpec = serde_json::from_str(json).unwrap();
+        assert!(spec.build_secrets.is_empty());
+        assert!(spec.build_args.is_empty());
+        assert_eq!(spec.image_tag, "");
+        assert!(matches!(spec.builder, Builder::Nixpacks { .. }));
+    }
 }

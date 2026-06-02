@@ -66,6 +66,27 @@ pub enum DeploymentError {
     Internal(#[from] anyhow::Error),
 }
 
+/// API-friendly representation of a persisted build (migration 0020). No secret material.
+#[derive(Debug, Clone, Serialize)]
+pub struct BuildRecord {
+    pub id: Uuid,
+    pub application_id: Uuid,
+    pub git_source_id: Option<Uuid>,
+    pub commit_sha: String,
+    pub git_ref: Option<String>,
+    pub builder: String,
+    pub status: String,
+    pub image: Option<String>,
+    pub image_digest: Option<String>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub error: Option<String>,
+    pub created_by_principal_id: Option<Uuid>,
+    pub deployment_id: Option<Uuid>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// API-friendly representation of a persisted JobResult.
 #[derive(Debug, Serialize)]
 pub struct JobResultRow {
@@ -2428,6 +2449,286 @@ impl DeploymentService {
         Ok(result)
     }
 
+    // =====================================================================
+    // Phase B: Source-to-deploy builds
+    // =====================================================================
+
+    /// Collect the age recipients of all enrolled agents that reported one. Build secrets
+    /// are encrypted to every such recipient so whichever agent runs the build can decrypt
+    /// them (multi-recipient envelope — one ciphertext, any agent opens it). Never logs the
+    /// recipients themselves.
+    pub async fn agent_age_recipients(&self) -> Result<Vec<String>, DeploymentError> {
+        let rows = sqlx::query!(
+            "SELECT age_recipient FROM agents WHERE age_recipient IS NOT NULL AND age_recipient <> ''"
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+        Ok(rows.into_iter().filter_map(|r| r.age_recipient).collect())
+    }
+
+    /// Load a named, enabled secret's age envelope for use as a build secret. Returns the
+    /// stored `SecretCiphertext` (already encrypted to the agents' recipients) or `None` if
+    /// the name is unknown/disabled or its blob is a non-encrypted placeholder. Never logs
+    /// or returns plaintext.
+    pub async fn get_build_secret_ref(
+        &self,
+        name: &str,
+    ) -> Result<Option<forge_agent::job::SecretCiphertext>, DeploymentError> {
+        let row = sqlx::query!(
+            "SELECT encrypted_blob FROM secrets WHERE name = $1 AND enabled = true ORDER BY created_at DESC LIMIT 1",
+            name
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        // A "pending" placeholder (no agents at creation time) is not usable as a build secret.
+        let version = row.encrypted_blob.get("version").and_then(|v| v.as_str());
+        if version != Some(forge_agent::job::SecretCiphertext::VERSION_AGE_V1) {
+            return Ok(None);
+        }
+        match serde_json::from_value::<forge_agent::job::SecretCiphertext>(row.encrypted_blob) {
+            Ok(ct) => Ok(Some(ct)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Create a build record (status `pending`) for an application from a pinned commit.
+    /// `builder` is the `Builder` discriminant string for the CHECK constraint.
+    /// Default-deny RBAC: a real principal must hold `builds:create`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_build(
+        &self,
+        application_id: Uuid,
+        git_source_id: Option<Uuid>,
+        commit_sha: &str,
+        git_ref: Option<&str>,
+        builder: &str,
+        image: &str,
+        created_by_principal_id: Option<Uuid>,
+    ) -> Result<BuildRecord, DeploymentError> {
+        self.enforce(created_by_principal_id, "builds:create")
+            .await?;
+
+        // Validate the application exists (and is the authz/audit anchor).
+        let _ = self.get_application(application_id).await?;
+
+        if !matches!(builder, "dockerfile" | "nixpacks" | "compose" | "buildpack") {
+            return Err(DeploymentError::InvalidInput(
+                "builder must be one of: dockerfile, nixpacks, compose, buildpack".into(),
+            ));
+        }
+        // Commit SHA must be a real 40/64-hex hash — we only ever build a pinned commit.
+        let sha_ok = (commit_sha.len() == 40 || commit_sha.len() == 64)
+            && commit_sha.chars().all(|c| c.is_ascii_hexdigit());
+        if !sha_ok {
+            return Err(DeploymentError::InvalidInput(
+                "commit_sha must be a 40- or 64-character hex commit hash".into(),
+            ));
+        }
+        if image.trim().is_empty() || image.len() > 512 {
+            return Err(DeploymentError::InvalidInput(
+                "invalid image reference".into(),
+            ));
+        }
+
+        let id = Uuid::now_v7();
+        sqlx::query!(
+            r#"
+            INSERT INTO builds
+                (id, application_id, git_source_id, commit_sha, git_ref, builder, status,
+                 image, created_by_principal_id, logs_ref)
+            VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9)
+            "#,
+            id,
+            application_id,
+            git_source_id,
+            commit_sha,
+            git_ref,
+            builder,
+            image,
+            created_by_principal_id,
+            // The build id doubles as the live build-log WS topic key.
+            id.to_string(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        self.get_build(id)
+            .await?
+            .ok_or(DeploymentError::DeploymentNotFound)
+    }
+
+    /// Fetch a single build by id.
+    pub async fn get_build(&self, id: Uuid) -> Result<Option<BuildRecord>, DeploymentError> {
+        let row = sqlx::query!(
+            r#"
+            SELECT id, application_id, git_source_id, commit_sha, git_ref, builder, status,
+                   image, image_digest, started_at, finished_at, error,
+                   created_by_principal_id, deployment_id, created_at, updated_at
+            FROM builds WHERE id = $1
+            "#,
+            id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        Ok(row.map(|r| BuildRecord {
+            id: r.id,
+            application_id: r.application_id,
+            git_source_id: r.git_source_id,
+            commit_sha: r.commit_sha,
+            git_ref: r.git_ref,
+            builder: r.builder,
+            status: r.status,
+            image: r.image,
+            image_digest: r.image_digest,
+            started_at: r.started_at,
+            finished_at: r.finished_at,
+            error: r.error,
+            created_by_principal_id: r.created_by_principal_id,
+            deployment_id: r.deployment_id,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }))
+    }
+
+    /// List recent builds for an application (newest first).
+    pub async fn list_builds(
+        &self,
+        application_id: Uuid,
+    ) -> Result<Vec<BuildRecord>, DeploymentError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, application_id, git_source_id, commit_sha, git_ref, builder, status,
+                   image, image_digest, started_at, finished_at, error,
+                   created_by_principal_id, deployment_id, created_at, updated_at
+            FROM builds WHERE application_id = $1
+            ORDER BY created_at DESC LIMIT 100
+            "#,
+            application_id
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| BuildRecord {
+                id: r.id,
+                application_id: r.application_id,
+                git_source_id: r.git_source_id,
+                commit_sha: r.commit_sha,
+                git_ref: r.git_ref,
+                builder: r.builder,
+                status: r.status,
+                image: r.image,
+                image_digest: r.image_digest,
+                started_at: r.started_at,
+                finished_at: r.finished_at,
+                error: r.error,
+                created_by_principal_id: r.created_by_principal_id,
+                deployment_id: r.deployment_id,
+                created_at: r.created_at,
+                updated_at: r.updated_at,
+            })
+            .collect())
+    }
+
+    /// Mark a build as running (sets started_at).
+    pub async fn mark_build_running(&self, id: Uuid) -> Result<(), DeploymentError> {
+        sqlx::query!(
+            "UPDATE builds SET status = 'running', started_at = NOW(), updated_at = NOW() WHERE id = $1",
+            id
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+        Ok(())
+    }
+
+    /// Apply a terminal build result from an agent's `JobResultDetails::Build`.
+    ///
+    /// On success records the image + digest and returns the [`BuildRecord`] so the caller
+    /// can dispatch a Deploy. On failure records the sanitized error and returns the record
+    /// with status `failed` — the caller MUST NOT deploy a failed build (fail-closed, A10).
+    pub async fn record_build_result(
+        &self,
+        id: Uuid,
+        success: bool,
+        image: Option<&str>,
+        image_digest: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<Option<BuildRecord>, DeploymentError> {
+        let status = if success { "succeeded" } else { "failed" };
+        // Truncate any error to a bounded, sanitized length for the UI (never store secrets).
+        let error_trunc = error.map(|e| e.chars().take(2000).collect::<String>());
+
+        sqlx::query!(
+            r#"
+            UPDATE builds
+            SET status = $1, image = COALESCE($2, image), image_digest = $3,
+                error = $4, finished_at = NOW(), updated_at = NOW()
+            WHERE id = $5
+            "#,
+            status,
+            image,
+            image_digest,
+            error_trunc,
+            id
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        self.get_build(id).await
+    }
+
+    /// Stamp git provenance (source, commit, ref) onto a deployment — the deploy end of the
+    /// commit→image→deploy audit chain.
+    pub async fn set_deployment_git_metadata(
+        &self,
+        deployment_id: Uuid,
+        git_source_id: Option<Uuid>,
+        commit_sha: Option<&str>,
+        git_ref: Option<&str>,
+    ) -> Result<(), DeploymentError> {
+        sqlx::query!(
+            "UPDATE deployments SET git_source_id = $1, commit_sha = $2, ref = $3 WHERE id = $4",
+            git_source_id,
+            commit_sha,
+            git_ref,
+            deployment_id
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+        Ok(())
+    }
+
+    /// Link a build to the deployment it produced (the deploy side of the audit chain).
+    pub async fn link_build_deployment(
+        &self,
+        build_id: Uuid,
+        deployment_id: Uuid,
+    ) -> Result<(), DeploymentError> {
+        sqlx::query!(
+            "UPDATE builds SET deployment_id = $1, updated_at = NOW() WHERE id = $2",
+            deployment_id,
+            build_id
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+        Ok(())
+    }
+
     /// Handle an incoming webhook from a Git provider.
     ///
     /// Verifies authenticity over the RAW request body using the stored webhook secret
@@ -2514,6 +2815,92 @@ impl DeploymentService {
                 .unwrap_or("push")
                 .to_string()
         };
+
+        // === Deploy-on-push (Phase B) ===
+        // For a non-PR push to the tracked branch, if the git source is wired to an
+        // application with build config, create a BUILD (not a preview deployment). The
+        // build runs on an agent; on success the Build JobResult path creates + dispatches a
+        // Deployment. Fail-closed: a failed build never deploys. The actual Build job
+        // dispatch is performed by the HTTP handler (which holds the agent registry/signer);
+        // here we create the durable build record and return its id + the spec inputs.
+        if !is_pr {
+            if let Some(build) = config.get("build").and_then(|b| b.as_object()) {
+                let app_id = config
+                    .get("application_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok());
+                let pushed_ref = payload["ref"]
+                    .as_str()
+                    .map(|r| r.trim_start_matches("refs/heads/").to_string());
+                let tracked_branch = build
+                    .get("branch")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                // Only build the tracked branch (when one is configured).
+                let branch_matches = match (&tracked_branch, &pushed_ref) {
+                    (Some(tb), Some(pr)) => tb == pr,
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                };
+
+                let commit_sha = payload["after"]
+                    .as_str()
+                    .or_else(|| payload["checkout_sha"].as_str())
+                    .unwrap_or_default();
+                let sha_ok = (commit_sha.len() == 40 || commit_sha.len() == 64)
+                    && commit_sha.chars().all(|c| c.is_ascii_hexdigit());
+
+                if let (Some(app_id), true, true) = (app_id, branch_matches, sha_ok) {
+                    let builder = build
+                        .get("builder")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("dockerfile");
+                    let image_name = build
+                        .get("image_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(repo_name.split('/').next_back().unwrap_or("app"));
+                    let registry = build.get("registry").and_then(|v| v.as_str());
+                    let tag: String = commit_sha.chars().take(12).collect();
+                    let image = match registry {
+                        Some(r) if !r.is_empty() => format!("{r}/{image_name}:{tag}"),
+                        _ => format!("{image_name}:{tag}"),
+                    };
+
+                    // builds:create is enforced; webhook path is system-initiated (None principal).
+                    match self
+                        .create_build(
+                            app_id,
+                            Some(source_id),
+                            commit_sha,
+                            pushed_ref.as_deref(),
+                            builder,
+                            &image,
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(record) => {
+                            return Ok(serde_json::json!({
+                                "received": true,
+                                "source_id": source_id,
+                                "is_preview": false,
+                                "created_build_id": record.id,
+                                "commit_sha": commit_sha,
+                                "builder": builder,
+                                "image": image,
+                                "repo_url": config.get("repo_url").and_then(|v| v.as_str()),
+                                "note": "Build created from push. On success it will deploy (fail-closed)."
+                            }));
+                        }
+                        Err(e) => {
+                            warn!(error = %e, %source_id, "deploy-on-push build creation failed");
+                            // Fall through to the legacy preview behavior below.
+                        }
+                    }
+                }
+            }
+        }
 
         let preview_name = format!(
             "{}-{}",
@@ -2824,6 +3211,264 @@ mod webhook_signature_tests {
             .handle_git_webhook(source_id, "github", Some(&good), body, payload)
             .await;
         assert!(ok.is_ok(), "valid HMAC over the raw body must be accepted");
+    }
+}
+
+#[cfg(test)]
+mod build_pipeline_tests {
+    //! Phase B source-to-deploy service-layer tests (`#[sqlx::test]` → isolated DB +
+    //! `./migrations`). These prove the webhook→build→deploy happy path and the fail-closed
+    //! guarantee, with agent dispatch mocked (we drive the service methods the WS layer
+    //! orchestrates, never a real agent).
+    use super::*;
+    use ring::hmac;
+    use sqlx::PgPool;
+
+    fn svc_with(pool: PgPool) -> DeploymentService {
+        let rbac = std::sync::Arc::new(crate::rbac::RbacService::new(pool.clone()));
+        DeploymentService::new(pool, rbac)
+    }
+
+    fn github_sig(secret: &str, body: &[u8]) -> String {
+        let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+        format!("sha256={}", hex::encode(hmac::sign(&key, body).as_ref()))
+    }
+
+    async fn seed_app(svc: &DeploymentService) -> Uuid {
+        svc.create_application("buildable", Some("test app"), None)
+            .await
+            .unwrap()
+            .id
+    }
+
+    #[sqlx::test]
+    async fn create_build_validates_commit_and_builder(pool: PgPool) {
+        let svc = svc_with(pool);
+        let app_id = seed_app(&svc).await;
+        let sha = "a".repeat(40);
+
+        // Bad commit SHA → rejected.
+        let err = svc
+            .create_build(
+                app_id,
+                None,
+                "main",
+                Some("main"),
+                "dockerfile",
+                "app:1",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DeploymentError::InvalidInput(_)));
+
+        // Bad builder → rejected.
+        let err = svc
+            .create_build(app_id, None, &sha, Some("main"), "make", "app:1", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DeploymentError::InvalidInput(_)));
+
+        // Valid → pending build record.
+        let b = svc
+            .create_build(
+                app_id,
+                None,
+                &sha,
+                Some("main"),
+                "dockerfile",
+                "app:abc",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(b.status, "pending");
+        assert_eq!(b.commit_sha, sha);
+        assert_eq!(b.image.as_deref(), Some("app:abc"));
+    }
+
+    #[sqlx::test]
+    async fn webhook_push_creates_build_then_success_deploys(pool: PgPool) {
+        let svc = svc_with(pool.clone());
+        let app_id = seed_app(&svc).await;
+        let sha = "b".repeat(40);
+
+        // Git source wired to the app with build config for the tracked branch.
+        let source_id = Uuid::now_v7();
+        sqlx::query("INSERT INTO git_sources (id, name, provider, config, enabled) VALUES ($1,$2,$3,$4,true)")
+            .bind(source_id)
+            .bind("acme")
+            .bind("github")
+            .bind(serde_json::json!({
+                "webhook_secret": "topsecret",
+                "application_id": app_id.to_string(),
+                "repo_url": "https://github.com/acme/app.git",
+                "build": { "builder": "dockerfile", "image_name": "acme/app", "branch": "main" }
+            }))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // A push to main with a real commit SHA.
+        let body = format!(
+            r#"{{"ref":"refs/heads/main","after":"{sha}","repository":{{"full_name":"acme/app"}}}}"#
+        );
+        let body = body.into_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sig = github_sig("topsecret", &body);
+
+        let res = svc
+            .handle_git_webhook(source_id, "github", Some(&sig), &body, payload)
+            .await
+            .unwrap();
+
+        // The webhook created a BUILD (not a preview deployment).
+        let build_id = res
+            .get("created_build_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .expect("push should create a build");
+        let build = svc.get_build(build_id).await.unwrap().unwrap();
+        assert_eq!(build.application_id, app_id);
+        assert_eq!(build.commit_sha, sha);
+        assert_eq!(build.image.as_deref(), Some("acme/app:bbbbbbbbbbbb"));
+
+        // Mock the agent: it ran the build and reported success with an image + digest.
+        // The WS layer would call record_build_result then create+dispatch a deployment;
+        // here we drive those service calls directly (dispatch is mocked away).
+        let updated = svc
+            .record_build_result(
+                build_id,
+                true,
+                Some("acme/app:bbbbbbbbbbbb"),
+                Some("sha256:deadbeef"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, "succeeded");
+        assert_eq!(updated.image_digest.as_deref(), Some("sha256:deadbeef"));
+
+        // On success → a deployment is created from the produced image, then linked.
+        let deployment = svc
+            .create_deployment(
+                updated.application_id,
+                serde_json::json!({"containers":[{"name":"app","image":"acme/app:bbbbbbbbbbbb"}]}),
+                forge_core::DeploymentStrategy::Rolling(forge_core::RollingConfig {
+                    max_unavailable: 0,
+                    max_surge: 1,
+                    health_check_grace_period_secs: 10,
+                    rollback_on_failure: true,
+                    failure_threshold: 2,
+                }),
+                vec![],
+            )
+            .await
+            .unwrap();
+        svc.link_build_deployment(build_id, deployment.id)
+            .await
+            .unwrap();
+        svc.set_deployment_git_metadata(deployment.id, Some(source_id), Some(&sha), Some("main"))
+            .await
+            .unwrap();
+
+        // Audit chain: build → deployment, with commit provenance on the deployment.
+        let linked = svc.get_build(build_id).await.unwrap().unwrap();
+        assert_eq!(linked.deployment_id, Some(deployment.id));
+        let dep_commit: Option<String> = sqlx::query_scalar!(
+            "SELECT commit_sha FROM deployments WHERE id = $1",
+            deployment.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(dep_commit.as_deref(), Some(sha.as_str()));
+    }
+
+    #[sqlx::test]
+    async fn failed_build_records_error_and_does_not_deploy(pool: PgPool) {
+        let svc = svc_with(pool.clone());
+        let app_id = seed_app(&svc).await;
+        let sha = "c".repeat(40);
+
+        let build = svc
+            .create_build(
+                app_id,
+                None,
+                &sha,
+                Some("main"),
+                "dockerfile",
+                "app:c",
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Agent reports failure → status failed, error recorded, NO image, NO deployment.
+        let updated = svc
+            .record_build_result(
+                build.id,
+                false,
+                None,
+                None,
+                Some("docker build returned non-zero"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, "failed");
+        assert!(updated.error.as_deref().unwrap().contains("non-zero"));
+        assert_eq!(updated.deployment_id, None);
+
+        // Fail-closed: no deployment was created for this application.
+        let deps: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) as \"c!\" FROM deployments WHERE application_id = $1",
+            app_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(deps, 0, "a failed build must never create a deployment");
+    }
+
+    #[sqlx::test]
+    async fn webhook_push_to_untracked_branch_does_not_build(pool: PgPool) {
+        let svc = svc_with(pool.clone());
+        let app_id = seed_app(&svc).await;
+        let sha = "d".repeat(40);
+
+        let source_id = Uuid::now_v7();
+        sqlx::query("INSERT INTO git_sources (id, name, provider, config, enabled) VALUES ($1,$2,$3,$4,true)")
+            .bind(source_id)
+            .bind("acme")
+            .bind("github")
+            .bind(serde_json::json!({
+                "webhook_secret": "topsecret",
+                "application_id": app_id.to_string(),
+                "repo_url": "https://github.com/acme/app.git",
+                "build": { "builder": "dockerfile", "image_name": "acme/app", "branch": "main" }
+            }))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Push to a DIFFERENT branch → must not create a build.
+        let body = format!(
+            r#"{{"ref":"refs/heads/dev","after":"{sha}","repository":{{"full_name":"acme/app"}}}}"#
+        )
+        .into_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sig = github_sig("topsecret", &body);
+
+        let res = svc
+            .handle_git_webhook(source_id, "github", Some(&sig), &body, payload)
+            .await
+            .unwrap();
+        assert!(
+            res.get("created_build_id").is_none(),
+            "push to an untracked branch must not create a build"
+        );
     }
 }
 

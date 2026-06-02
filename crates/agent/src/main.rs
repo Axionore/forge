@@ -286,8 +286,10 @@ async fn run_agent(
 
                 info!(job_id = %job_id, "Job signature and attestation verified successfully");
 
-                // Pass the agent's age identity so deploy jobs can decrypt secrets (Tier 3-2)
-                let result = execute_job(signed_job.job, docker, None, age_identity.as_ref()).await;
+                // Pass the agent's age identity so deploy jobs can decrypt secrets (Tier 3-2),
+                // and the outbound WS sender so Build jobs can stream redacted logs (Phase B).
+                let log_sink = receiver.outbound_sender();
+                let result = execute_job(signed_job.job, docker, log_sink, age_identity.as_ref()).await;
 
                 if result.success {
                     info!(job_id = %job_id, correlation = %result.correlation_id, "Job executed successfully");

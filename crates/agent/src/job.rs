@@ -344,13 +344,14 @@ pub enum Job {
     /// Deploy job using that image.
     Build {
         build_id: Uuid,
-        /// What to build (dockerfile, buildpack, etc.)
+        /// What to build. The source (git url + pinned commit SHA), builder, output image,
+        /// build args, and build secrets all live on the `BuildSpec` (Phase B).
         spec: BuildSpec,
-        /// Optional git checkout to perform first (the agent will clone into a workspace dir)
-        git_checkout: Option<GitCheckout>,
-        /// Target image reference to tag the result with (control plane decides the name/tag)
+        /// Target image reference to tag the result with (control plane decides the name/tag).
+        /// This is the same as `spec.target_image()`; carried explicitly for the result
+        /// correlation and so the control plane can dispatch a Deploy without re-deriving it.
         target_image: String,
-        /// Optional registry auth for push (if the target_image requires it)
+        /// Optional registry auth for push (if the target_image requires it).
         #[serde(default)]
         registry_auth: Option<RegistryAuth>,
     },
@@ -418,6 +419,20 @@ pub enum JobResultDetails {
         /// Short log excerpt or error details for UI.
         message: Option<String>,
         db_type: String,
+    },
+    /// Result of a Build job (Phase B source-to-deploy). The control plane records the
+    /// image + digest and, on success, dispatches a Deploy using this image. On failure
+    /// `success` is false and `error_message` carries a sanitized reason (no secrets).
+    Build {
+        success: bool,
+        /// Fully-qualified image reference the build produced/tagged.
+        image: Option<String>,
+        /// Image digest (`sha256:...`) recorded after the build, if resolvable.
+        image_digest: Option<String>,
+        /// Whether the image was pushed to the configured registry.
+        pushed: bool,
+        /// Sanitized failure reason (never contains secrets or host paths).
+        error_message: Option<String>,
     },
     Generic {
         message: String,
