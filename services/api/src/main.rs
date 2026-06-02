@@ -34,6 +34,7 @@ mod agent_ws;
 mod deployment;
 mod enrollment;
 mod metrics;
+mod provisioning;
 mod rbac;
 mod xds;
 
@@ -86,6 +87,9 @@ struct AppState {
     /// This allows the control plane itself to decrypt tokens when performing provisioning actions.
     /// Should be provided via FORGE_HETZNER_CP_AGE_SECRET (or equivalent secure config).
     hetzner_cp_age_secret: Option<Arc<String>>,
+
+    /// Cloud provisioning service (Phase A.2): provider registry + provisioned_resources tracking.
+    provisioning_service: Arc<provisioning::ProvisioningService>,
 }
 
 /// Configuration for public-facing TLS (supports static certs or automatic Let's Encrypt via ACME).
@@ -227,6 +231,16 @@ async fn main() {
         .ok()
         .map(Arc::new);
 
+    // Cloud provisioning (Phase A.2): production provider registry resolves + decrypts
+    // stored credentials on demand. Tracks every created resource in provisioned_resources.
+    let provisioning_service = Arc::new(provisioning::ProvisioningService::new(
+        (*pool).clone(),
+        Arc::new(provisioning::ProviderRegistry::new(
+            (*pool).clone(),
+            hetzner_cp_age_secret.clone(),
+        )),
+    ));
+
     let xds_state = crate::xds::XdsState::new();
 
     // Create mTLS authority once at startup so we can auto-issue client certs during enrollment.
@@ -251,6 +265,7 @@ async fn main() {
         terminal_sessions: Arc::new(RwLock::new(HashMap::new())),
         rbac_service,
         hetzner_cp_age_secret,
+        provisioning_service,
     };
 
     // CORS for local dev UI (apps/web on :3001). In prod this is behind reverse proxy with proper origin allowlist.
@@ -343,9 +358,45 @@ async fn main() {
             "/applications/{app_id}/deploy-from-catalog",
             post(deploy_from_catalog),
         )
-        // A0-4 (first slice): Hetzner provider - minimal one-click server creation
+        // Phase A.2: unified cloud provisioning surface (all gated on RBAC cloud:provision).
+        .route("/admin/providers", get(list_providers))
+        .route("/admin/providers/{provider}/catalog", get(provider_catalog))
         .route(
-            "/admin/providers/hetzner/servers",
+            "/admin/providers/{provider}/servers",
+            post(provision_server),
+        )
+        .route(
+            "/admin/providers/{provider}/firewalls",
+            post(provision_firewall),
+        )
+        .route(
+            "/admin/providers/{provider}/networks",
+            post(provision_network),
+        )
+        .route(
+            "/admin/providers/{provider}/volumes",
+            post(provision_volume),
+        )
+        .route(
+            "/admin/providers/{provider}/load-balancers",
+            post(provision_load_balancer),
+        )
+        .route("/admin/providers/{provider}/ips", post(provision_ip))
+        .route(
+            "/admin/providers/{provider}/dns-records",
+            post(provision_dns_record),
+        )
+        .route(
+            "/admin/providers/{provider}/resources",
+            get(list_provider_resources),
+        )
+        .route(
+            "/admin/providers/{provider}/resources/{id}",
+            delete(delete_provider_resource),
+        )
+        // Backward-compatible alias for the original one-click Hetzner endpoint.
+        .route(
+            "/admin/providers/hetzner/servers/batch",
             post(create_hetzner_server),
         )
         // Dedicated Hetzner credential management (control-plane decryptable tokens)
@@ -899,13 +950,74 @@ struct ProblemDetail {
 enum ApiError {
     Unauthorized,
     Forbidden,
-    Validation { field: String, message: String },
+    Validation {
+        field: String,
+        message: String,
+    },
     BadRequest(String),
     Internal,
+    /// 404 — a tracked resource (or upstream resource) was not found.
+    NotFound,
+    /// 409 — a conflict; `detail` is a sanitized, operator-safe message.
+    Conflict(String),
+    /// 429 — upstream/provider rate limit. `retry_after_secs` becomes a Retry-After header.
+    RateLimited {
+        retry_after_secs: Option<u64>,
+    },
+    /// 501 — the selected provider does not implement this operation.
+    NotImplemented,
+    /// 502 — upstream provider returned an error we forward (sanitized) to the caller.
+    BadGateway {
+        detail: String,
+    },
+    /// 207 — a multi-step provision partially succeeded. The body carries the IDs that
+    /// were created and the subset that cleanup could not remove, so an operator can finish.
+    PartialFailure {
+        message: String,
+        created_resource_ids: Vec<String>,
+        leftover_resource_ids: Vec<String>,
+    },
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // 207 carries a richer body (the leftover IDs an operator needs); handle it first.
+        if let ApiError::PartialFailure {
+            message,
+            created_resource_ids,
+            leftover_resource_ids,
+        } = self
+        {
+            let status = StatusCode::MULTI_STATUS;
+            let body = serde_json::json!({
+                "title": "Partial failure",
+                "status": status.as_u16(),
+                "detail": message,
+                "created_resource_ids": created_resource_ids,
+                "leftover_resource_ids": leftover_resource_ids,
+            });
+            return (status, Json(body)).into_response();
+        }
+
+        // 429 needs a Retry-After header when the provider supplied one.
+        if let ApiError::RateLimited { retry_after_secs } = self {
+            let status = StatusCode::TOO_MANY_REQUESTS;
+            let body = ProblemDetail {
+                title: Some("Rate limited".to_string()),
+                status: status.as_u16(),
+                detail: Some("Upstream provider rate limit; retry later".to_string()),
+                field: None,
+            };
+            let mut resp = (status, Json(body)).into_response();
+            if let Some(secs) = retry_after_secs {
+                if let Ok(val) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                    resp.headers_mut()
+                        .insert(axum::http::header::RETRY_AFTER, val);
+                }
+            }
+            return resp;
+        }
+
         let (status, title, detail, field) = match self {
             ApiError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
@@ -926,7 +1038,28 @@ impl IntoResponse for ApiError {
                 Some(field),
             ),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "Bad request", Some(msg), None),
+            ApiError::NotFound => (StatusCode::NOT_FOUND, "Not found", None, None),
+            ApiError::Conflict(msg) => (StatusCode::CONFLICT, "Conflict", Some(msg), None),
+            ApiError::NotImplemented => (
+                StatusCode::NOT_IMPLEMENTED,
+                "Not implemented",
+                Some("This provider does not support the requested operation".to_string()),
+                None,
+            ),
+            ApiError::BadGateway { detail } => (
+                StatusCode::BAD_GATEWAY,
+                "Upstream provider error",
+                Some(detail),
+                None,
+            ),
             ApiError::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error",
+                None,
+                None,
+            ),
+            // Handled above; unreachable but keeps the match total.
+            ApiError::RateLimited { .. } | ApiError::PartialFailure { .. } => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal server error",
                 None,
@@ -942,6 +1075,71 @@ impl IntoResponse for ApiError {
         };
 
         (status, Json(body)).into_response()
+    }
+}
+
+/// Map a `ProvisionError` to an `ApiError`, never leaking tokens or raw upstream text beyond
+/// what the typed provider error already sanitizes. Logs internally for diagnosis.
+impl From<provisioning::ProvisionError> for ApiError {
+    fn from(e: provisioning::ProvisionError) -> Self {
+        use forge_providers::ProviderError as PE;
+        use provisioning::ProvisionError as ProvE;
+        match e {
+            ProvE::UnknownProvider => ApiError::BadRequest("unknown provider".into()),
+            ProvE::CredentialUnavailable(msg) => ApiError::Validation {
+                field: "credential".into(),
+                message: msg,
+            },
+            ProvE::InvalidInput(msg) => ApiError::Validation {
+                field: "input".into(),
+                message: msg,
+            },
+            ProvE::NotFound => ApiError::NotFound,
+            ProvE::Conflict(msg) => ApiError::Conflict(msg),
+            ProvE::Provider(pe) => match pe {
+                PE::NotImplemented => ApiError::NotImplemented,
+                PE::NotFound(_) => ApiError::NotFound,
+                PE::InvalidRequest(msg) => ApiError::Validation {
+                    field: "request".into(),
+                    message: msg,
+                },
+                PE::RateLimited { retry_after_secs } => ApiError::RateLimited { retry_after_secs },
+                PE::Api { status, code, .. } => {
+                    // Forward the upstream HTTP status when it is a usable client/server code;
+                    // otherwise 502. Never echo the provider's raw message (may carry detail).
+                    warn!(upstream_status = status, upstream_code = %code, "provider API error");
+                    match StatusCode::from_u16(status) {
+                        Ok(s) if s.is_client_error() || s.is_server_error() => {
+                            ApiError::BadGateway {
+                                detail: format!("upstream provider returned {status}"),
+                            }
+                        }
+                        _ => ApiError::BadGateway {
+                            detail: "upstream provider error".into(),
+                        },
+                    }
+                }
+                PE::PartialFailure {
+                    message,
+                    created_resource_ids,
+                    leftover_resource_ids,
+                } => ApiError::PartialFailure {
+                    message,
+                    created_resource_ids,
+                    leftover_resource_ids,
+                },
+                PE::Http(_) | PE::Timeout(_) | PE::ActionFailed(_) => {
+                    warn!("provider transport/timeout/action error");
+                    ApiError::BadGateway {
+                        detail: "upstream provider unavailable".into(),
+                    }
+                }
+            },
+            ProvE::Internal(err) => {
+                warn!(error = %err, "provisioning internal error");
+                ApiError::Internal
+            }
+        }
     }
 }
 
@@ -2511,6 +2709,326 @@ async fn deploy_from_catalog(
 }
 
 // =====================================================================
+// Phase A.2: Unified cloud provisioning handlers
+//
+// All routes are mounted under the /admin router (bootstrap X-Admin-Token gate) AND
+// individually enforce RBAC `cloud:provision` (default-deny via enforce_action). The
+// bootstrap path passes principal_id=None and is allowed; an issued operator token that
+// resolves to a real principal without the permission is rejected with 403.
+// =====================================================================
+
+/// Default-deny gate shared by every provisioning handler. `None` principal = bootstrap.
+async fn require_cloud_provision(state: &AppState) -> Result<(), ApiError> {
+    state
+        .deployment_service
+        .enforce_action(None, "cloud:provision")
+        .await
+        .map_err(|_| ApiError::Forbidden)
+}
+
+async fn list_providers(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_cloud_provision(&state).await?;
+    Ok(Json(serde_json::json!({
+        "providers": state.provisioning_service.list_providers(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct CatalogQuery {
+    #[serde(default)]
+    credential_id: Option<Uuid>,
+}
+
+async fn provider_catalog(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    Query(q): Query<CatalogQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_cloud_provision(&state).await?;
+    let catalog = state
+        .provisioning_service
+        .catalog(&provider, q.credential_id)
+        .await?;
+    Ok(Json(catalog))
+}
+
+#[derive(Deserialize)]
+struct ProvisionServerBody {
+    #[serde(default)]
+    credential_id: Option<Uuid>,
+    #[serde(flatten)]
+    spec: provisioning::ServerProvisionInput,
+    /// Control-plane URL injected into the agent enrollment cloud-init. Defaults to the
+    /// local CP. When `spec.user_data` is supplied it is used verbatim instead.
+    #[serde(default)]
+    control_plane_url: Option<String>,
+    #[serde(default)]
+    token_description: Option<String>,
+}
+
+async fn provision_server(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    Json(body): Json<ProvisionServerBody>,
+) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
+    require_cloud_provision(&state).await?;
+
+    let mut spec = body.spec;
+
+    // When the caller did not supply explicit user-data, generate a one-time enrollment
+    // token and embed the agent cloud-init so the provisioned server auto-enrolls.
+    if spec.user_data.is_none() {
+        let cp_url = body
+            .control_plane_url
+            .unwrap_or_else(|| "http://localhost:3000".to_string());
+        let token_desc = body
+            .token_description
+            .unwrap_or_else(|| format!("Auto-generated for {provider} server {}", spec.name));
+        let enrollment = state
+            .enrollment_service
+            .create_enrollment_token(Some(token_desc), Some(7), Some(1))
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        spec.user_data = Some(forge_provider_hetzner::build_agent_cloud_init(
+            &cp_url,
+            &enrollment.raw_token,
+            Some(&spec.name),
+        ));
+    }
+
+    let resource = state
+        .provisioning_service
+        .provision_server(&provider, body.credential_id, spec, None)
+        .await?;
+    Ok((StatusCode::CREATED, Json(resource)))
+}
+
+#[derive(Deserialize)]
+struct ProvisionFirewallBody {
+    #[serde(default)]
+    credential_id: Option<Uuid>,
+    name: String,
+    #[serde(default)]
+    rules: Vec<provisioning::FirewallRuleInput>,
+    #[serde(default)]
+    application_id: Option<Uuid>,
+}
+
+async fn provision_firewall(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    Json(body): Json<ProvisionFirewallBody>,
+) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
+    require_cloud_provision(&state).await?;
+    let resource = state
+        .provisioning_service
+        .create_firewall(
+            &provider,
+            body.credential_id,
+            &body.name,
+            body.rules,
+            body.application_id,
+            None,
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(resource)))
+}
+
+#[derive(Deserialize)]
+struct ProvisionNetworkBody {
+    #[serde(default)]
+    credential_id: Option<Uuid>,
+    name: String,
+    ip_range: String,
+    #[serde(default)]
+    application_id: Option<Uuid>,
+}
+
+async fn provision_network(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    Json(body): Json<ProvisionNetworkBody>,
+) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
+    require_cloud_provision(&state).await?;
+    let resource = state
+        .provisioning_service
+        .create_network(
+            &provider,
+            body.credential_id,
+            &body.name,
+            &body.ip_range,
+            body.application_id,
+            None,
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(resource)))
+}
+
+#[derive(Deserialize)]
+struct ProvisionVolumeBody {
+    #[serde(default)]
+    credential_id: Option<Uuid>,
+    name: String,
+    size_gb: u64,
+    region: String,
+    #[serde(default)]
+    application_id: Option<Uuid>,
+}
+
+async fn provision_volume(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    Json(body): Json<ProvisionVolumeBody>,
+) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
+    require_cloud_provision(&state).await?;
+    let resource = state
+        .provisioning_service
+        .create_volume(
+            &provider,
+            body.credential_id,
+            &body.name,
+            body.size_gb,
+            &body.region,
+            body.application_id,
+            None,
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(resource)))
+}
+
+#[derive(Deserialize)]
+struct ProvisionLoadBalancerBody {
+    #[serde(default)]
+    credential_id: Option<Uuid>,
+    name: String,
+    region: String,
+    #[serde(default)]
+    services: Vec<forge_providers::LbService>,
+    #[serde(default)]
+    application_id: Option<Uuid>,
+}
+
+async fn provision_load_balancer(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    Json(body): Json<ProvisionLoadBalancerBody>,
+) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
+    require_cloud_provision(&state).await?;
+    let resource = state
+        .provisioning_service
+        .create_load_balancer(
+            &provider,
+            body.credential_id,
+            &body.name,
+            &body.region,
+            body.services,
+            body.application_id,
+            None,
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(resource)))
+}
+
+#[derive(Deserialize)]
+struct ProvisionIpBody {
+    #[serde(default)]
+    credential_id: Option<Uuid>,
+    region: String,
+    #[serde(default)]
+    ipv6: bool,
+    #[serde(default)]
+    application_id: Option<Uuid>,
+}
+
+async fn provision_ip(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    Json(body): Json<ProvisionIpBody>,
+) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
+    require_cloud_provision(&state).await?;
+    let resource = state
+        .provisioning_service
+        .allocate_ip(
+            &provider,
+            body.credential_id,
+            &body.region,
+            body.ipv6,
+            body.application_id,
+            None,
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(resource)))
+}
+
+#[derive(Deserialize)]
+struct ProvisionDnsBody {
+    #[serde(default)]
+    credential_id: Option<Uuid>,
+    /// Zone id or domain (a value containing a dot is resolved via `dns_ensure_zone`).
+    zone: String,
+    record_type: forge_providers::DnsRecordType,
+    name: String,
+    value: String,
+    #[serde(default)]
+    ttl: Option<u32>,
+    #[serde(default)]
+    application_id: Option<Uuid>,
+}
+
+async fn provision_dns_record(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    Json(body): Json<ProvisionDnsBody>,
+) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
+    require_cloud_provision(&state).await?;
+    let resource = state
+        .provisioning_service
+        .dns_upsert(
+            &provider,
+            body.credential_id,
+            &body.zone,
+            body.record_type,
+            &body.name,
+            &body.value,
+            body.ttl,
+            body.application_id,
+            None,
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(resource)))
+}
+
+async fn list_provider_resources(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_cloud_provision(&state).await?;
+    let resources = state.provisioning_service.list_resources(&provider).await?;
+    Ok(Json(serde_json::json!({ "resources": resources })))
+}
+
+#[derive(Deserialize)]
+struct DeleteResourceQuery {
+    #[serde(default)]
+    credential_id: Option<Uuid>,
+}
+
+async fn delete_provider_resource(
+    State(state): State<AppState>,
+    Path((provider, id)): Path<(String, Uuid)>,
+    Query(q): Query<DeleteResourceQuery>,
+) -> Result<Json<provisioning::ProvisionedResource>, ApiError> {
+    require_cloud_provision(&state).await?;
+    let resource = state
+        .provisioning_service
+        .delete_resource(&provider, id, q.credential_id)
+        .await?;
+    Ok(Json(resource))
+}
+
+// =====================================================================
 // A0-4 (first slice): Hetzner Provider handlers
 // =====================================================================
 
@@ -2554,6 +3072,14 @@ async fn create_hetzner_server(
     State(state): State<AppState>,
     Json(req): Json<CreateHetznerServerRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // RBAC default-deny: provisioning infra requires `cloud:provision`. The bootstrap
+    // X-Admin-Token path passes principal_id=None and is already authenticated upstream.
+    state
+        .deployment_service
+        .enforce_action(None, "cloud:provision")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     let count = req.count.unwrap_or(1).clamp(1, 20); // safety cap
     let cp_url = req
         .control_plane_url
