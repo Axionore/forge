@@ -14,6 +14,7 @@ import {
   ExternalLink,
   PanelLeftClose,
   PanelLeft,
+  Server,
   type LucideIcon,
 } from "lucide-react";
 
@@ -35,6 +36,10 @@ const NAV_GROUPS: NavGroup[] = [
       { href: "/admin/deployments", label: "Deployments", icon: Rocket },
       { href: "/admin/applications", label: "Applications", icon: Boxes },
     ],
+  },
+  {
+    label: "Infrastructure",
+    items: [{ href: "/admin/servers", label: "Servers", icon: Server }],
   },
   {
     label: "Operate",

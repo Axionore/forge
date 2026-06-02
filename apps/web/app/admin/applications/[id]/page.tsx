@@ -4,8 +4,21 @@ import React from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import * as Dialog from "@radix-ui/react-dialog";
+import * as Select from "@radix-ui/react-select";
 import { toast } from "sonner";
-import { Copy, X, Play, Pause, Clock } from "lucide-react";
+import {
+  Copy,
+  X,
+  Play,
+  Pause,
+  Clock,
+  Hammer,
+  ChevronDown,
+  Check,
+  Shield,
+  GitBranch,
+  Loader2,
+} from "lucide-react";
 import { StatusTimeline } from "../../../../components/StatusTimeline";
 import { useAdminToken } from "../../token-store";
 
@@ -58,6 +71,32 @@ interface CreateDeploymentRequest {
   targets: Array<{ agent_id: string; replicas: number }>;
   git_source_id?: string;
   ref?: string;
+}
+
+type BuildStatus = "pending" | "running" | "succeeded" | "failed" | "cancelled";
+
+type BuilderType = "nixpacks" | "dockerfile" | "compose";
+
+interface Build {
+  id: string;
+  application_id: string;
+  status: BuildStatus;
+  builder: BuilderType;
+  git_source_id?: string | null;
+  ref?: string | null;
+  commit_sha?: string | null;
+  image_digest?: string | null;
+  signed?: boolean | null;
+  provenance?: boolean | null;
+  created_at: string;
+  updated_at: string;
+  error?: string | null;
+}
+
+interface TriggerBuildRequest {
+  git_source_id?: string;
+  ref?: string;
+  builder: BuilderType;
 }
 
 export default function ApplicationDetailPage() {
@@ -280,6 +319,26 @@ export default function ApplicationDetailPage() {
   const pollIntervalRef = React.useRef<ReturnType<typeof setInterval> | null>(
     null,
   );
+
+  // ---- Builds state ----
+  const [builds, setBuilds] = React.useState<Build[]>([]);
+  const [buildsLoading, setBuildsLoading] = React.useState(false);
+  const [showNewBuild, setShowNewBuild] = React.useState(false);
+  const [buildGitSourceId, setBuildGitSourceId] = React.useState("");
+  const [buildRef, setBuildRef] = React.useState("main");
+  const [buildBuilder, setBuildBuilder] =
+    React.useState<BuilderType>("nixpacks");
+  const [isTriggering, setIsTriggering] = React.useState(false);
+  // Build log viewer
+  const [showBuildLogs, setShowBuildLogs] = React.useState(false);
+  const [activeBuild, setActiveBuild] = React.useState<Build | null>(null);
+  const [buildLogLines, setBuildLogLines] = React.useState<string[]>([]);
+  const [buildLogsWs, setBuildLogsWs] = React.useState<WebSocket | null>(null);
+  const [buildLogsStatus, setBuildLogsStatus] = React.useState<
+    "disconnected" | "connecting" | "connected" | "error"
+  >("disconnected");
+  const [buildLogsPaused, setBuildLogsPaused] = React.useState(false);
+  const buildLogsRef = React.useRef<HTMLDivElement>(null);
 
   const headers = React.useMemo(() => {
     const h = new Headers();
@@ -760,6 +819,161 @@ export default function ApplicationDetailPage() {
       if (logsWs) logsWs.close();
     };
   }, [logsWs]);
+
+  // ---- Builds helpers ----
+
+  const fetchBuilds = React.useCallback(async () => {
+    if (!adminToken || !appId) return;
+    setBuildsLoading(true);
+    try {
+      const res = await fetch(
+        `${API_BASE}/admin/applications/${appId}/builds`,
+        { headers },
+      );
+      if (!res.ok) throw new Error(`${res.status}`);
+      const data: Build[] = await res.json();
+      setBuilds(data);
+    } catch {
+      // non-fatal — backend may not have builds yet
+    } finally {
+      setBuildsLoading(false);
+    }
+  }, [adminToken, appId, headers]);
+
+  React.useEffect(() => {
+    if (adminToken && appId) void fetchBuilds();
+  }, [adminToken, appId, fetchBuilds]);
+
+  async function triggerBuild(e: React.FormEvent) {
+    e.preventDefault();
+    if (!adminToken || !appId) return;
+    setIsTriggering(true);
+    try {
+      const body: TriggerBuildRequest = { builder: buildBuilder };
+      if (buildGitSourceId) body.git_source_id = buildGitSourceId;
+      if (buildRef.trim()) body.ref = buildRef.trim();
+      const res = await fetch(
+        `${API_BASE}/admin/applications/${appId}/builds`,
+        { method: "POST", headers, body: JSON.stringify(body) },
+      );
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(
+          (err as { detail?: string }).detail ?? `Error ${res.status}`,
+        );
+      }
+      const created: Build = await res.json();
+      toast.success("Build triggered");
+      setShowNewBuild(false);
+      setBuilds((prev) => [created, ...prev]);
+      // Auto-open logs for the new build
+      openBuildLogs(created);
+    } catch (e: unknown) {
+      toast.error(e instanceof Error ? e.message : "Trigger failed");
+    } finally {
+      setIsTriggering(false);
+    }
+  }
+
+  function openBuildLogs(build: Build) {
+    if (buildLogsWs) buildLogsWs.close();
+    setActiveBuild(build);
+    setBuildLogLines([]);
+    setBuildLogsPaused(false);
+    setBuildLogsStatus("connecting");
+    setShowBuildLogs(true);
+
+    const ws = new WebSocket(
+      `ws://localhost:3000/admin/applications/${appId}/builds/${build.id}/logs/ws`,
+    );
+
+    ws.onopen = () => {
+      setBuildLogsStatus("connected");
+      const ts = new Date().toLocaleTimeString();
+      setBuildLogLines((prev) => [
+        ...prev,
+        `[${ts}] [connected] Streaming build logs...`,
+      ]);
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data as string) as Record<
+          string,
+          unknown
+        >;
+        let newLine: string | null = null;
+        if (typeof data["line"] === "string") {
+          const ts = new Date().toLocaleTimeString();
+          newLine = `[${ts}] ${data["line"]}`;
+        } else if (typeof event.data === "string") {
+          const ts = new Date().toLocaleTimeString();
+          newLine = `[${ts}] ${event.data}`;
+        }
+        if (newLine) {
+          setBuildLogLines((prev) => {
+            const next = [...prev.slice(-499), newLine!];
+            if (!buildLogsPaused && buildLogsRef.current) {
+              requestAnimationFrame(() => {
+                if (buildLogsRef.current)
+                  buildLogsRef.current.scrollTop =
+                    buildLogsRef.current.scrollHeight;
+              });
+            }
+            return next;
+          });
+        }
+      } catch {
+        const ts = new Date().toLocaleTimeString();
+        setBuildLogLines((prev) => [
+          ...prev.slice(-499),
+          `[${ts}] ${typeof event.data === "string" ? event.data : "[binary]"}`,
+        ]);
+      }
+    };
+
+    ws.onerror = () => setBuildLogsStatus("error");
+
+    ws.onclose = () => {
+      setBuildLogsStatus("disconnected");
+      const ts = new Date().toLocaleTimeString();
+      setBuildLogLines((prev) => [
+        ...prev,
+        `[${ts}] [closed] Log stream ended`,
+      ]);
+      setBuildLogsWs(null);
+    };
+
+    setBuildLogsWs(ws);
+  }
+
+  function closeBuildLogs() {
+    if (buildLogsWs) buildLogsWs.close();
+    setShowBuildLogs(false);
+    setActiveBuild(null);
+    setBuildLogLines([]);
+    setBuildLogsStatus("disconnected");
+  }
+
+  // Pause build logs scroll on manual scroll-up
+  React.useEffect(() => {
+    const el = buildLogsRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+      if (!nearBottom && !buildLogsPaused) setBuildLogsPaused(true);
+      if (nearBottom && buildLogsPaused) setBuildLogsPaused(false);
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [buildLogsPaused]);
+
+  // Cleanup build WS on unmount
+  React.useEffect(() => {
+    return () => {
+      buildLogsWs?.close();
+    };
+  }, [buildLogsWs]);
 
   if (!appId) {
     return <div className="p-12 text-center">Invalid application</div>;
@@ -1959,6 +2173,492 @@ export default function ApplicationDetailPage() {
           </p>
         </div>
       )}
+
+      {/* ---- Builds Section ---- */}
+      <div className="rounded-xl border border-[oklch(1_0_0/0.08)] bg-[oklch(0.185_0_0)]">
+        <div className="flex items-center justify-between border-b border-[oklch(1_0_0/0.07)] px-6 py-4">
+          <div className="flex items-center gap-2">
+            <Hammer className="h-4 w-4 text-[oklch(1_0_0/0.45)]" />
+            <span className="text-[13px] font-semibold tracking-tight">
+              Builds
+            </span>
+            {builds.length > 0 && (
+              <span className="rounded-[4px] border border-[oklch(1_0_0/0.08)] bg-[oklch(1_0_0/0.04)] px-1.5 py-px text-[10px] font-medium tabular-nums text-[oklch(1_0_0/0.45)]">
+                {builds.length}
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void fetchBuilds()}
+              className="btn btn-ghost btn-sm"
+              aria-label="Refresh builds"
+            >
+              {buildsLoading ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                "Refresh"
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                if (gitSources.length === 0) void fetchGitSources();
+                setShowNewBuild(true);
+              }}
+              className="btn btn-primary btn-sm"
+            >
+              <Hammer className="h-3.5 w-3.5" />
+              New Build
+            </button>
+          </div>
+        </div>
+
+        {/* Git source hint */}
+        {gitSources.length > 0 && (
+          <div className="flex items-center gap-2 border-b border-[oklch(1_0_0/0.05)] bg-[oklch(0.72_0.17_150/0.04)] px-6 py-2.5">
+            <GitBranch className="h-3.5 w-3.5 shrink-0 text-[var(--color-success)]" />
+            <span className="text-[11px] text-[oklch(1_0_0/0.45)]">
+              {gitSources.length === 1
+                ? `Git source connected: ${gitSources[0]?.name ?? gitSources[0]?.repo_url}`
+                : `${gitSources.length} git sources connected`}{" "}
+              — trigger a build to build from source and get a signed image
+              digest.
+            </span>
+          </div>
+        )}
+
+        {/* Builds list */}
+        {buildsLoading && builds.length === 0 ? (
+          <div className="space-y-px p-4">
+            {[1, 2, 3].map((i) => (
+              <div
+                key={i}
+                className="h-12 animate-pulse rounded-md border border-[oklch(1_0_0/0.06)] bg-[oklch(0.2_0_0)]"
+              />
+            ))}
+          </div>
+        ) : builds.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-14 text-center">
+            <Hammer className="mb-3 h-7 w-7 text-[oklch(1_0_0/0.2)]" />
+            <div className="text-[13px] font-medium text-[oklch(1_0_0/0.5)]">
+              No builds yet
+            </div>
+            <div className="mt-1 text-[11px] text-[oklch(1_0_0/0.3)]">
+              Trigger a build from a Git source to get a signed,
+              provenance-tracked image
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                if (gitSources.length === 0) void fetchGitSources();
+                setShowNewBuild(true);
+              }}
+              className="btn btn-primary btn-sm mt-5"
+            >
+              <Hammer className="h-3.5 w-3.5" />
+              New Build
+            </button>
+          </div>
+        ) : (
+          <ul className="divide-y divide-[oklch(1_0_0/0.05)]">
+            {builds.map((build, idx) => {
+              const statusDot =
+                build.status === "succeeded"
+                  ? "status-dot-healthy"
+                  : build.status === "running"
+                    ? "status-dot-progress"
+                    : build.status === "failed"
+                      ? "status-dot-failed"
+                      : "status-dot-pending";
+              const isPulse =
+                build.status === "succeeded" || build.status === "running";
+
+              return (
+                <li
+                  key={build.id}
+                  className="reveal flex items-center gap-3 px-6 py-3.5"
+                  style={{ animationDelay: `${idx * 25}ms` }}
+                >
+                  {/* Status dot */}
+                  <span
+                    className={`status-dot shrink-0 ${statusDot} ${isPulse ? "pulse-dot text-[var(--color-success)]" : ""}`}
+                  />
+
+                  {/* Builder chip */}
+                  <span className="inline-flex w-20 shrink-0 items-center justify-center rounded-[4px] border border-[oklch(1_0_0/0.08)] bg-[oklch(1_0_0/0.04)] px-1.5 py-px text-[10px] font-medium uppercase tracking-wide text-[oklch(1_0_0/0.5)]">
+                    {build.builder}
+                  </span>
+
+                  {/* Commit SHA + ref */}
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono text-[12px] text-[oklch(0.97_0_0)]">
+                        {build.commit_sha
+                          ? build.commit_sha.slice(0, 7)
+                          : build.id.slice(0, 7)}
+                      </span>
+                      {build.ref && (
+                        <span className="flex items-center gap-1 text-[11px] text-[oklch(1_0_0/0.38)]">
+                          <GitBranch className="h-3 w-3" />
+                          {build.ref}
+                        </span>
+                      )}
+                    </div>
+                    <div className="mt-0.5 text-[10px] text-[oklch(1_0_0/0.3)] tabular-nums">
+                      {new Date(build.created_at).toLocaleString()}
+                    </div>
+                  </div>
+
+                  {/* Supply-chain badge */}
+                  {(build.signed ?? false) && (
+                    <div
+                      title={
+                        (build.provenance ?? false)
+                          ? "Signed + provenance attestation present"
+                          : "Image signed"
+                      }
+                      className={`inline-flex items-center gap-1 rounded-[4px] border px-2 py-px text-[10px] font-semibold ${
+                        (build.provenance ?? false)
+                          ? "border-[oklch(0.72_0.17_150/0.35)] bg-[oklch(0.72_0.17_150/0.08)] text-[var(--color-success)]"
+                          : "border-[oklch(1_0_0/0.12)] bg-[oklch(1_0_0/0.05)] text-[oklch(1_0_0/0.55)]"
+                      }`}
+                    >
+                      <Shield className="h-3 w-3" />
+                      {(build.provenance ?? false)
+                        ? "signed + provenance"
+                        : "signed"}
+                    </div>
+                  )}
+
+                  {/* Status text */}
+                  <span className="w-20 shrink-0 text-right text-[11px] capitalize text-[oklch(1_0_0/0.4)]">
+                    {build.status}
+                  </span>
+
+                  {/* Logs button */}
+                  <button
+                    type="button"
+                    onClick={() => openBuildLogs(build)}
+                    className="btn btn-ghost btn-sm shrink-0"
+                    aria-label={`View logs for build ${build.id.slice(0, 7)}`}
+                  >
+                    Logs
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+
+      {/* ---- New Build Dialog ---- */}
+      <Dialog.Root open={showNewBuild} onOpenChange={setShowNewBuild}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm" />
+          <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-full max-w-lg -translate-x-1/2 -translate-y-1/2 rounded-xl border border-[oklch(1_0_0/0.1)] bg-[oklch(0.185_0_0)] p-7 shadow-2xl focus:outline-none">
+            <div className="mb-5 flex items-center justify-between">
+              <Dialog.Title className="text-base font-semibold tracking-tight">
+                Trigger Build
+              </Dialog.Title>
+              <Dialog.Close asChild>
+                <button
+                  aria-label="Close"
+                  className="grid h-7 w-7 place-items-center rounded-md text-[oklch(1_0_0/0.4)] transition-colors hover:bg-[oklch(1_0_0/0.07)] hover:text-[oklch(0.97_0_0)]"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </Dialog.Close>
+            </div>
+
+            <form onSubmit={(e) => void triggerBuild(e)} className="space-y-4">
+              {/* Git source */}
+              <div>
+                <label className="mb-1.5 block text-[12px] font-medium text-[oklch(1_0_0/0.55)]">
+                  Git source{" "}
+                  <span className="font-normal text-[oklch(1_0_0/0.3)]">
+                    (optional)
+                  </span>
+                </label>
+                {gitSources.length > 0 ? (
+                  <Select.Root
+                    value={buildGitSourceId}
+                    onValueChange={setBuildGitSourceId}
+                  >
+                    <Select.Trigger
+                      className="select flex items-center justify-between"
+                      aria-label="Select git source"
+                    >
+                      <Select.Value placeholder="Select git source…" />
+                      <Select.Icon>
+                        <ChevronDown className="h-3.5 w-3.5 text-[oklch(1_0_0/0.4)]" />
+                      </Select.Icon>
+                    </Select.Trigger>
+                    <Select.Portal>
+                      <Select.Content className="z-[200] overflow-hidden rounded-lg border border-[oklch(1_0_0/0.1)] bg-[oklch(0.2_0_0)] shadow-xl">
+                        <Select.Viewport className="p-1">
+                          <Select.Item
+                            value=""
+                            className="flex cursor-pointer items-center rounded-md px-3 py-2 text-[13px] text-[oklch(1_0_0/0.45)] outline-none hover:bg-[oklch(1_0_0/0.07)] focus:bg-[oklch(1_0_0/0.07)]"
+                          >
+                            <Select.ItemText>
+                              None (manual build)
+                            </Select.ItemText>
+                          </Select.Item>
+                          {gitSources.map((gs) => (
+                            <Select.Item
+                              key={gs.id}
+                              value={gs.id}
+                              className="flex cursor-pointer items-center rounded-md px-3 py-2 text-[13px] outline-none hover:bg-[oklch(1_0_0/0.07)] focus:bg-[oklch(1_0_0/0.07)]"
+                            >
+                              <Select.ItemText>
+                                {gs.name} — {gs.repo_url}
+                              </Select.ItemText>
+                              <Select.ItemIndicator className="ml-auto">
+                                <Check className="h-3 w-3" />
+                              </Select.ItemIndicator>
+                            </Select.Item>
+                          ))}
+                        </Select.Viewport>
+                      </Select.Content>
+                    </Select.Portal>
+                  </Select.Root>
+                ) : (
+                  <div className="rounded-md border border-[oklch(1_0_0/0.08)] bg-[oklch(1_0_0/0.03)] px-3 py-2 text-[12px] text-[oklch(1_0_0/0.38)]">
+                    No git sources connected yet — builds will run without a
+                    source checkout
+                  </div>
+                )}
+              </div>
+
+              {/* Ref */}
+              <div>
+                <label className="mb-1.5 block text-[12px] font-medium text-[oklch(1_0_0/0.55)]">
+                  Branch / tag / commit
+                </label>
+                <input
+                  value={buildRef}
+                  onChange={(e) => setBuildRef(e.target.value)}
+                  className="input font-mono"
+                  placeholder="main"
+                  aria-label="Git ref"
+                />
+              </div>
+
+              {/* Builder */}
+              <div>
+                <label className="mb-1.5 block text-[12px] font-medium text-[oklch(1_0_0/0.55)]">
+                  Builder
+                </label>
+                <div className="flex gap-2">
+                  {(["nixpacks", "dockerfile", "compose"] as const).map((b) => (
+                    <button
+                      key={b}
+                      type="button"
+                      onClick={() => setBuildBuilder(b)}
+                      className={`btn btn-sm flex-1 capitalize ${buildBuilder === b ? "btn-primary" : "btn-ghost"}`}
+                    >
+                      {b}
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-1 text-[11px] text-[oklch(1_0_0/0.35)]">
+                  {buildBuilder === "nixpacks" &&
+                    "Auto-detects language and builds a container image via Nixpacks."}
+                  {buildBuilder === "dockerfile" &&
+                    "Builds from a Dockerfile in the repo root (or specified path)."}
+                  {buildBuilder === "compose" &&
+                    "Builds all services defined in docker-compose.yml."}
+                </p>
+              </div>
+
+              <div className="flex justify-end gap-2 border-t border-[oklch(1_0_0/0.07)] pt-4">
+                <Dialog.Close asChild>
+                  <button type="button" className="btn btn-ghost btn-sm">
+                    Cancel
+                  </button>
+                </Dialog.Close>
+                <button
+                  type="submit"
+                  disabled={isTriggering}
+                  className="btn btn-primary btn-sm"
+                >
+                  {isTriggering ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      Triggering…
+                    </>
+                  ) : (
+                    "Trigger Build"
+                  )}
+                </button>
+              </div>
+            </form>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+
+      {/* ---- Build Logs Dialog ---- */}
+      <Dialog.Root
+        open={showBuildLogs}
+        onOpenChange={(open) => {
+          if (!open) closeBuildLogs();
+        }}
+      >
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 z-[150] bg-black/60" />
+          <Dialog.Content className="fixed left-1/2 top-1/2 z-[160] flex h-[70vh] w-full max-w-5xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-[var(--color-card-border)] bg-[#0a0a0a] text-[#d1d5db] shadow-2xl focus:outline-none">
+            {/* Header */}
+            <div className="flex items-center justify-between border-b border-white/10 bg-black/40 px-6 py-4">
+              <div className="flex items-center gap-3">
+                <Dialog.Title className="text-base font-semibold">
+                  Build Logs
+                  {activeBuild && (
+                    <span className="ml-2 font-mono text-[12px] font-normal text-[oklch(1_0_0/0.45)]">
+                      {activeBuild.id.slice(0, 8)}
+                    </span>
+                  )}
+                </Dialog.Title>
+
+                {/* Connection status */}
+                <div
+                  className={`flex items-center gap-1.5 rounded-full border px-2.5 py-px text-[11px] ${
+                    buildLogsStatus === "connected"
+                      ? "border-[var(--color-success)]/40 bg-[var(--color-success)]/10 text-[var(--color-success)]"
+                      : buildLogsStatus === "connecting"
+                        ? "border-[var(--color-warning)]/40 bg-[var(--color-warning)]/10 text-[var(--color-warning)]"
+                        : buildLogsStatus === "error"
+                          ? "border-[var(--color-destructive)]/40 bg-[var(--color-destructive)]/10 text-[var(--color-destructive)]"
+                          : "border-white/20 bg-black/20 text-[#9ca3af]"
+                  }`}
+                >
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full ${
+                      buildLogsStatus === "connected"
+                        ? "bg-[var(--color-success)]"
+                        : buildLogsStatus === "connecting"
+                          ? "animate-pulse bg-[var(--color-warning)]"
+                          : buildLogsStatus === "error"
+                            ? "bg-[var(--color-destructive)]"
+                            : "bg-[#6b7280]"
+                    }`}
+                  />
+                  {buildLogsStatus}
+                </div>
+
+                {/* Supply-chain badge in header if available */}
+                {activeBuild?.signed === true && (
+                  <div
+                    className={`flex items-center gap-1 rounded-[4px] border px-2 py-px text-[10px] font-semibold ${
+                      activeBuild.provenance === true
+                        ? "border-[oklch(0.72_0.17_150/0.35)] bg-[oklch(0.72_0.17_150/0.1)] text-[var(--color-success)]"
+                        : "border-white/15 bg-white/5 text-[oklch(1_0_0/0.55)]"
+                    }`}
+                  >
+                    <Shield className="h-3 w-3" />
+                    {activeBuild.provenance === true
+                      ? "signed + provenance"
+                      : "signed"}
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setBuildLogLines([])}
+                  className="rounded border border-white/20 px-3 py-1 text-[11px] hover:bg-white/5"
+                >
+                  Clear
+                </button>
+                <button
+                  type="button"
+                  onClick={closeBuildLogs}
+                  aria-label="Close"
+                  className="text-[#9ca3af] hover:text-white"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Image digest */}
+            {activeBuild?.image_digest && (
+              <div className="border-b border-white/10 bg-[oklch(0.08_0_0)] px-6 py-2">
+                <span className="mr-2 text-[10px] uppercase tracking-widest text-[#9ca3af]">
+                  Digest
+                </span>
+                <span className="font-mono text-[11px] text-[oklch(0.97_0_0)]">
+                  {activeBuild.image_digest}
+                </span>
+              </div>
+            )}
+
+            {/* Log output */}
+            <div
+              ref={buildLogsRef}
+              className="flex-1 overflow-auto bg-black/90 p-4 font-mono text-sm leading-snug whitespace-pre-wrap"
+            >
+              {buildLogLines.length === 0 ? (
+                <div className="text-[#6b7280]">
+                  {buildLogsStatus === "connecting"
+                    ? "Connecting to build log stream…"
+                    : "No log output yet."}
+                </div>
+              ) : (
+                buildLogLines.map((line, i) => (
+                  <div
+                    key={i}
+                    className="-mx-1 flex rounded px-1 hover:bg-white/5"
+                  >
+                    <span className="w-8 select-none pr-3 text-right tabular-nums text-[#3f3f46]">
+                      {i + 1}
+                    </span>
+                    <span className="flex-1">{line}</span>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* Footer */}
+            <div className="flex items-center justify-between border-t border-white/10 bg-black/40 px-6 py-3 text-[11px] text-[#9ca3af]">
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const blob = new Blob([buildLogLines.join("\n")], {
+                      type: "text/plain",
+                    });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `build-${activeBuild?.id ?? "log"}.log`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                  className="rounded border border-white/20 px-3 py-1 hover:bg-white/5"
+                >
+                  Download .log
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void navigator.clipboard.writeText(
+                      buildLogLines.join("\n"),
+                    );
+                    toast.success("Copied to clipboard");
+                  }}
+                  className="flex items-center gap-1 rounded border border-white/20 px-3 py-1 hover:bg-white/5"
+                >
+                  <Copy className="h-3 w-3" /> Copy all
+                </button>
+              </div>
+              <span className="tabular-nums">{buildLogLines.length} lines</span>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
 
       {/* Logs Dialog — now matches deployments polish: timestamps, filter+highlight, pause, copy, status, line nums */}
       <Dialog.Root
