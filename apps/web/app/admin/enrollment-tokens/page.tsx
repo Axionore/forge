@@ -1,6 +1,7 @@
 "use client";
 
 import React from "react";
+import { RefreshCw } from "lucide-react";
 import { useAdminToken } from "../token-store";
 
 type TokenSummary = {
@@ -566,7 +567,7 @@ export default function EnrollmentTokensPage() {
           {/* Local form feedback for Hetzner section */}
           {(hetznerFormError || hetznerFormSuccess) && (
             <div
-              className={`rounded-xl px-4 py-2 text-sm ${hetznerFormError ? "bg-[var(--color-destructive)]/100/10 text-[var(--color-destructive)] border border-red-500/30" : "bg-[var(--color-success)]/120/10 text-emerald-700 border border-emerald-500/30"}`}
+              className={`rounded-xl px-4 py-2 text-sm ${hetznerFormError ? "bg-[var(--color-destructive)]/10 text-[var(--color-destructive)] border border-[var(--color-destructive)]/30" : "bg-[var(--color-success)]/10 text-[var(--color-success)] border border-[var(--color-success)]/30"}`}
             >
               {hetznerFormError || hetznerFormSuccess}
             </div>
@@ -621,7 +622,7 @@ export default function EnrollmentTokensPage() {
           </div>
 
           {hetznerResult && (
-            <div className="mt-4 rounded-2xl border p-4 text-sm bg-black/5">
+            <div className="mt-4 rounded-lg border p-4 text-sm bg-[var(--color-muted)]/20">
               <div className="font-medium mb-2">Provisioning Results</div>
               <div className="space-y-3">
                 {(hetznerResult.servers || []).map((s: any, idx: number) => (
@@ -667,7 +668,7 @@ export default function EnrollmentTokensPage() {
 
         {/* Richer Credential Management UI */}
         {savedHetznerCredentials.length > 0 && (
-          <div className="mb-10 rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-6">
+          <div className="mb-10 rounded-xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-6">
             <div className="font-semibold text-lg tracking-tight mb-4">
               Saved Hetzner Credentials
             </div>
@@ -675,7 +676,7 @@ export default function EnrollmentTokensPage() {
               {savedHetznerCredentials.map((c: any) => (
                 <div
                   key={c.id}
-                  className="flex items-center justify-between rounded-2xl border p-4 text-sm"
+                  className="flex items-center justify-between rounded-lg border p-4 text-sm"
                 >
                   <div>
                     <div className="font-medium">{c.name}</div>
@@ -848,9 +849,9 @@ export default function EnrollmentTokensPage() {
 
         {/* One-time secret reveal — only after successful create */}
         {justCreated && (
-          <div className="mb-8 rounded-3xl border-2 border-amber-400/70 bg-[var(--color-warning)]/10/60 p-6">
+          <div className="mb-8 rounded-xl border-2 border-[var(--color-warning)]/70 bg-[var(--color-warning)]/10 p-6">
             <div className="flex items-start gap-4">
-              <div className="mt-0.5 text-amber-500">
+              <div className="mt-0.5 text-[var(--color-warning)]">
                 <svg
                   width="22"
                   height="22"
@@ -863,7 +864,7 @@ export default function EnrollmentTokensPage() {
                 </svg>
               </div>
               <div className="flex-1 min-w-0">
-                <div className="font-semibold tracking-tight text-amber-950">
+                <div className="font-semibold tracking-tight text-[var(--color-foreground)]">
                   One-time secret — copy immediately
                 </div>
                 <div className="text-sm text-[var(--color-warning)]/80 mt-0.5">
@@ -871,14 +872,14 @@ export default function EnrollmentTokensPage() {
                   page.
                 </div>
 
-                <div className="mt-4 flex items-center gap-3 rounded-2xl bg-[var(--color-card)] px-5 py-4 font-mono text-[15px] border border-[var(--color-warning)]/25 tracking-[0.5px] break-all select-all">
+                <div className="mt-4 flex items-center gap-3 rounded-lg bg-[var(--color-card)] px-5 py-4 font-mono text-[15px] border border-[var(--color-warning)]/25 tracking-[0.5px] break-all select-all">
                   {justCreated.token}
                 </div>
 
                 <div className="mt-3 flex items-center gap-3">
                   <button
                     onClick={() => copySecret(justCreated.token)}
-                    className="inline-flex items-center gap-2 rounded-2xl bg-[var(--color-card)] border border-[var(--color-warning)]/25 px-6 h-10 text-sm font-medium active:bg-[var(--color-warning)]/15 transition"
+                    className="inline-flex items-center gap-2 rounded-lg bg-[var(--color-card)] border border-[var(--color-warning)]/25 px-6 h-10 text-sm font-medium active:bg-[var(--color-warning)]/15 transition"
                   >
                     {copied ? (
                       <>Copied to clipboard ✓</>
@@ -901,7 +902,7 @@ export default function EnrollmentTokensPage() {
                   </button>
                   <button
                     onClick={() => setJustCreated(null)}
-                    className="text-sm text-amber-950/70 hover:text-amber-950 underline underline-offset-2"
+                    className="text-sm text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)] underline underline-offset-2"
                   >
                     Dismiss
                   </button>
@@ -911,9 +912,9 @@ export default function EnrollmentTokensPage() {
                 </div>
 
                 {/* Phase 4: Live, always-correct one-command bootstrap (editable public URL + real copy button) */}
-                <div className="mt-6 rounded-2xl border border-emerald-200 bg-[var(--color-success)]/12 p-4">
+                <div className="mt-6 rounded-lg border border-[var(--color-success)]/30 bg-[var(--color-success)]/10 p-4">
                   <div className="flex items-center justify-between mb-1.5">
-                    <div className="text-xs font-medium tracking-widest text-emerald-700">
+                    <div className="text-xs font-medium tracking-widest text-[var(--color-success)]">
                       ONE-COMMAND SERVER BOOTSTRAP
                     </div>
                     <button
@@ -929,14 +930,14 @@ export default function EnrollmentTokensPage() {
                           }, 1800);
                         });
                       }}
-                      className="text-[10px] px-2 py-0.5 rounded border border-emerald-300 text-emerald-700 hover:bg-[var(--color-card)] active:bg-emerald-100"
+                      className="text-[10px] px-2 py-0.5 rounded border border-[var(--color-success)]/40 text-[var(--color-success)] hover:bg-[var(--color-card)]"
                     >
                       Copy command
                     </button>
                   </div>
 
                   <div className="mb-2">
-                    <label className="text-[10px] text-emerald-700/70 block mb-0.5">
+                    <label className="text-[10px] text-[var(--color-success)]/70 block mb-0.5">
                       Public Control Plane URL (edit for prod / reverse proxy /
                       different host)
                     </label>
@@ -945,7 +946,7 @@ export default function EnrollmentTokensPage() {
                       onChange={(e) =>
                         setControlPlaneUrl(e.target.value.trim())
                       }
-                      className="w-full font-mono text-sm rounded-xl border border-emerald-200 bg-[var(--color-card)] px-3 py-1.5 text-emerald-950"
+                      className="w-full font-mono text-sm rounded-xl border border-[var(--color-success)]/30 bg-[var(--color-card)] px-3 py-1.5 text-[var(--color-foreground)]"
                       placeholder="https://forge.example.com"
                     />
                   </div>
@@ -966,21 +967,21 @@ export default function EnrollmentTokensPage() {
                                 );
                               });
                             }}
-                            className="text-[10px] px-2.5 py-0.5 rounded border border-emerald-300 text-emerald-700 hover:bg-[var(--color-card)] active:bg-emerald-100"
+                            className="text-[10px] px-2.5 py-0.5 rounded border border-[var(--color-success)]/40 text-[var(--color-success)] hover:bg-[var(--color-card)]"
                           >
                             {copiedOneLiner ? "Copied ✓" : "Copy full command"}
                           </button>
-                          <span className="text-[10px] text-emerald-600/70">
+                          <span className="text-[10px] text-[var(--color-success)]/70">
                             Run exactly as-is on the new server
                           </span>
                         </div>
-                        <code className="block bg-[var(--color-card)] border border-emerald-200 rounded-xl p-3 text-[12px] font-mono text-emerald-950 break-all select-all">
+                        <code className="block bg-[var(--color-card)] border border-[var(--color-success)]/30 rounded-xl p-3 text-[12px] font-mono text-[var(--color-foreground)] break-all select-all">
                           {cmd}
                         </code>
                       </>
                     );
                   })()}
-                  <div className="mt-2 text-[11px] text-emerald-700/80">
+                  <div className="mt-2 text-[11px] text-[var(--color-success)]/80">
                     Runs on the target machine. The agent will present its
                     Ed25519 key + age recipient at enrollment time. It appears
                     in "Your Servers" above within seconds. The one-time token
@@ -1009,14 +1010,16 @@ export default function EnrollmentTokensPage() {
             <button
               onClick={fetchAgents}
               disabled={isLoadingAgents || !hasAdminToken}
-              className="text-xs rounded-full border px-3 h-8 flex items-center gap-1 disabled:opacity-50"
+              className="btn btn-ghost btn-sm disabled:opacity-50"
+              aria-label="Refresh agents"
             >
+              <RefreshCw className="h-3.5 w-3.5" aria-hidden />
               {isLoadingAgents ? "Refreshing…" : "Refresh"}
             </button>
           </div>
 
           {isLoadingAgents && agents.length === 0 ? (
-            <div className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-card)] p-8 text-center text-sm text-[var(--color-muted-foreground)]">
+            <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] p-8 text-center text-sm text-[var(--color-muted-foreground)]">
               Loading registered agents…
             </div>
           ) : agents.length === 0 ? (
@@ -1053,7 +1056,7 @@ export default function EnrollmentTokensPage() {
                         </div>
                       </div>
                       <span
-                        className={`inline-flex items-center rounded-full px-2 py-px text-[10px] font-medium border ${isConnected ? "bg-[var(--color-success)]/120/10 text-emerald-700 border-emerald-500/30" : "bg-[var(--color-warning)]/100/10 text-[var(--color-warning)] border-amber-500/30"}`}
+                        className={`inline-flex items-center rounded-full px-2 py-px text-[10px] font-medium border ${isConnected ? "bg-[var(--color-success)]/10 text-[var(--color-success)] border-[var(--color-success)]/30" : "bg-[var(--color-warning)]/10 text-[var(--color-warning)] border-[var(--color-warning)]/30"}`}
                       >
                         {isConnected ? "CONNECTED" : "OFFLINE"}
                       </span>
@@ -1098,21 +1101,10 @@ export default function EnrollmentTokensPage() {
             <button
               onClick={fetchTokens}
               disabled={isLoading || !hasAdminToken}
-              className="flex items-center gap-2 rounded-full border border-[var(--color-card-border)] bg-[var(--color-card)] px-4 h-9 text-sm font-medium disabled:opacity-50 active:bg-[var(--color-muted)]"
+              className="btn btn-ghost btn-sm disabled:opacity-50"
+              aria-label="Refresh tokens"
             >
-              <svg
-                width="14"
-                height="14"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="3"
-              >
-                <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
-                <path d="M21 3v5h-5" />
-                <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" />
-                <path d="M8 21H3v-5" />
-              </svg>
+              <RefreshCw className="h-3.5 w-3.5" aria-hidden />
               Refresh
             </button>
           </div>

@@ -766,7 +766,7 @@ export default function ApplicationDetailPage() {
   }
 
   return (
-    <div className="mx-auto max-w-7xl px-6 py-8 space-y-8">
+    <div className="page-root space-y-6">
       <div className="flex items-center justify-between gap-4">
         <Link
           href="/admin/applications"
@@ -799,7 +799,7 @@ export default function ApplicationDetailPage() {
               </svg>
             </div>
             <div className="flex-1 min-w-0">
-              <div className="font-semibold tracking-tight text-amber-950">
+              <div className="font-semibold tracking-tight text-[var(--color-foreground)]">
                 One-time connection note — copy immediately
               </div>
               <div className="text-sm text-[var(--color-warning)]/80 mt-0.5">
@@ -807,13 +807,13 @@ export default function ApplicationDetailPage() {
                 into the container (tmpfs 0600). Never logged or returned in
                 control-plane responses.
               </div>
-              <div className="mt-4 flex items-center gap-3 rounded-2xl bg-[var(--color-card)] px-5 py-4 font-mono text-[15px] border border-[var(--color-warning)]/25 tracking-[0.5px] break-all select-all">
+              <div className="mt-4 flex items-center gap-3 rounded-lg bg-[var(--color-card)] px-5 py-4 font-mono text-[15px] border border-[var(--color-warning)]/25 tracking-[0.5px] break-all select-all">
                 {oneTimeSecret}
               </div>
               <div className="mt-3 flex items-center gap-3">
                 <button
                   onClick={copyOneTimeSecret}
-                  className="inline-flex items-center gap-2 rounded-2xl bg-[var(--color-card)] border border-[var(--color-warning)]/25 px-6 h-10 text-sm font-medium active:bg-[var(--color-warning)]/15 transition"
+                  className="inline-flex items-center gap-2 rounded-lg bg-[var(--color-card)] border border-[var(--color-warning)]/25 px-6 h-10 text-sm font-medium active:bg-[var(--color-warning)]/15 transition"
                 >
                   {copiedOneTime ? "Copied to clipboard ✓" : "Copy note"}
                 </button>
@@ -822,7 +822,7 @@ export default function ApplicationDetailPage() {
                     setOneTimeSecret(null);
                     setCopiedOneTime(false);
                   }}
-                  className="text-sm text-amber-950/70 hover:text-amber-950 underline underline-offset-2"
+                  className="text-sm text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)] underline underline-offset-2"
                 >
                   Dismiss
                 </button>
@@ -837,12 +837,12 @@ export default function ApplicationDetailPage() {
 
       {/* App Header + 4-state handling */}
       {isLoadingApp ? (
-        <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8 animate-pulse">
+        <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-card)] p-8 animate-pulse">
           <div className="h-9 w-2/3 bg-[var(--color-muted)] rounded" />
           <div className="mt-3 h-4 w-1/3 bg-[var(--color-muted)] rounded" />
         </div>
       ) : appError ? (
-        <div className="rounded-3xl border border-red-500/30 bg-[var(--color-destructive)]/100/5 p-6 text-[var(--color-destructive)]">
+        <div className="rounded-xl border border-[var(--color-destructive)]/30 bg-[var(--color-destructive)]/5 p-6 text-[var(--color-destructive)]">
           Failed to load application: {appError}
           <button onClick={() => loadApplication()} className="ml-4 underline">
             Retry
@@ -868,7 +868,7 @@ export default function ApplicationDetailPage() {
       ) : null}
 
       {/* Deploy Panel — polished primary flow from details (Phase 1) */}
-      <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8">
+      <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-card)] p-8">
         <div className="flex items-center justify-between mb-6">
           <div>
             <div className="font-semibold text-2xl tracking-tight">Deploy</div>
@@ -884,7 +884,11 @@ export default function ApplicationDetailPage() {
           <button
             type="button"
             onClick={() => setDeployMode("image")}
-            className={`px-5 py-2 rounded-2xl text-sm font-medium transition ${deployMode === "image" ? "bg-[var(--color-foreground)] text-[var(--color-background)]" : "border border-[var(--color-border)] hover:bg-[var(--color-muted)]"}`}
+            className={
+              deployMode === "image"
+                ? "btn btn-primary btn-sm"
+                : "btn btn-ghost btn-sm"
+            }
           >
             Container Image
           </button>
@@ -894,7 +898,11 @@ export default function ApplicationDetailPage() {
               setDeployMode("git");
               if (gitSources.length === 0) void fetchGitSources();
             }}
-            className={`px-5 py-2 rounded-2xl text-sm font-medium transition ${deployMode === "git" ? "bg-[var(--color-foreground)] text-[var(--color-background)]" : "border border-[var(--color-border)] hover:bg-[var(--color-muted)]"}`}
+            className={
+              deployMode === "git"
+                ? "btn btn-primary btn-sm"
+                : "btn btn-ghost btn-sm"
+            }
           >
             Git Repository
           </button>
@@ -909,7 +917,7 @@ export default function ApplicationDetailPage() {
               <input
                 value={deployImage}
                 onChange={(e) => setDeployImage(e.target.value)}
-                className="w-full rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-5 py-3 text-sm font-mono"
+                className="input font-mono"
                 placeholder="nginx:alpine or ghcr.io/org/app:v1.2.3"
                 required
               />
@@ -955,7 +963,7 @@ export default function ApplicationDetailPage() {
                 <select
                   value={selectedGitSourceId}
                   onChange={(e) => setSelectedGitSourceId(e.target.value)}
-                  className="w-full rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-5 py-3 text-sm"
+                  className="select"
                   required
                 >
                   <option value="">Select connected Git source...</option>
@@ -979,7 +987,7 @@ export default function ApplicationDetailPage() {
                 <input
                   value={gitRef}
                   onChange={(e) => setGitRef(e.target.value)}
-                  className="w-full rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-5 py-3 text-sm font-mono"
+                  className="input font-mono"
                   placeholder="main or pr/42 or commit-sha"
                 />
                 <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
@@ -1014,7 +1022,7 @@ export default function ApplicationDetailPage() {
               {envVars.map((ev, idx) => (
                 <div
                   key={idx}
-                  className="flex gap-2 items-center rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2"
+                  className="flex gap-2 items-center rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2"
                 >
                   <input
                     value={ev.key}
@@ -1057,10 +1065,10 @@ export default function ApplicationDetailPage() {
                     onClick={() =>
                       setEnvVars(envVars.filter((_, i) => i !== idx))
                     }
-                    className="ml-1 text-[var(--color-muted-foreground)] hover:text-red-500 text-lg leading-none"
-                    title="Remove"
+                    className="ml-1 text-[var(--color-muted-foreground)] hover:text-[var(--color-destructive)]"
+                    aria-label="Remove variable"
                   >
-                    ×
+                    <X className="h-3.5 w-3.5" />
                   </button>
                 </div>
               ))}
@@ -1081,7 +1089,7 @@ export default function ApplicationDetailPage() {
               Target Agents
             </label>
             {availableAgents.length === 0 ? (
-              <div className="text-xs text-[var(--color-muted-foreground)] rounded-2xl border border-[var(--color-border)] p-3">
+              <div className="text-xs text-[var(--color-muted-foreground)] rounded-lg border border-[var(--color-border)] p-3">
                 No agents registered yet. Go to{" "}
                 <a href="/admin/enrollment-tokens" className="underline">
                   Add Server
@@ -1147,7 +1155,7 @@ export default function ApplicationDetailPage() {
                     }
                   }
                 }}
-                className="flex-1 rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-5 py-3 text-sm font-mono"
+                className="flex-1 rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-5 py-3 text-sm font-mono"
                 placeholder="80 or 8080:80"
               />
               <button
@@ -1158,7 +1166,7 @@ export default function ApplicationDetailPage() {
                     setNewPort("");
                   }
                 }}
-                className="rounded-2xl border border-[var(--color-border)] px-4 text-sm hover:bg-[var(--color-muted)]"
+                className="rounded-lg border border-[var(--color-border)] px-4 text-sm hover:bg-[var(--color-muted)]"
               >
                 Add
               </button>
@@ -1207,7 +1215,7 @@ export default function ApplicationDetailPage() {
                     }
                   }
                 }}
-                className="flex-1 rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-5 py-3 text-sm"
+                className="flex-1 rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-5 py-3 text-sm"
                 placeholder="app.example.com"
               />
               <button
@@ -1218,7 +1226,7 @@ export default function ApplicationDetailPage() {
                     setNewDomain("");
                   }
                 }}
-                className="rounded-2xl border border-[var(--color-border)] px-4 text-sm hover:bg-[var(--color-muted)]"
+                className="rounded-lg border border-[var(--color-border)] px-4 text-sm hover:bg-[var(--color-muted)]"
               >
                 Add
               </button>
@@ -1251,27 +1259,39 @@ export default function ApplicationDetailPage() {
           </div>
 
           {/* Strategy configuration (Zero-Downtime ready) */}
-          <div className="border border-[var(--color-border)] rounded-2xl p-4 space-y-4">
+          <div className="border border-[var(--color-border)] rounded-lg p-4 space-y-4">
             <div className="font-medium text-sm">Deployment Strategy</div>
             <div className="flex gap-2">
               <button
                 type="button"
                 onClick={() => setDeployStrategyType("rolling")}
-                className={`flex-1 py-2 rounded-xl text-sm font-medium ${deployStrategyType === "rolling" ? "bg-[var(--color-foreground)] text-[var(--color-background)]" : "border border-[var(--color-border)]"}`}
+                className={
+                  deployStrategyType === "rolling"
+                    ? "btn btn-primary btn-sm flex-1"
+                    : "btn btn-ghost btn-sm flex-1"
+                }
               >
                 Rolling
               </button>
               <button
                 type="button"
                 onClick={() => setDeployStrategyType("bluegreen")}
-                className={`flex-1 py-2 rounded-xl text-sm font-medium ${deployStrategyType === "bluegreen" ? "bg-[var(--color-foreground)] text-[var(--color-background)]" : "border border-[var(--color-border)]"}`}
+                className={
+                  deployStrategyType === "bluegreen"
+                    ? "btn btn-primary btn-sm flex-1"
+                    : "btn btn-ghost btn-sm flex-1"
+                }
               >
                 Blue/Green
               </button>
               <button
                 type="button"
                 onClick={() => setDeployStrategyType("canary")}
-                className={`flex-1 py-2 rounded-xl text-sm font-medium ${deployStrategyType === "canary" ? "bg-[var(--color-foreground)] text-[var(--color-background)]" : "border border-[var(--color-border)]"}`}
+                className={
+                  deployStrategyType === "canary"
+                    ? "btn btn-primary btn-sm flex-1"
+                    : "btn btn-ghost btn-sm flex-1"
+                }
               >
                 Canary
               </button>
@@ -1362,7 +1382,7 @@ export default function ApplicationDetailPage() {
               <select
                 value={workloadType}
                 onChange={(e) => setWorkloadType(e.target.value as any)}
-                className="w-full rounded-xl border px-3 py-2 bg-[var(--color-background)] text-sm"
+                className="select"
               >
                 <option value="stateless">
                   Stateless (zero-downtime fully supported)
@@ -1375,7 +1395,7 @@ export default function ApplicationDetailPage() {
                 </option>
               </select>
               {!zeroDowntimeGuaranteed && (
-                <div className="mt-2 rounded-xl border border-amber-500/40 bg-[var(--color-warning)]/100/5 p-3 text-xs text-[var(--color-warning)]">
+                <div className="mt-2 rounded-xl border border-[var(--color-warning)]/40 bg-[var(--color-warning)]/5 p-3 text-xs text-[var(--color-warning)]">
                   ⚠ Zero-downtime is not guaranteed for {workloadType}{" "}
                   workloads. Expect possible connection resets or dual-write
                   windows during cutover. Consider a maintenance window for
@@ -1390,7 +1410,7 @@ export default function ApplicationDetailPage() {
                 <div className="font-semibold text-sm">
                   One-click Databases &amp; Services
                 </div>
-                <div className="text-[10px] px-2 py-0.5 rounded-full bg-[var(--color-success)]/120/10 text-emerald-700">
+                <div className="text-[10px] px-2 py-0.5 rounded-full bg-[var(--color-success)]/10 text-[var(--color-success)]">
                   Auto backup schedule + age secrets
                 </div>
               </div>
@@ -1456,7 +1476,7 @@ export default function ApplicationDetailPage() {
                             setIsDeploying(false);
                           }
                         }}
-                        className="group text-left rounded-3xl border border-[var(--color-border)] p-4 hover:border-violet-500/60 hover:shadow-sm transition bg-[var(--color-card)] flex flex-col gap-1.5"
+                        className="group text-left rounded-xl border border-[var(--color-border)] p-4 hover:border-[oklch(1_0_0/0.18)] hover:shadow-sm transition bg-[var(--color-card)] flex flex-col gap-1.5"
                         disabled={isDeploying}
                       >
                         <div className="flex items-center gap-2">
@@ -1468,7 +1488,7 @@ export default function ApplicationDetailPage() {
                           {tpl.description}
                         </div>
                         <div className="mt-auto pt-2 flex items-center justify-between text-[10px]">
-                          <span className="font-medium text-violet-600 group-hover:underline">
+                          <span className="font-medium text-[var(--color-primary)] group-hover:underline">
                             Deploy from Catalog →
                           </span>
                           <span className="text-[var(--color-muted-foreground)]">
@@ -1495,7 +1515,7 @@ export default function ApplicationDetailPage() {
           </div>
 
           {/* Phase 2 Change Preview with actual spec diff */}
-          <div className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] p-4 text-sm">
+          <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] p-4 text-sm">
             <div className="font-medium mb-2">
               Change Preview — What will actually change on the agent
             </div>
@@ -1567,7 +1587,7 @@ export default function ApplicationDetailPage() {
                 setPreviewSpecJson(JSON.stringify(previewSpec, null, 2));
                 setShowPreviewSpec(true);
               }}
-              className="flex-1 rounded-2xl border border-[var(--color-border)] py-3.5 text-sm font-medium hover:bg-[var(--color-muted)] transition"
+              className="flex-1 rounded-lg border border-[var(--color-border)] py-3.5 text-sm font-medium hover:bg-[var(--color-muted)] transition"
             >
               Preview Spec (JSON)
             </button>
@@ -1580,7 +1600,7 @@ export default function ApplicationDetailPage() {
                 !deployImage.trim() ||
                 selectedAgentIds.length === 0
               }
-              className="flex-[2] rounded-2xl bg-[var(--color-primary)] text-[var(--color-primary-foreground)] py-3.5 text-sm font-semibold disabled:opacity-60 active:opacity-90 transition flex items-center justify-center gap-2"
+              className="btn btn-primary flex-[2] py-3.5"
             >
               {isDeploying ? (
                 <>Signing &amp; dispatching…</>
@@ -1601,7 +1621,7 @@ export default function ApplicationDetailPage() {
 
       {/* Rich Post-Deploy Experience – polished status + activity */}
       {latestDeployment ? (
-        <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8 space-y-6">
+        <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-card)] p-8 space-y-6">
           <div className="flex items-center justify-between">
             <div>
               <div className="font-semibold text-xl tracking-tight">
@@ -1617,10 +1637,10 @@ export default function ApplicationDetailPage() {
             <div
               className={`text-xs px-3 py-1 rounded-full border font-medium ${
                 liveResults[0]?.success === false
-                  ? "bg-[var(--color-destructive)]/100/10 text-[var(--color-destructive)] border-red-500/20"
+                  ? "bg-[var(--color-destructive)]/10 text-[var(--color-destructive)] border-[var(--color-destructive)]/20"
                   : liveResults.length > 0
-                    ? "bg-[var(--color-success)]/120/10 text-emerald-600 border-emerald-500/20"
-                    : "bg-[var(--color-warning)]/100/10 text-amber-600 border-amber-500/20"
+                    ? "bg-[var(--color-success)]/10 text-[var(--color-success)] border-[var(--color-success)]/20"
+                    : "bg-[var(--color-warning)]/10 text-[var(--color-warning)] border-[var(--color-warning)]/20"
               }`}
             >
               {liveResults[0]?.success === false
@@ -1638,19 +1658,19 @@ export default function ApplicationDetailPage() {
                 Live Activity from Agent (JobResults)
               </div>
               {isPolling && (
-                <div className="text-[10px] px-2 py-0.5 rounded bg-[var(--color-success)]/120/10 text-emerald-600">
+                <div className="text-[10px] px-2 py-0.5 rounded bg-[var(--color-success)]/10 text-[var(--color-success)]">
                   LIVE • refreshing
                 </div>
               )}
             </div>
 
             {liveResults.length === 0 ? (
-              <div className="rounded-2xl border border-[var(--color-border)] p-6 text-sm text-[var(--color-muted-foreground)]">
+              <div className="rounded-lg border border-[var(--color-border)] p-6 text-sm text-[var(--color-muted-foreground)]">
                 Waiting for first results from the agent. Logs are already
                 streaming above.
               </div>
             ) : (
-              <div className="space-y-2 text-sm font-mono bg-[var(--color-background)] rounded-2xl p-4 border border-[var(--color-border)]">
+              <div className="space-y-2 text-sm font-mono bg-[var(--color-background)] rounded-lg p-4 border border-[var(--color-border)]">
                 {liveResults.slice(0, 8).map((r, idx) => (
                   <div
                     key={idx}
@@ -1665,7 +1685,7 @@ export default function ApplicationDetailPage() {
                     <div
                       className={
                         r.success
-                          ? "text-emerald-600"
+                          ? "text-[var(--color-success)]"
                           : "text-[var(--color-destructive)]"
                       }
                     >
@@ -1679,13 +1699,13 @@ export default function ApplicationDetailPage() {
           </div>
 
           {/* Sophisticated Rollout UI + Deeper Observability (Phase 2 advanced) */}
-          <div className="rounded-2xl border border-[var(--color-border)] p-5 text-sm space-y-4">
+          <div className="rounded-lg border border-[var(--color-border)] p-5 text-sm space-y-4">
             <div className="flex items-center justify-between">
               <div className="font-semibold">
                 Rollout Progress — {deployStrategyType.toUpperCase()}
               </div>
               <div
-                className={`text-xs px-2 py-0.5 rounded ${latestDeployment?.status === "healthy" ? "bg-[var(--color-success)]/120/10 text-emerald-700" : "bg-[var(--color-warning)]/100/10 text-[var(--color-warning)]"}`}
+                className={`text-xs px-2 py-0.5 rounded ${latestDeployment?.status === "healthy" ? "bg-[var(--color-success)]/10 text-[var(--color-success)]" : "bg-[var(--color-warning)]/10 text-[var(--color-warning)]"}`}
               >
                 {latestDeployment?.status || "in progress"}
               </div>
@@ -1823,13 +1843,13 @@ export default function ApplicationDetailPage() {
               onClick={() =>
                 latestDeployment && openLogsForDeployment(latestDeployment)
               }
-              className="flex-1 rounded-2xl border border-[var(--color-border)] py-3 text-sm font-medium hover:bg-[var(--color-muted)]"
+              className="btn btn-ghost flex-1"
             >
               Open Live Logs
             </button>
             <Link
               href="/admin/deployments"
-              className="flex-1 text-center rounded-2xl bg-[var(--color-foreground)] text-[var(--color-background)] py-3 text-sm font-medium"
+              className="btn btn-primary flex-1 text-center py-3"
             >
               Full Deployments
             </Link>
@@ -1856,7 +1876,7 @@ export default function ApplicationDetailPage() {
                   toast.error("Promote failed");
                 }
               }}
-              className="flex-1 rounded-2xl border border-emerald-500/30 text-emerald-600 py-2 text-sm font-medium hover:bg-[var(--color-success)]/120/5"
+              className="btn btn-ghost flex-1"
             >
               Manual Promote (to 100%)
             </button>
@@ -1878,7 +1898,7 @@ export default function ApplicationDetailPage() {
                   toast.error("Rollback failed");
                 }
               }}
-              className="flex-1 rounded-2xl border border-red-500/30 text-[var(--color-destructive)] py-2 text-sm font-medium hover:bg-[var(--color-destructive)]/100/5"
+              className="btn btn-danger flex-1"
             >
               Manual Rollback
             </button>
@@ -1894,7 +1914,7 @@ export default function ApplicationDetailPage() {
                 {domains.map((d, idx) => (
                   <div
                     key={idx}
-                    className="flex items-center gap-3 rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] px-4 py-2.5 text-sm"
+                    className="flex items-center gap-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-4 py-2.5 text-sm"
                   >
                     <div className="font-mono flex-1 truncate">https://{d}</div>
                     <button
@@ -1927,7 +1947,7 @@ export default function ApplicationDetailPage() {
         </div>
       ) : (
         /* Better empty state */
-        <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-12 text-center">
+        <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-card)] p-12 text-center">
           <div className="mx-auto w-12 h-12 rounded-full bg-[var(--color-muted)] mb-4" />
           <div className="font-medium text-lg">
             No deployments yet for this application
@@ -1949,7 +1969,7 @@ export default function ApplicationDetailPage() {
       >
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 bg-black/60 z-[150]" />
-          <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-full max-w-5xl h-[70vh] rounded-3xl border border-[var(--color-border)] bg-[#0a0a0a] text-[#d1d5db] shadow-2xl z-[160] flex flex-col overflow-hidden">
+          <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-full max-w-5xl h-[70vh] rounded-xl border border-[var(--color-border)] bg-[#0a0a0a] text-[#d1d5db] shadow-2xl z-[160] flex flex-col overflow-hidden focus:outline-none">
             <div className="flex items-center justify-between px-6 py-4 border-b border-white/10 bg-black/40">
               <div className="flex items-center gap-3">
                 <Dialog.Title className="font-semibold text-lg">
@@ -1959,22 +1979,22 @@ export default function ApplicationDetailPage() {
                 <div
                   className={`flex items-center gap-1.5 text-xs px-2.5 py-0.5 rounded-full border ${
                     logsConnectionStatus === "connected"
-                      ? "bg-[var(--color-success)]/120/10 border-emerald-500/40 text-emerald-400"
+                      ? "bg-[var(--color-success)]/10 border-[var(--color-success)]/40 text-[var(--color-success)]"
                       : logsConnectionStatus === "connecting"
-                        ? "bg-[var(--color-warning)]/100/10 border-amber-500/40 text-amber-400"
+                        ? "bg-[var(--color-warning)]/10 border-[var(--color-warning)]/40 text-[var(--color-warning)]"
                         : logsConnectionStatus === "error"
-                          ? "bg-[var(--color-destructive)]/100/10 border-red-500/40 text-red-400"
+                          ? "bg-[var(--color-destructive)]/10 border-[var(--color-destructive)]/40 text-[var(--color-destructive)]"
                           : "bg-[var(--color-card)]/5 border-white/20 text-[#9ca3af]"
                   }`}
                 >
                   <div
                     className={`w-1.5 h-1.5 rounded-full ${
                       logsConnectionStatus === "connected"
-                        ? "bg-emerald-400"
+                        ? "bg-[var(--color-success)]"
                         : logsConnectionStatus === "connecting"
-                          ? "bg-amber-400 animate-pulse"
+                          ? "bg-[var(--color-warning)] animate-pulse"
                           : logsConnectionStatus === "error"
-                            ? "bg-red-400"
+                            ? "bg-[var(--color-destructive)]"
                             : "bg-[#6b7280]"
                     }`}
                   />
@@ -1987,7 +2007,7 @@ export default function ApplicationDetailPage() {
                     setFollowLogs(next);
                     if (next) setLogsPaused(false);
                   }}
-                  className={`text-xs px-3 py-1 rounded border transition flex items-center gap-1 ${followLogs ? "bg-[var(--color-success)]/120/20 border-emerald-500 text-emerald-400" : "border-white/20 hover:bg-[var(--color-card)]/5"}`}
+                  className={`text-xs px-3 py-1 rounded border transition flex items-center gap-1 ${followLogs ? "bg-[var(--color-success)]/20 border-[var(--color-success)] text-[var(--color-success)]" : "border-white/20 hover:bg-[var(--color-card)]/5"}`}
                 >
                   {followLogs ? (
                     <Play className="w-3 h-3" />
@@ -2059,6 +2079,7 @@ export default function ApplicationDetailPage() {
                 <input
                   type="text"
                   placeholder="Filter (live highlight)..."
+                  aria-label="Filter log lines"
                   value={logsFilter}
                   onChange={(e) => setLogsFilter(e.target.value)}
                   className="bg-black/60 border border-white/10 rounded px-3 py-1 text-xs w-72 focus:outline-none focus:border-white/30"
@@ -2104,7 +2125,7 @@ export default function ApplicationDetailPage() {
       <Dialog.Root open={showPreviewSpec} onOpenChange={setShowPreviewSpec}>
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 bg-black/70 z-[170]" />
-          <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[95vw] max-w-3xl max-h-[80vh] overflow-hidden rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] shadow-2xl z-[180] flex flex-col">
+          <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[95vw] max-w-3xl max-h-[80vh] overflow-hidden rounded-xl border border-[var(--color-card-border)] bg-[var(--color-card)] shadow-2xl z-[180] flex flex-col">
             <div className="flex items-center justify-between px-6 py-4 border-b">
               <Dialog.Title className="font-semibold text-lg">
                 Preview DeploymentSpec (what the agent will receive)
@@ -2130,7 +2151,7 @@ export default function ApplicationDetailPage() {
       <Dialog.Root open={showUpdateForge} onOpenChange={setShowUpdateForge}>
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 bg-black/80 z-[200]" />
-          <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[96vw] max-w-4xl rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8 shadow-2xl z-[210] focus:outline-none overflow-auto max-h-[88vh]">
+          <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[96vw] max-w-4xl rounded-xl border border-[var(--color-border)] bg-[var(--color-card)] p-8 shadow-2xl z-[210] focus:outline-none overflow-auto max-h-[88vh]">
             <Dialog.Title className="text-2xl font-semibold tracking-tight mb-1.5 text-foreground">
               Update Forge — Zero-Downtime (Dogfood)
             </Dialog.Title>
@@ -2142,13 +2163,13 @@ export default function ApplicationDetailPage() {
             </p>
 
             {/* Rich tiered Change Preview with honest stateful warnings */}
-            <div className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] p-5 mb-5 text-sm">
+            <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] p-5 mb-5 text-sm">
               <div className="font-semibold mb-3 tracking-tight">
                 Tiered Rollout Preview (real engine strategy)
               </div>
               <div className="space-y-3 text-xs">
                 <div className="rounded-xl border border-[var(--color-border)] p-3">
-                  <div className="font-medium text-violet-600">
+                  <div className="font-medium text-[var(--color-foreground)]">
                     1. Agents (stateless canary first — lowest risk)
                   </div>
                   <div className="mt-1 text-[var(--color-muted-foreground)]">
@@ -2159,7 +2180,7 @@ export default function ApplicationDetailPage() {
                   </div>
                 </div>
                 <div className="rounded-xl border border-[var(--color-border)] p-3">
-                  <div className="font-medium text-emerald-600">
+                  <div className="font-medium text-[var(--color-success)]">
                     2. Control Plane (blue-green after agents healthy)
                   </div>
                   <div className="mt-1 text-[var(--color-muted-foreground)]">
@@ -2168,7 +2189,7 @@ export default function ApplicationDetailPage() {
                     handoff.
                   </div>
                 </div>
-                <div className="rounded-xl border border-amber-500/40 bg-[var(--color-warning)]/100/5 p-3">
+                <div className="rounded-xl border border-[var(--color-warning)]/40 bg-[var(--color-warning)]/5 p-3">
                   <div className="font-medium text-[var(--color-warning)]">
                     3. Postgres / stateful core (rolling with extended handling
                     — honest warning)
@@ -2186,7 +2207,7 @@ export default function ApplicationDetailPage() {
                   </div>
                 </div>
               </div>
-              <div className="text-amber-600 text-[10px] mt-3 font-medium">
+              <div className="text-[var(--color-warning)] text-[10px] mt-3 font-medium">
                 ⚠ Any phase failure → automatic rollback to previous_spec using
                 the identical strategy + JobResult ingestion path your workloads
                 use.
@@ -2195,8 +2216,8 @@ export default function ApplicationDetailPage() {
 
             {/* Tighter integration: embedded live L7 + stateful + rollout observability for the forge-system meta deployment (reuses the exact panels from the main detail page) */}
             {isUpdatingForge && systemDeployment && (
-              <div className="rounded-2xl border border-violet-500/30 bg-violet-500/5 p-4 mb-5 text-sm">
-                <div className="font-semibold mb-2 text-violet-700">
+              <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] p-4 mb-5 text-sm">
+                <div className="font-semibold mb-2 text-[var(--color-foreground)]">
                   Live forge-system Rollout + L7/Stateful Observability (real
                   engine data)
                 </div>
@@ -2242,7 +2263,7 @@ export default function ApplicationDetailPage() {
                     </div>
                   </div>
                 </div>
-                <div className="text-[10px] mt-2 text-violet-700/80">
+                <div className="text-[10px] mt-2 text-[var(--color-muted-foreground)]">
                   Full detail, manual promote/rollback, and deeper charts live
                   in the dedicated forge-system detail page (open it in another
                   tab now).
@@ -2256,14 +2277,14 @@ export default function ApplicationDetailPage() {
                 <input
                   value={updateVersion}
                   onChange={(e) => setUpdateVersion(e.target.value)}
-                  className="w-full mt-1 rounded-2xl border px-4 py-2.5 bg-[var(--color-background)] font-mono text-sm"
+                  className="w-full mt-1 rounded-lg border px-4 py-2.5 bg-[var(--color-background)] font-mono text-sm"
                 />
               </div>
               <div>
                 <label className="text-xs font-medium">
                   Binary + Strategy (your Phase 2 controls)
                 </label>
-                <div className="mt-1 text-xs p-2.5 rounded-2xl border bg-[var(--color-background)] text-[var(--color-muted-foreground)]">
+                <div className="mt-1 text-xs p-2.5 rounded-lg border bg-[var(--color-background)] text-[var(--color-muted-foreground)]">
                   Canary (agents 10%→100%) + Blue/Green (CP) + stateful-aware
                   rolling (Postgres). All gates, durations, and plugins
                   configurable via the same API.

@@ -366,9 +366,9 @@ export default function AccessPage() {
 
         {/* One-time admin token reveal (strong amber warning, copy once) */}
         {justCreatedToken && (
-          <div className="mb-8 rounded-3xl border-2 border-amber-400/70 bg-[var(--color-warning)]/10/60 p-6">
+          <div className="mb-8 rounded-xl border-2 border-[var(--color-warning)]/70 bg-[var(--color-warning)]/10 p-6">
             <div className="flex items-start gap-4">
-              <div className="mt-0.5 text-amber-500">
+              <div className="mt-0.5 text-[var(--color-warning)]">
                 <svg
                   width="22"
                   height="22"
@@ -381,7 +381,7 @@ export default function AccessPage() {
                 </svg>
               </div>
               <div className="flex-1 min-w-0">
-                <div className="font-semibold tracking-tight text-amber-950">
+                <div className="font-semibold tracking-tight text-[var(--color-foreground)]">
                   One-time admin token — copy immediately
                 </div>
                 <div className="text-sm text-[var(--color-warning)]/80 mt-0.5">
@@ -389,20 +389,20 @@ export default function AccessPage() {
                   <code>X-Admin-Token</code> for any /admin route.
                 </div>
 
-                <div className="mt-4 flex items-center gap-3 rounded-2xl bg-[var(--color-card)] px-5 py-4 font-mono text-[15px] border border-[var(--color-warning)]/25 tracking-[0.5px] break-all select-all">
+                <div className="mt-4 flex items-center gap-3 rounded-lg bg-[var(--color-card)] px-5 py-4 font-mono text-[15px] border border-[var(--color-warning)]/25 tracking-[0.5px] break-all select-all">
                   {justCreatedToken.token}
                 </div>
 
                 <div className="mt-3 flex items-center gap-3">
                   <button
                     onClick={() => copySecret(justCreatedToken.token)}
-                    className="inline-flex items-center gap-2 rounded-2xl bg-[var(--color-card)] border border-[var(--color-warning)]/25 px-6 h-10 text-sm font-medium active:bg-[var(--color-warning)]/15 transition"
+                    className="inline-flex items-center gap-2 rounded-lg bg-[var(--color-card)] border border-[var(--color-warning)]/25 px-6 h-10 text-sm font-medium active:bg-[var(--color-warning)]/15 transition"
                   >
                     {copied ? "Copied to clipboard ✓" : "Copy secret"}
                   </button>
                   <button
                     onClick={() => setJustCreatedToken(null)}
-                    className="text-sm text-amber-950/70 hover:text-amber-950 underline underline-offset-2"
+                    className="text-sm text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)] underline underline-offset-2"
                   >
                     Dismiss
                   </button>
@@ -547,7 +547,7 @@ export default function AccessPage() {
                       </span>
                     )}
                   </div>
-                  <pre className="mt-2 text-[10px] bg-black/5 p-2 rounded-xl overflow-auto">
+                  <pre className="mt-2 text-[10px] bg-[var(--color-muted)]/20 p-2 rounded-xl overflow-auto">
                     {JSON.stringify(r.permissions, null, 2)}
                   </pre>
                 </div>
@@ -579,7 +579,7 @@ export default function AccessPage() {
                 <select
                   value={selectedPrincipalId}
                   onChange={(e) => setSelectedPrincipalId(e.target.value)}
-                  className="w-full rounded-2xl border border-[var(--color-input)] bg-[var(--color-card)] px-5 py-3 text-[15px] focus:outline-none focus:ring-2 focus:ring-[var(--color-ring)]"
+                  className="w-full rounded-lg border border-[var(--color-input)] bg-[var(--color-card)] px-5 py-3 text-[15px] focus:outline-none focus:ring-2 focus:ring-[var(--color-ring)]"
                   required
                 >
                   <option value="">Select principal…</option>
@@ -612,7 +612,7 @@ export default function AccessPage() {
                       e.target.value === "" ? "" : Number(e.target.value),
                     )
                   }
-                  className="w-full rounded-2xl border border-[var(--color-input)] bg-[var(--color-card)] px-5 py-3 text-[15px] focus:outline-none focus:ring-2 focus:ring-[var(--color-ring)]"
+                  className="w-full rounded-lg border border-[var(--color-input)] bg-[var(--color-card)] px-5 py-3 text-[15px] focus:outline-none focus:ring-2 focus:ring-[var(--color-ring)]"
                 >
                   <option value="">Never</option>
                   <option value={7}>7 days</option>

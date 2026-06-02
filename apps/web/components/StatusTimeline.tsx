@@ -28,7 +28,9 @@ interface StatusTimelineProps {
 }
 
 function getEventIcon(jobType: string, success: boolean) {
-  const cls = success ? "text-emerald-500" : "text-red-500";
+  const cls = success
+    ? "text-[var(--color-success)]"
+    : "text-[var(--color-destructive)]";
   const lower = jobType.toLowerCase();
   if (lower.includes("deploy"))
     return <Rocket className={`w-3.5 h-3.5 ${cls}`} />;
@@ -62,7 +64,7 @@ export function StatusTimeline({ results, max = 12 }: StatusTimelineProps) {
 
   if (!results || results.length === 0) {
     return (
-      <div className="text-xs text-[var(--color-muted-foreground)] py-3 border border-dashed border-[var(--color-card-border)] rounded-2xl px-4">
+      <div className="text-xs text-[var(--color-muted-foreground)] py-3 border border-dashed border-[var(--color-card-border)] rounded-lg px-4">
         No execution events yet. Trigger a deploy or Stream Logs to see the real
         timeline from JobResults.
       </div>
@@ -102,7 +104,7 @@ export function StatusTimeline({ results, max = 12 }: StatusTimelineProps) {
             {/* Dot + connector */}
             <div className="relative flex flex-col items-center pt-1">
               <div
-                className={`w-5 h-5 rounded-full flex items-center justify-center border ${r.success ? "bg-[var(--color-success)]/120/10 border-emerald-500/40" : "bg-[var(--color-destructive)]/100/10 border-red-500/40"}`}
+                className={`w-5 h-5 rounded-full flex items-center justify-center border ${r.success ? "bg-[var(--color-success)]/10 border-[var(--color-success)]/40" : "bg-[var(--color-destructive)]/10 border-[var(--color-destructive)]/40"}`}
               >
                 {getEventIcon(r.job_type, r.success)}
               </div>
@@ -118,7 +120,7 @@ export function StatusTimeline({ results, max = 12 }: StatusTimelineProps) {
                   {r.job_type}
                 </span>
                 <span
-                  className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${r.success ? "text-emerald-600 bg-[var(--color-success)]/120/10" : "text-[var(--color-destructive)] bg-[var(--color-destructive)]/100/10"}`}
+                  className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${r.success ? "text-[var(--color-success)] bg-[var(--color-success)]/10" : "text-[var(--color-destructive)] bg-[var(--color-destructive)]/10"}`}
                 >
                   {r.success ? "SUCCESS" : "FAILED"}
                 </span>

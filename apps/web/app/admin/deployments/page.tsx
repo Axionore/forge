@@ -1156,8 +1156,8 @@ export default function DeploymentsPage() {
                       className={`inline-flex items-center gap-1.5 rounded-full px-3 py-0.5 text-[10px] font-semibold tracking-wide border ${
                         item.deployment.rollout_state.last_statistical_analysis
                           .promotable
-                          ? "bg-[var(--color-success)]/120/10 text-emerald-600 border-emerald-500/20"
-                          : "bg-[var(--color-warning)]/100/10 text-amber-600 border-amber-500/20"
+                          ? "bg-[var(--color-success)]/10 text-[var(--color-success)] border-[var(--color-success)]/20"
+                          : "bg-[var(--color-warning)]/10 text-[var(--color-warning)] border-[var(--color-warning)]/20"
                       }`}
                     >
                       {item.deployment.rollout_state.last_statistical_analysis
@@ -1173,7 +1173,7 @@ export default function DeploymentsPage() {
                     </div>
                   </div>
 
-                  <div className="rounded-2xl border border-[var(--color-card-border)] bg-[var(--color-muted)]/30 p-4 text-sm">
+                  <div className="rounded-lg border border-[var(--color-card-border)] bg-[var(--color-muted)]/30 p-4 text-sm">
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                       {/* Key decision metrics */}
                       <div>
@@ -1323,221 +1323,227 @@ export default function DeploymentsPage() {
       )}
 
       {/* Detail / Logs Panel (richer view) */}
-      {selectedDeployment && (
-        <div
-          className="fixed inset-0 bg-black/40 flex items-center justify-center z-[100] p-4"
-          onClick={() => setSelectedDeployment(null)}
-        >
-          <div
-            className="bg-[var(--color-card)] rounded-3xl max-w-4xl w-full max-h-[90vh] overflow-auto border border-[var(--color-card-border)]"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="p-6 border-b flex justify-between items-center">
+      <Dialog.Root
+        open={!!selectedDeployment}
+        onOpenChange={(o) => !o && setSelectedDeployment(null)}
+      >
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 bg-black/40 z-[100]" />
+          <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 bg-[var(--color-card)] rounded-xl max-w-4xl w-[calc(100vw-2rem)] max-h-[90vh] overflow-auto border border-[var(--color-card-border)] z-[101] focus:outline-none">
+            {selectedDeployment && (
               <div>
-                <div className="font-semibold text-xl">
-                  Deployment {selectedDeployment.deployment.id}
-                </div>
-                <div className="text-sm text-[var(--color-muted-foreground)]">
-                  v{selectedDeployment.deployment.version} • Status:{" "}
-                  {selectedDeployment.deployment.status}
-                </div>
-              </div>
-              <button
-                onClick={() => setSelectedDeployment(null)}
-                className="text-2xl leading-none"
-              >
-                ×
-              </button>
-            </div>
-
-            <div className="p-6 space-y-6">
-              {/* Strategy preview */}
-              <div>
-                <div className="font-medium mb-2">Update Strategy</div>
-                <div className="text-sm p-3 bg-[var(--color-muted)] rounded-xl">
-                  Rolling update with health gates (full strategies coming
-                  soon).
-                </div>
-              </div>
-
-              {/* Change diff (simple) */}
-              <div>
-                <div className="font-medium mb-2">Spec (current)</div>
-                <pre className="text-xs bg-black text-green-400 p-4 rounded-xl overflow-auto max-h-48">
-                  {JSON.stringify(selectedDeployment.deployment.spec, null, 2)}
-                </pre>
-              </div>
-
-              {/* Logs streaming button (placeholder for real WS/SSE) */}
-              <div>
-                <button
-                  onClick={() =>
-                    alert(
-                      "Logs streaming would open a live tail here (calls future /deployments/{id}/logs WS or SSE endpoint using agent's ContainerLogs job)",
-                    )
-                  }
-                  className="px-4 py-2 rounded-xl border hover:bg-[var(--color-muted)] text-sm"
-                >
-                  Stream Live Logs →
-                </button>
-                <div className="text-xs mt-1 text-[var(--color-muted-foreground)]">
-                  Uses agent ContainerLogs + attach under the hood.
-                </div>
-              </div>
-
-              {/* Feature 5: Preview actions for git-linked deployments */}
-              {selectedDeployment?.deployment?.git_source_id && (
-                <div className="pt-4 border-t">
-                  <div className="font-medium mb-2 text-amber-600">
-                    This is a Git Preview
+                <div className="p-6 border-b flex justify-between items-center">
+                  <div>
+                    <Dialog.Title className="font-semibold text-xl">
+                      Deployment {selectedDeployment.deployment.id}
+                    </Dialog.Title>
+                    <Dialog.Description className="text-sm text-[var(--color-muted-foreground)]">
+                      v{selectedDeployment.deployment.version} • Status:{" "}
+                      {selectedDeployment.deployment.status}
+                    </Dialog.Description>
                   </div>
-                  <div className="flex gap-2">
-                    <button
-                      onClick={async () => {
-                        if (!adminToken || !selectedDeployment) return;
-                        try {
-                          const res = await fetch(
-                            `${API_BASE}/admin/deployments/${selectedDeployment.deployment.id}/promote`,
-                            {
-                              method: "POST",
-                              headers,
-                            },
-                          );
-                          if (res.ok) {
-                            alert(
-                              "Promote dispatched (main spec updated + Deploy jobs sent to agents). Refreshing...",
-                            );
-                            await fetchDeployments();
-                            // re-select to refresh detail
-                            const updated = deployments.find(
-                              (d: any) =>
-                                d.deployment.id ===
-                                selectedDeployment.deployment.id,
-                            );
-                            if (updated) setSelectedDeployment(updated);
-                          } else {
-                            alert("Promote failed: " + (await res.text()));
-                          }
-                        } catch (e: any) {
-                          alert("Error: " + e.message);
-                        }
-                      }}
-                      className="px-3 py-1 text-sm rounded border bg-[var(--color-success)]/12 hover:bg-emerald-100"
-                    >
-                      Promote to Production
+                  <Dialog.Close asChild>
+                    <button className="btn btn-ghost btn-sm" aria-label="Close">
+                      <X className="h-4 w-4" />
                     </button>
+                  </Dialog.Close>
+                </div>
+
+                <div className="p-6 space-y-6">
+                  {/* Strategy preview */}
+                  <div>
+                    <div className="font-medium mb-2">Update Strategy</div>
+                    <div className="text-sm p-3 bg-[var(--color-muted)] rounded-xl">
+                      Rolling update with health gates (full strategies coming
+                      soon).
+                    </div>
+                  </div>
+
+                  {/* Change diff (simple) */}
+                  <div>
+                    <div className="font-medium mb-2">Spec (current)</div>
+                    <pre className="text-xs bg-[#0a0a0a] text-[var(--color-foreground)] p-4 rounded-xl overflow-auto max-h-48">
+                      {JSON.stringify(
+                        selectedDeployment.deployment.spec,
+                        null,
+                        2,
+                      )}
+                    </pre>
+                  </div>
+
+                  {/* Logs streaming button (placeholder for real WS/SSE) */}
+                  <div>
                     <button
-                      onClick={async () => {
-                        if (!adminToken || !selectedDeployment) return;
-                        if (
-                          !confirm(
-                            "Destroy this preview deployment? This will stop containers on agents.",
-                          )
+                      onClick={() =>
+                        alert(
+                          "Logs streaming would open a live tail here (calls future /deployments/{id}/logs WS or SSE endpoint using agent's ContainerLogs job)",
                         )
-                          return;
-                        try {
-                          const res = await fetch(
-                            `${API_BASE}/admin/deployments/${selectedDeployment.deployment.id}/destroy`,
-                            {
-                              method: "POST",
-                              headers,
-                            },
-                          );
-                          if (res.ok) {
-                            alert(
-                              "Destroy dispatched (Stop jobs sent). Refreshing...",
-                            );
-                            await fetchDeployments();
-                            setSelectedDeployment(null);
-                          } else {
-                            alert("Destroy failed: " + (await res.text()));
-                          }
-                        } catch (e: any) {
-                          alert("Error: " + e.message);
-                        }
-                      }}
-                      className="px-3 py-1 text-sm rounded border bg-[var(--color-destructive)]/10 hover:bg-red-100"
+                      }
+                      className="px-4 py-2 rounded-xl border hover:bg-[var(--color-muted)] text-sm"
                     >
-                      Destroy Preview
+                      Stream Live Logs →
                     </button>
+                    <div className="text-xs mt-1 text-[var(--color-muted-foreground)]">
+                      Uses agent ContainerLogs + attach under the hood.
+                    </div>
+                  </div>
+
+                  {/* Feature 5: Preview actions for git-linked deployments */}
+                  {selectedDeployment?.deployment?.git_source_id && (
+                    <div className="pt-4 border-t">
+                      <div className="font-medium mb-2 text-[var(--color-warning)]">
+                        This is a Git Preview
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={async () => {
+                            if (!adminToken || !selectedDeployment) return;
+                            try {
+                              const res = await fetch(
+                                `${API_BASE}/admin/deployments/${selectedDeployment.deployment.id}/promote`,
+                                {
+                                  method: "POST",
+                                  headers,
+                                },
+                              );
+                              if (res.ok) {
+                                alert(
+                                  "Promote dispatched (main spec updated + Deploy jobs sent to agents). Refreshing...",
+                                );
+                                await fetchDeployments();
+                                // re-select to refresh detail
+                                const updated = deployments.find(
+                                  (d: any) =>
+                                    d.deployment.id ===
+                                    selectedDeployment.deployment.id,
+                                );
+                                if (updated) setSelectedDeployment(updated);
+                              } else {
+                                alert("Promote failed: " + (await res.text()));
+                              }
+                            } catch (e: any) {
+                              alert("Error: " + e.message);
+                            }
+                          }}
+                          className="btn btn-ghost btn-sm"
+                        >
+                          Promote to Production
+                        </button>
+                        <button
+                          onClick={async () => {
+                            if (!adminToken || !selectedDeployment) return;
+                            if (
+                              !confirm(
+                                "Destroy this preview deployment? This will stop containers on agents.",
+                              )
+                            )
+                              return;
+                            try {
+                              const res = await fetch(
+                                `${API_BASE}/admin/deployments/${selectedDeployment.deployment.id}/destroy`,
+                                {
+                                  method: "POST",
+                                  headers,
+                                },
+                              );
+                              if (res.ok) {
+                                alert(
+                                  "Destroy dispatched (Stop jobs sent). Refreshing...",
+                                );
+                                await fetchDeployments();
+                                setSelectedDeployment(null);
+                              } else {
+                                alert("Destroy failed: " + (await res.text()));
+                              }
+                            } catch (e: any) {
+                              alert("Error: " + e.message);
+                            }
+                          }}
+                          className="btn btn-danger btn-sm"
+                        >
+                          Destroy Preview
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Feature 3: Backups (manual trigger + history) */}
+                  <div>
+                    <div className="font-medium mb-2">Backups</div>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() =>
+                          triggerBackup(selectedDeployment.deployment.id)
+                        }
+                        disabled={!adminToken}
+                        className="px-4 py-2 rounded-xl border hover:bg-[var(--color-muted)] text-sm disabled:opacity-50"
+                      >
+                        Trigger Manual Backup (Postgres)
+                      </button>
+                      <button
+                        onClick={() =>
+                          alert(
+                            "Full backup schedule UI + history coming in next slice. Tables and API are already live.",
+                          )
+                        }
+                        className="px-4 py-2 rounded-xl border hover:bg-[var(--color-muted)] text-sm"
+                      >
+                        Manage Schedules
+                      </button>
+                    </div>
+                    <div className="text-xs mt-1 text-[var(--color-muted-foreground)]">
+                      Uses the new Job::Backup on the agent (pg_dump + optional
+                      S3). Results appear in history and fire notifications.
+                    </div>
+                  </div>
+
+                  {/* Feature 4: Web Terminal */}
+                  <div>
+                    <button
+                      onClick={() => {
+                        setTerminalContainer("postgres"); // default to main container from catalog examples
+                        setTerminalOutput([
+                          "Welcome to Forge Web Terminal (v1)",
+                          "Type commands below. Full PTY coming next.",
+                        ]);
+                        setShowTerminal(true);
+                      }}
+                      className="px-4 py-2 rounded-xl border hover:bg-[var(--color-muted)] text-sm"
+                    >
+                      Open Web Terminal →
+                    </button>
+                    <div className="text-xs mt-1 text-[var(--color-muted-foreground)]">
+                      Live exec in container (tty + real Job::Exec under the
+                      hood).
+                    </div>
+                  </div>
+
+                  {/* Per-container health from recent HealthCheck results */}
+                  <div>
+                    <div className="font-medium mb-2">
+                      Per-Container Health (from HealthCheck jobs)
+                    </div>
+                    {selectedDeployment.recent_results?.filter(
+                      (r: any) => r.job_type === "health_check",
+                    ).length > 0 ? (
+                      <div className="text-sm">
+                        Latest health data available in results above. Deep
+                        stats (CPU/mem/net from agent HealthCheck) will appear
+                        here in richer format.
+                      </div>
+                    ) : (
+                      <div className="text-sm text-[var(--color-muted-foreground)]">
+                        No recent health check data. Trigger a HealthCheck job
+                        for this deployment to populate container-level metrics.
+                      </div>
+                    )}
                   </div>
                 </div>
-              )}
-
-              {/* Feature 3: Backups (manual trigger + history) */}
-              <div>
-                <div className="font-medium mb-2">Backups</div>
-                <div className="flex gap-2">
-                  <button
-                    onClick={() =>
-                      triggerBackup(selectedDeployment.deployment.id)
-                    }
-                    disabled={!adminToken}
-                    className="px-4 py-2 rounded-xl border hover:bg-[var(--color-muted)] text-sm disabled:opacity-50"
-                  >
-                    Trigger Manual Backup (Postgres)
-                  </button>
-                  <button
-                    onClick={() =>
-                      alert(
-                        "Full backup schedule UI + history coming in next slice. Tables and API are already live.",
-                      )
-                    }
-                    className="px-4 py-2 rounded-xl border hover:bg-[var(--color-muted)] text-sm"
-                  >
-                    Manage Schedules
-                  </button>
-                </div>
-                <div className="text-xs mt-1 text-[var(--color-muted-foreground)]">
-                  Uses the new Job::Backup on the agent (pg_dump + optional S3).
-                  Results appear in history and fire notifications.
-                </div>
               </div>
-
-              {/* Feature 4: Web Terminal */}
-              <div>
-                <button
-                  onClick={() => {
-                    setTerminalContainer("postgres"); // default to main container from catalog examples
-                    setTerminalOutput([
-                      "Welcome to Forge Web Terminal (v1)",
-                      "Type commands below. Full PTY coming next.",
-                    ]);
-                    setShowTerminal(true);
-                  }}
-                  className="px-4 py-2 rounded-xl border hover:bg-[var(--color-muted)] text-sm"
-                >
-                  Open Web Terminal →
-                </button>
-                <div className="text-xs mt-1 text-[var(--color-muted-foreground)]">
-                  Live exec in container (tty + real Job::Exec under the hood).
-                </div>
-              </div>
-
-              {/* Per-container health from recent HealthCheck results */}
-              <div>
-                <div className="font-medium mb-2">
-                  Per-Container Health (from HealthCheck jobs)
-                </div>
-                {selectedDeployment.recent_results?.filter(
-                  (r: any) => r.job_type === "health_check",
-                ).length > 0 ? (
-                  <div className="text-sm">
-                    Latest health data available in results above. Deep stats
-                    (CPU/mem/net from agent HealthCheck) will appear here in
-                    richer format.
-                  </div>
-                ) : (
-                  <div className="text-sm text-[var(--color-muted-foreground)]">
-                    No recent health check data. Trigger a HealthCheck job for
-                    this deployment to populate container-level metrics.
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+            )}
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
 
       {/* Logs Streaming Dialog — enhanced (timestamps, real filter+highlight, pause-on-scroll, copy, follow) */}
       <Dialog.Root
@@ -1548,7 +1554,7 @@ export default function DeploymentsPage() {
       >
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 bg-black/60 z-[150]" />
-          <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-full max-w-5xl h-[70vh] rounded-3xl border border-[var(--color-card-border)] bg-[#0a0a0a] text-[#d1d5db] shadow-2xl z-[160] flex flex-col overflow-hidden">
+          <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-full max-w-5xl h-[70vh] rounded-xl border border-[var(--color-card-border)] bg-[#0a0a0a] text-[#d1d5db] shadow-2xl z-[160] flex flex-col overflow-hidden focus:outline-none">
             <div className="flex items-center justify-between px-6 py-4 border-b border-white/10 bg-black/40">
               <div className="flex items-center gap-3">
                 <Dialog.Title className="font-semibold text-lg">
@@ -1559,22 +1565,22 @@ export default function DeploymentsPage() {
                 <div
                   className={`flex items-center gap-1.5 text-xs px-2.5 py-0.5 rounded-full border ${
                     logsConnectionStatus === "connected"
-                      ? "bg-[var(--color-success)]/120/10 border-emerald-500/40 text-emerald-400"
+                      ? "bg-[var(--color-success)]/10 border-[var(--color-success)]/40 text-[var(--color-success)]"
                       : logsConnectionStatus === "connecting"
-                        ? "bg-[var(--color-warning)]/100/10 border-amber-500/40 text-amber-400"
+                        ? "bg-[var(--color-warning)]/10 border-[var(--color-warning)]/40 text-[var(--color-warning)]"
                         : logsConnectionStatus === "error"
-                          ? "bg-[var(--color-destructive)]/100/10 border-red-500/40 text-red-400"
+                          ? "bg-[var(--color-destructive)]/10 border-[var(--color-destructive)]/40 text-[var(--color-destructive)]"
                           : "bg-[var(--color-card)]/5 border-white/20 text-[#9ca3af]"
                   }`}
                 >
                   <div
                     className={`w-1.5 h-1.5 rounded-full ${
                       logsConnectionStatus === "connected"
-                        ? "bg-emerald-400"
+                        ? "bg-[var(--color-success)]"
                         : logsConnectionStatus === "connecting"
-                          ? "bg-amber-400 animate-pulse"
+                          ? "bg-[var(--color-warning)] animate-pulse"
                           : logsConnectionStatus === "error"
-                            ? "bg-red-400"
+                            ? "bg-[var(--color-destructive)]"
                             : "bg-[#6b7280]"
                     }`}
                   />
@@ -1587,7 +1593,7 @@ export default function DeploymentsPage() {
                     setFollowLogs(!followLogs);
                     if (!followLogs) setLogsPaused(false);
                   }}
-                  className={`text-xs px-3 py-1 rounded border transition flex items-center gap-1 ${followLogs ? "bg-[var(--color-success)]/120/20 border-emerald-500 text-emerald-400" : "border-white/20 hover:bg-[var(--color-card)]/5"}`}
+                  className={`text-xs px-3 py-1 rounded border transition flex items-center gap-1 ${followLogs ? "bg-[var(--color-success)]/20 border-[var(--color-success)] text-[var(--color-success)]" : "border-white/20 hover:bg-[var(--color-card)]/5"}`}
                 >
                   {followLogs ? (
                     <Play className="w-3 h-3" />
@@ -1602,7 +1608,7 @@ export default function DeploymentsPage() {
                       setLogsPaused(false);
                       setFollowLogs(true);
                     }}
-                    className="text-[10px] px-2 py-0.5 rounded border border-amber-500/40 text-amber-400"
+                    className="text-[10px] px-2 py-0.5 rounded border border-[var(--color-warning)]/40 text-[var(--color-warning)]"
                   >
                     Resume follow
                   </button>
@@ -1662,6 +1668,7 @@ export default function DeploymentsPage() {
                 <input
                   type="text"
                   placeholder="Filter (live highlight)..."
+                  aria-label="Filter log lines"
                   value={logsFilter}
                   onChange={(e) => setLogsFilter(e.target.value)}
                   className="bg-black/60 border border-white/10 rounded px-3 py-1 text-xs w-72 focus:outline-none focus:border-white/30"
@@ -1709,7 +1716,7 @@ export default function DeploymentsPage() {
       <Dialog.Root open={showCatalog} onOpenChange={setShowCatalog}>
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 bg-black/60 z-50" />
-          <Dialog.Content className="fixed left-1/2 top-1/2 z-[60] w-[95vw] max-w-5xl -translate-x-1/2 -translate-y-1/2 rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-8 shadow-2xl focus:outline-none">
+          <Dialog.Content className="fixed left-1/2 top-1/2 z-[60] w-[95vw] max-w-5xl -translate-x-1/2 -translate-y-1/2 rounded-xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-8 shadow-2xl focus:outline-none">
             <div className="flex items-start justify-between mb-6">
               <div>
                 <Dialog.Title className="text-2xl font-semibold tracking-tight">
@@ -1731,7 +1738,7 @@ export default function DeploymentsPage() {
               {catalogItems.map((item) => (
                 <div
                   key={item.id}
-                  className="group rounded-2xl border border-[var(--color-card-border)] bg-[var(--color-muted)]/30 p-5 hover:border-[var(--color-primary)] transition-all flex flex-col"
+                  className="group rounded-lg border border-[var(--color-card-border)] bg-[var(--color-muted)]/30 p-5 hover:border-[var(--color-primary)] transition-all flex flex-col"
                 >
                   <div className="text-[10px] uppercase tracking-widest text-[var(--color-muted-foreground)] mb-1">
                     {item.category}
@@ -1765,7 +1772,7 @@ export default function DeploymentsPage() {
       <Dialog.Root open={showGitSources} onOpenChange={setShowGitSources}>
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 bg-black/60 z-50" />
-          <Dialog.Content className="fixed left-1/2 top-1/2 z-[60] w-[95vw] max-w-4xl -translate-x-1/2 -translate-y-1/2 rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-8 shadow-2xl focus:outline-none">
+          <Dialog.Content className="fixed left-1/2 top-1/2 z-[60] w-[95vw] max-w-4xl -translate-x-1/2 -translate-y-1/2 rounded-xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-8 shadow-2xl focus:outline-none">
             <div className="flex items-start justify-between mb-6">
               <div>
                 <Dialog.Title className="text-2xl font-semibold tracking-tight">
@@ -1784,7 +1791,7 @@ export default function DeploymentsPage() {
             </div>
 
             {/* Connect Form - nice and polished */}
-            <div className="mb-8 border border-[var(--color-card-border)] rounded-2xl p-6 bg-[var(--color-muted)]/20">
+            <div className="mb-8 border border-[var(--color-card-border)] rounded-lg p-6 bg-[var(--color-muted)]/20">
               <div className="font-semibold mb-4">Connect New Source</div>
               <form
                 onSubmit={async (e) => {
@@ -1940,7 +1947,7 @@ export default function DeploymentsPage() {
       >
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 bg-black/60 z-50" />
-          <Dialog.Content className="fixed left-1/2 top-1/2 z-[60] w-[95vw] max-w-4xl -translate-x-1/2 -translate-y-1/2 rounded-3xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-8 shadow-2xl focus:outline-none">
+          <Dialog.Content className="fixed left-1/2 top-1/2 z-[60] w-[95vw] max-w-4xl -translate-x-1/2 -translate-y-1/2 rounded-xl border border-[var(--color-card-border)] bg-[var(--color-card)] p-8 shadow-2xl focus:outline-none">
             <div className="flex items-start justify-between mb-6">
               <div>
                 <Dialog.Title className="text-2xl font-semibold tracking-tight">
@@ -1959,7 +1966,7 @@ export default function DeploymentsPage() {
             </div>
 
             {/* Create Form */}
-            <div className="mb-8 border border-[var(--color-card-border)] rounded-2xl p-6 bg-[var(--color-muted)]/20">
+            <div className="mb-8 border border-[var(--color-card-border)] rounded-lg p-6 bg-[var(--color-muted)]/20">
               <div className="font-semibold mb-4">Create New Secret</div>
               <form
                 onSubmit={async (e) => {
@@ -2077,7 +2084,7 @@ export default function DeploymentsPage() {
 
             {/* One-time plaintext reveal (exactly like enrollment tokens / webhook secrets) */}
             {justCreatedSecret && (
-              <div className="mt-4 rounded-2xl border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/10 p-4">
+              <div className="mt-4 rounded-lg border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/10 p-4">
                 <div className="font-semibold text-[var(--color-warning)] mb-1 flex items-center gap-2">
                   <AlertTriangle className="h-4 w-4" /> Copy this value now — it
                   will never be shown again.
