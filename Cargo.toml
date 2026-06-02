@@ -83,6 +83,12 @@ ssh-key = { version = "0.6", features = ["ed25519", "alloc"] }
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
+# URL parsing for outbound notification targets (SSRF validation)
+url = "2.5"
+
+# SMTP email delivery for notification channels (rustls, no native-tls/OpenSSL dependency)
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls", "pool"] }
+
 # gRPC + xDS (ADS) for true dynamic Envoy control plane (no sidecar restarts on canary steps)
 tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "tls-ring"] }
 prost = "0.14"

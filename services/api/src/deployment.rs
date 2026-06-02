@@ -1491,6 +1491,70 @@ impl DeploymentService {
     // (Discord/Slack/etc.) added in follow-up slices with proper secret handling.
     // =====================================================================
 
+    /// Validate a channel's `config` JSONB at creation time. URL-bearing channels
+    /// (discord/slack/webhook) must carry a syntactically-valid https URL to a
+    /// non-private literal host; telegram must carry a bounded token + chat_id; email
+    /// must carry host/from/to (or it is treated as "not configured" and will record a
+    /// `skipped` delivery rather than failing creation). Never surfaces secret values.
+    fn validate_channel_config(
+        channel_type: &str,
+        config: &serde_json::Value,
+    ) -> Result<(), DeploymentError> {
+        let url_field = |key: &str| -> Result<(), DeploymentError> {
+            let raw = config.get(key).and_then(|v| v.as_str()).unwrap_or("");
+            crate::notify::validate_url_syntax(raw, false)
+                .map(|_| ())
+                .map_err(|e| DeploymentError::InvalidInput(format!("{key}: {e}")))
+        };
+
+        match channel_type {
+            "discord" | "slack" | "webhook" => {
+                url_field("url")?;
+                // An optional generic-webhook signing secret is length-bounded.
+                if let Some(secret) = config.get("secret").and_then(|v| v.as_str()) {
+                    if secret.len() > 512 {
+                        return Err(DeploymentError::InvalidInput(
+                            "secret too long (max 512)".into(),
+                        ));
+                    }
+                }
+            }
+            "telegram" => {
+                let token = config.get("token").and_then(|v| v.as_str()).unwrap_or("");
+                if token.trim().is_empty() || token.len() > 256 {
+                    return Err(DeploymentError::InvalidInput(
+                        "telegram token is required (max 256 chars)".into(),
+                    ));
+                }
+                let has_chat = config
+                    .get("chat_id")
+                    .is_some_and(|v| v.is_string() || v.is_i64() || v.is_u64());
+                if !has_chat {
+                    return Err(DeploymentError::InvalidInput(
+                        "telegram chat_id is required".into(),
+                    ));
+                }
+            }
+            "email" => {
+                // host/from/to optional at creation: an unconfigured email channel is
+                // valid and yields an explicit `skipped` at send time. If present,
+                // length-bound them.
+                for key in ["host", "from", "to", "username"] {
+                    if let Some(v) = config.get(key).and_then(|v| v.as_str()) {
+                        if v.len() > 320 {
+                            return Err(DeploymentError::InvalidInput(format!(
+                                "{key} too long (max 320)"
+                            )));
+                        }
+                    }
+                }
+            }
+            // pushover and any future types: no URL to validate here.
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Create a new notification channel.
     pub async fn create_notification_channel(
         &self,
@@ -1509,6 +1573,13 @@ impl DeploymentService {
         if !allowed.contains(&channel_type) {
             return Err(DeploymentError::InvalidInput("invalid channel_type".into()));
         }
+
+        // Validate channel config up front so an SSRF-unsafe or malformed target is
+        // rejected at creation, not silently stored and only discovered at send time
+        // (OWASP A01/A10). URL-bearing channels must parse as https to a non-private
+        // literal host (DNS-level checks run again at send time to defeat rebinding).
+        // String inputs are length-bounded. We never echo secret material.
+        Self::validate_channel_config(channel_type, &config)?;
 
         let id = Uuid::now_v7();
         let now = Utc::now();
@@ -1659,8 +1730,17 @@ impl DeploymentService {
         Ok(out)
     }
 
-    /// Core trigger: called after important events (JobResult, canary promotion decision, system update, etc.).
-    /// For v1 we only audit (insert delivery rows). Real dispatch to channels happens in a later slice.
+    /// Core trigger: called after important events (JobResult, canary promotion
+    /// decision, system update, etc.). For each matching enabled subscription we insert
+    /// a `pending` delivery row, then spawn a NON-BLOCKING task that actually delivers
+    /// to the channel (Discord/Slack/Telegram/generic-webhook/email) and updates the
+    /// row with the real per-attempt outcome (`sent`/`failed`/`skipped` + status_code +
+    /// secret-free error). The caller (the deploy / canary path) never blocks on a slow
+    /// or hostile endpoint. Returns the number of deliveries enqueued.
+    ///
+    /// Channel `config` (which holds webhook URLs, bot tokens, SMTP creds, signing
+    /// secrets) is read inside the spawned task and NEVER written to the audit row or
+    /// logged — only the channel id + type and a coarse status are persisted (A09).
     pub async fn trigger_notifications(
         &self,
         event_type: &str,
@@ -1668,14 +1748,16 @@ impl DeploymentService {
         resource_id: Option<Uuid>,
         context: serde_json::Value,
     ) -> Result<u64, DeploymentError> {
-        // Find matching enabled subscriptions
+        // Join the channel so we have its type + config (and enabled flag) in one query.
         let subs = sqlx::query!(
             r#"
-            SELECT id, channel_id, events, filters
-            FROM notification_subscriptions
-            WHERE resource_type = $1
-              AND (resource_id IS NULL OR resource_id = $2)
-              AND enabled = true
+            SELECT s.id AS sub_id, s.channel_id, s.events,
+                   c.channel_type, c.config, c.enabled AS channel_enabled
+            FROM notification_subscriptions s
+            JOIN notification_channels c ON c.id = s.channel_id
+            WHERE s.resource_type = $1
+              AND (s.resource_id IS NULL OR s.resource_id = $2)
+              AND s.enabled = true
             "#,
             resource_type,
             resource_id
@@ -1684,31 +1766,31 @@ impl DeploymentService {
         .await
         .map_err(|e| DeploymentError::Internal(e.into()))?;
 
-        let mut delivered = 0u64;
+        let mut enqueued = 0u64;
 
         for sub in subs {
-            // Simple event match (events is JSONB array of strings)
+            // Simple event match (events is JSONB array of strings; "*" = all).
             let matches_event = if let Some(arr) = sub.events.as_array() {
                 arr.iter()
                     .any(|v| v.as_str().is_some_and(|s| s == event_type || s == "*"))
             } else {
                 true
             };
-
             if !matches_event {
                 continue;
             }
 
-            // Insert audit delivery row (v1: status 'logged' = would have sent)
             let delivery_id = Uuid::now_v7();
-            let _ = sqlx::query!(
+            // Insert the audit row as `pending`; the spawned task flips it to the real
+            // terminal status. payload is the event context (no channel secrets).
+            let inserted = sqlx::query!(
                 r#"
                 INSERT INTO notification_deliveries
                     (id, subscription_id, channel_id, event_type, resource_type, resource_id, payload, status, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, 'logged', NOW())
+                VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', NOW())
                 "#,
                 delivery_id,
-                sub.id,
+                sub.sub_id,
                 sub.channel_id,
                 event_type,
                 resource_type,
@@ -1718,10 +1800,152 @@ impl DeploymentService {
             .execute(&self.pool)
             .await;
 
-            delivered += 1;
+            if inserted.is_err() {
+                continue;
+            }
+
+            // A disabled channel: record an explicit skipped status, don't dispatch.
+            if !sub.channel_enabled {
+                let _ = Self::finalize_delivery(
+                    &self.pool,
+                    delivery_id,
+                    crate::notify::DeliveryOutcome {
+                        status: "skipped",
+                        status_code: None,
+                        error: Some("channel disabled".into()),
+                    },
+                )
+                .await;
+                continue;
+            }
+
+            // Spawn the actual egress so the caller is never blocked (A10: bounded
+            // timeout + retry happen inside the dispatcher).
+            let pool = self.pool.clone();
+            let channel_type = sub.channel_type.clone();
+            let config = sub.config.clone();
+            let channel_id = sub.channel_id;
+            let event = event_type.to_string();
+            let ctx = context.clone();
+            let rtype = resource_type.to_string();
+            tokio::spawn(async move {
+                let outcome = Self::dispatch_to_channel(
+                    &channel_type,
+                    &config,
+                    &event,
+                    &rtype,
+                    resource_id,
+                    &ctx,
+                )
+                .await;
+                // Structured, secret-free log: channel id + type + coarse status only.
+                match outcome.status {
+                    "sent" => tracing::info!(
+                        channel_id = %channel_id,
+                        channel_type = %channel_type,
+                        event = %event,
+                        status_code = outcome.status_code,
+                        "notification delivered"
+                    ),
+                    "skipped" => tracing::info!(
+                        channel_id = %channel_id,
+                        channel_type = %channel_type,
+                        event = %event,
+                        reason = outcome.error.as_deref().unwrap_or(""),
+                        "notification skipped"
+                    ),
+                    _ => tracing::warn!(
+                        channel_id = %channel_id,
+                        channel_type = %channel_type,
+                        event = %event,
+                        status_code = outcome.status_code,
+                        error = outcome.error.as_deref().unwrap_or(""),
+                        "notification delivery failed"
+                    ),
+                }
+                let _ = Self::finalize_delivery(&pool, delivery_id, outcome).await;
+            });
+
+            enqueued += 1;
         }
 
-        Ok(delivered)
+        Ok(enqueued)
+    }
+
+    /// Render a message + payload for an event and dispatch it to one channel. Returns
+    /// the real outcome. Never logs or returns secret material from `config`.
+    async fn dispatch_to_channel(
+        channel_type: &str,
+        config: &serde_json::Value,
+        event_type: &str,
+        resource_type: &str,
+        resource_id: Option<Uuid>,
+        context: &serde_json::Value,
+    ) -> crate::notify::DeliveryOutcome {
+        // Human-readable message for chat channels.
+        let rid = resource_id.map_or_else(|| "-".to_string(), |id| id.to_string());
+        let message = format!("[forge] {event_type} on {resource_type} {rid}");
+        // Structured event payload for generic webhooks (signed if a secret is set).
+        let payload = serde_json::json!({
+            "event": event_type,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "context": context,
+        });
+
+        match channel_type {
+            "discord" => crate::notify::deliver_discord(config, &message).await,
+            "slack" => crate::notify::deliver_slack(config, &message).await,
+            "telegram" => crate::notify::deliver_telegram(config, &message).await,
+            "webhook" => crate::notify::deliver_generic_webhook(config, &payload).await,
+            "email" => {
+                let subject = format!("[forge] {event_type}");
+                crate::notify::deliver_email(config, &subject, &message).await
+            }
+            // pushover not yet implemented: explicit skip, never a fake success.
+            other => crate::notify::DeliveryOutcome {
+                status: "skipped",
+                status_code: None,
+                error: Some(format!("channel type '{other}' not implemented")),
+            },
+        }
+    }
+
+    /// Write the terminal status of a delivery attempt back to its audit row. Error text
+    /// is already secret-free (the dispatchers guarantee it).
+    async fn finalize_delivery(
+        pool: &PgPool,
+        delivery_id: Uuid,
+        outcome: crate::notify::DeliveryOutcome,
+    ) -> Result<(), DeploymentError> {
+        let sent_at = if outcome.status == "sent" {
+            Some(Utc::now())
+        } else {
+            None
+        };
+        // status_code is not a column in notification_deliveries; fold it into the error
+        // text for failures so the audit row is self-describing without schema churn.
+        let error = match (outcome.status, outcome.status_code, outcome.error) {
+            ("sent", _, _) => None,
+            (_, Some(code), Some(msg)) => Some(format!("[{code}] {msg}")),
+            (_, Some(code), None) => Some(format!("[{code}]")),
+            (_, None, msg) => msg,
+        };
+        sqlx::query!(
+            r#"
+            UPDATE notification_deliveries
+            SET status = $1, error = $2, sent_at = $3
+            WHERE id = $4
+            "#,
+            outcome.status,
+            error,
+            sent_at,
+            delivery_id
+        )
+        .execute(pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+        Ok(())
     }
 
     // =====================================================================
@@ -4008,5 +4232,172 @@ mod per_principal_rbac_tests {
             .await
             .unwrap();
         assert_eq!(record.created_by_principal_id, Some(pid));
+    }
+}
+
+#[cfg(test)]
+mod notification_delivery_tests {
+    //! Service-layer notification delivery tests (`#[sqlx::test]` → isolated DB +
+    //! `./migrations`). Cover the SSRF create-time gate, the audit-row lifecycle for
+    //! enabled-but-unreachable channels, and the explicit `skipped` path for an
+    //! unconfigured email channel. The actual HTTP egress shape/HMAC is covered by the
+    //! wiremock tests in the `notify` module.
+    use super::*;
+    use sqlx::PgPool;
+
+    fn svc_with(pool: PgPool) -> DeploymentService {
+        let rbac = std::sync::Arc::new(crate::rbac::RbacService::new(pool.clone()));
+        DeploymentService::new(pool, rbac)
+    }
+
+    #[sqlx::test]
+    async fn create_channel_rejects_ssrf_urls_at_creation(pool: PgPool) {
+        let svc = svc_with(pool);
+
+        for url in [
+            "https://127.0.0.1/hook",
+            "https://169.254.169.254/latest/meta-data", // cloud metadata
+            "https://10.1.2.3/hook",
+            "http://example.com/hook", // not https
+        ] {
+            let err = svc
+                .create_notification_channel("ssrf", "discord", serde_json::json!({ "url": url }))
+                .await
+                .expect_err(&format!("expected {url} rejected"));
+            assert!(matches!(err, DeploymentError::InvalidInput(_)), "{url}");
+        }
+
+        // A public https URL is accepted.
+        let ok = svc
+            .create_notification_channel(
+                "good",
+                "discord",
+                serde_json::json!({ "url": "https://discord.com/api/webhooks/x/y" }),
+            )
+            .await;
+        assert!(ok.is_ok(), "{ok:?}");
+    }
+
+    #[sqlx::test]
+    async fn trigger_writes_delivery_row_and_finalizes_failed_for_blocked_at_send(pool: PgPool) {
+        let svc = svc_with(pool.clone());
+
+        // Create the channel via a public host so the create-time gate passes, then
+        // re-point its stored config at a loopback host directly in the DB to simulate a
+        // DNS-rebinding / config-tamper scenario. At SEND time the runtime SSRF guard
+        // must catch it: the delivery row is written and finalized to 'failed' (a
+        // blocked host), never left 'pending' and never a fake 'sent'.
+        let chan = svc
+            .create_notification_channel(
+                "discord-rebind",
+                "discord",
+                serde_json::json!({ "url": "https://discord.com/api/webhooks/x/y" }),
+            )
+            .await
+            .unwrap();
+        let channel_id = Uuid::parse_str(chan["id"].as_str().unwrap()).unwrap();
+
+        // Tamper the stored config to point at loopback (bypassing the create-time gate).
+        sqlx::query!(
+            "UPDATE notification_channels SET config = $1 WHERE id = $2",
+            serde_json::json!({ "url": "https://127.0.0.1/webhook" }),
+            channel_id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Subscribe the system scope to all events on this channel.
+        svc.create_notification_subscription(
+            "system",
+            None,
+            channel_id,
+            serde_json::json!(["*"]),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        let enqueued = svc
+            .trigger_notifications(
+                "deploy.failed",
+                "system",
+                None,
+                serde_json::json!({"k":"v"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(enqueued, 1);
+
+        // The spawned delivery task must finalize the row off 'pending'. Poll briefly.
+        let mut finalized: Option<(String, Option<String>)> = None;
+        for _ in 0..40 {
+            let row = sqlx::query!(
+                "SELECT status, error FROM notification_deliveries WHERE channel_id = $1 ORDER BY created_at DESC LIMIT 1",
+                channel_id
+            )
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            if let Some(r) = row {
+                if r.status != "pending" {
+                    finalized = Some((r.status, r.error));
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, error) = finalized.expect("delivery row never finalized");
+        assert_eq!(status, "failed");
+        assert!(
+            error.as_deref().unwrap_or("").contains("not allowed"),
+            "expected blocked-host error, got {error:?}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn unconfigured_email_channel_is_skipped(pool: PgPool) {
+        let svc = svc_with(pool.clone());
+
+        // Email channel with no SMTP host/from/to → valid to create, skipped to send.
+        let chan = svc
+            .create_notification_channel("email-unset", "email", serde_json::json!({}))
+            .await
+            .unwrap();
+        let channel_id = Uuid::parse_str(chan["id"].as_str().unwrap()).unwrap();
+
+        svc.create_notification_subscription(
+            "system",
+            None,
+            channel_id,
+            serde_json::json!(["*"]),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        svc.trigger_notifications("deploy.healthy", "system", None, serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut status: Option<String> = None;
+        for _ in 0..20 {
+            let row = sqlx::query!(
+                "SELECT status, error FROM notification_deliveries WHERE channel_id = $1 ORDER BY created_at DESC LIMIT 1",
+                channel_id
+            )
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            if let Some(r) = row {
+                if r.status != "pending" {
+                    assert_eq!(r.error.as_deref(), Some("smtp not configured"));
+                    status = Some(r.status);
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(status.as_deref(), Some("skipped"));
     }
 }

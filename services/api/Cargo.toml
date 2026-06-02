@@ -43,6 +43,8 @@ age = { workspace = true }
 ssh-key = { workspace = true }
 rand = "0.8"
 hex = "0.4"
+url.workspace = true
+lettre.workspace = true
 
 # Prometheus exposition format (lightweight, no heavy client)
 prometheus = { version = "0.13", features = ["process"] }
@@ -69,3 +71,4 @@ rustls-pemfile.workspace = true
 
 [dev-dependencies]
 tokio-test = "0.4"
+wiremock.workspace = true

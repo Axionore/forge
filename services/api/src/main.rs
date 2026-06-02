@@ -34,6 +34,7 @@ mod agent_ws;
 mod deployment;
 mod enrollment;
 mod metrics;
+mod notify;
 mod provisioning;
 mod rbac;
 mod xds;
