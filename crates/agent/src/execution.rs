@@ -229,11 +229,10 @@ pub async fn execute_job(
             .await
         }
         Job::Build { .. } => {
-            // The Build variant and execute_build have pre-existing type/implementation mismatches
-            // in the current workspace snapshot (the feature is Phase 4 scoped).
-            // Stubbed here to allow a clean check for the Phase 1 Slice A work (Spec types move + comments).
-            // Real implementation will be completed in a later slice.
-            Ok(())
+            // `Job::Build` is fully handled by the early `execute_build_job` return at the top of
+            // this function (it produces a rich `JobResultDetails::Build`). Control never reaches
+            // here for a Build job; this arm only exists to keep the match exhaustive.
+            unreachable!("Job::Build is dispatched via execute_build_job before this match")
         }
     };
 
@@ -269,11 +268,12 @@ pub async fn execute_job(
 // Individual job handlers
 // =============================================================================
 
+#[cfg_attr(not(feature = "docker"), allow(unused_variables))]
 async fn execute_deploy(
-    _deployment_id: uuid::Uuid,
+    deployment_id: uuid::Uuid,
     spec: crate::job::DeploymentSpec,
-    _docker: Option<&DockerClient>,
-    _age_identity: Option<&age::x25519::Identity>,
+    docker: Option<&DockerClient>,
+    age_identity: Option<&age::x25519::Identity>,
 ) -> Result<()> {
     #[cfg(feature = "docker")]
     {
@@ -281,6 +281,7 @@ async fn execute_deploy(
         use bollard::image::CreateImageOptions;
         use bollard::models::{HealthConfig, HostConfig, RestartPolicy};
         use bollard::network::CreateNetworkOptions;
+        use std::os::unix::fs::PermissionsExt;
 
         let docker = docker.expect("Docker client must be provided when docker feature is enabled");
 
@@ -299,38 +300,34 @@ async fn execute_deploy(
 
         // Rich advanced network specs (full driver, IPAM, internal, attachable, ingress, ipv6, options, labels)
         for net in &spec.network_specs {
-            let ipam = if let Some(our_ipam) = &net.ipam {
-                Some(bollard::models::Ipam {
-                    driver: our_ipam.driver.clone(),
-                    config: if our_ipam.config.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            our_ipam
-                                .config
-                                .iter()
-                                .map(|pool| bollard::models::IpamConfig {
-                                    subnet: pool.subnet.clone(),
-                                    ip_range: pool.ip_range.clone(),
-                                    gateway: pool.gateway.clone(),
-                                    auxiliary_addresses: if pool.aux_addresses.is_empty() {
-                                        None
-                                    } else {
-                                        Some(pool.aux_addresses.iter().cloned().collect())
-                                    },
-                                })
-                                .collect(),
-                        )
-                    },
-                    options: if our_ipam.options.is_empty() {
-                        None
-                    } else {
-                        Some(our_ipam.options.iter().cloned().collect())
-                    },
-                })
-            } else {
-                None
-            };
+            let ipam = net.ipam.as_ref().map(|our_ipam| bollard::models::Ipam {
+                driver: our_ipam.driver.clone(),
+                config: if our_ipam.config.is_empty() {
+                    None
+                } else {
+                    Some(
+                        our_ipam
+                            .config
+                            .iter()
+                            .map(|pool| bollard::models::IpamConfig {
+                                subnet: pool.subnet.clone(),
+                                ip_range: pool.ip_range.clone(),
+                                gateway: pool.gateway.clone(),
+                                auxiliary_addresses: if pool.aux_addresses.is_empty() {
+                                    None
+                                } else {
+                                    Some(pool.aux_addresses.iter().cloned().collect())
+                                },
+                            })
+                            .collect(),
+                    )
+                },
+                options: if our_ipam.options.is_empty() {
+                    None
+                } else {
+                    Some(our_ipam.options.iter().cloned().collect())
+                },
+            });
 
             let mut labels = std::collections::HashMap::new();
             for (k, v) in &net.labels {
@@ -376,7 +373,6 @@ async fn execute_deploy(
                 driver,
                 driver_opts,
                 labels,
-                ..Default::default()
             };
             if let Err(e) = docker.create_volume(create_vol_opts).await {
                 // Many volumes are created implicitly by binds; only warn on real errors
@@ -400,7 +396,7 @@ async fn execute_deploy(
             std::collections::HashMap::new();
 
         if !spec.secrets.is_empty() {
-            if let Some(age_id) = _age_identity {
+            if let Some(age_id) = age_identity {
                 for secret in &spec.secrets {
                     match crate::job::decrypt_secret(&secret.ciphertext, age_id) {
                         Ok(plaintext) => match &secret.target {
@@ -422,15 +418,13 @@ async fn execute_deploy(
                                         }
                                     })
                                     .collect();
-                                let host_dir = format!(
-                                    "/dev/shm/forge-secrets/{}/{}",
-                                    _deployment_id, safe_name
-                                );
+                                let host_dir =
+                                    format!("/dev/shm/forge-secrets/{deployment_id}/{safe_name}");
                                 if let Err(e) = std::fs::create_dir_all(&host_dir) {
                                     warn!(secret=%secret.name, error=?e, "Failed to create secret dir on host tmpfs");
                                     continue;
                                 }
-                                let host_file = format!("{}/value", host_dir);
+                                let host_file = format!("{host_dir}/value");
                                 if let Err(e) = std::fs::write(&host_file, &plaintext) {
                                     warn!(secret=%secret.name, error=?e, "Failed to write secret to host tmpfs");
                                     continue;
@@ -439,18 +433,18 @@ async fn execute_deploy(
                                     &host_file,
                                     std::fs::Permissions::from_mode(0o600),
                                 );
-                                secret_file_binds.push(format!("{}:{}:ro", host_file, path));
+                                secret_file_binds.push(format!("{host_file}:{path}:ro"));
                                 secret_name_to_file.insert(secret.name.clone(), host_file.clone());
                                 info!(secret = %secret.name, path = %path, "Prepared secret file bind mount from host tmpfs (0600)");
                             }
                         },
                         Err(e) => {
                             error!(secret = %secret.name, error = ?e, "CRITICAL: Failed to decrypt secret for this agent — failing deploy (fail-closed)");
-                            return Err(anyhow::anyhow!(
+                            return Err(crate::AgentError::Internal(anyhow::anyhow!(
                                 "secret decryption failed for {}: {}",
                                 secret.name,
                                 e
-                            ));
+                            )));
                         }
                     }
                 }
@@ -458,9 +452,9 @@ async fn execute_deploy(
                 error!(
                     "Deployment references secrets but agent has no age_identity — this is a configuration/upgrade error. Failing deploy."
                 );
-                return Err(anyhow::anyhow!(
+                return Err(crate::AgentError::Internal(anyhow::anyhow!(
                     "agent missing age identity for secret decryption"
-                ));
+                )));
             }
         }
 
@@ -472,8 +466,7 @@ async fn execute_deploy(
                     let _ = std::fs::create_dir_all(workspace);
 
                     let ssh_cmd = format!(
-                        "ssh -i {} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
-                        key_path
+                        "ssh -i {key_path} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
                     );
 
                     info!(repo = %checkout.url, r#ref = %checkout.r#ref, "Performing SSH git checkout for private repo");
@@ -605,7 +598,7 @@ async fn execute_deploy(
             // Config mounts (treated as additional volume binds for now)
             for cfg in &container.configs {
                 if cfg.source.contains('/') || cfg.source.contains('\\') {
-                    let mode = cfg.mode.map(|m| format!(":{}", m)).unwrap_or_default();
+                    let mode = cfg.mode.map(|m| format!(":{m}")).unwrap_or_default();
                     binds.push(format!("{}:{}{}", cfg.source, cfg.target, mode));
                 } else {
                     binds.push(format!("{}:{}", cfg.source, cfg.target));
@@ -639,46 +632,28 @@ async fn execute_deploy(
                     let weighted_svc = format!("{}-weighted", container.name);
 
                     labels.insert(
-                        format!(
-                            "traefik.http.services.{}.loadbalancer.server.port",
-                            canary_svc
-                        ),
+                        format!("traefik.http.services.{canary_svc}.loadbalancer.server.port"),
                         "80".to_string(),
                     );
                     labels.insert(
-                        format!(
-                            "traefik.http.services.{}.loadbalancer.server.port",
-                            weighted_svc
-                        ),
+                        format!("traefik.http.services.{weighted_svc}.loadbalancer.server.port"),
                         "80".to_string(),
                     );
 
                     labels.insert(
-                        format!(
-                            "traefik.http.services.{}.weighted.services.0.name",
-                            weighted_svc
-                        ),
+                        format!("traefik.http.services.{weighted_svc}.weighted.services.0.name"),
                         container.name.clone(),
                     );
                     labels.insert(
-                        format!(
-                            "traefik.http.services.{}.weighted.services.0.weight",
-                            weighted_svc
-                        ),
+                        format!("traefik.http.services.{weighted_svc}.weighted.services.0.weight"),
                         (100u32.saturating_sub(weight)).to_string(),
                     );
                     labels.insert(
-                        format!(
-                            "traefik.http.services.{}.weighted.services.1.name",
-                            weighted_svc
-                        ),
+                        format!("traefik.http.services.{weighted_svc}.weighted.services.1.name"),
                         canary_svc.clone(),
                     );
                     labels.insert(
-                        format!(
-                            "traefik.http.services.{}.weighted.services.1.weight",
-                            weighted_svc
-                        ),
+                        format!("traefik.http.services.{weighted_svc}.weighted.services.1.weight"),
                         weight.to_string(),
                     );
 
@@ -690,7 +665,7 @@ async fn execute_deploy(
             }
 
             // Additional L7 middleware (headers, rate limiting, stripPrefix for canary paths, etc.)
-            if labels.get("forge.middleware.headers").is_some() {
+            if labels.contains_key("forge.middleware.headers") {
                 labels.insert(format!("traefik.http.middlewares.{}-headers.headers.customrequestheaders.X-Forge-Canary", container.name), "true".to_string());
                 labels.insert(
                     format!("traefik.http.routers.{}.middlewares", container.name),
@@ -714,7 +689,7 @@ async fn execute_deploy(
             // Exposed ports (not published)
             for expose_port in &container.expose {
                 labels.insert(
-                    format!("forge.exposed_port.{}", expose_port),
+                    format!("forge.exposed_port.{expose_port}"),
                     "true".to_string(),
                 );
             }
@@ -732,7 +707,6 @@ async fn execute_deploy(
                     start_period: hc.start_period,
                     start_interval: hc.start_interval,
                     retries: hc.retries,
-                    ..Default::default()
                 })
             } else {
                 // Fallback basic HTTP healthcheck
@@ -897,7 +871,6 @@ async fn execute_deploy(
                                 }),
                                 labels: if v.labels.is_empty() { None } else { Some(v.labels.iter().cloned().collect()) },
                             }),
-                            ..Default::default()
                         })
                         .collect(),
                 )
@@ -922,12 +895,7 @@ async fn execute_deploy(
                             capabilities: if dr.capabilities.is_empty() {
                                 None
                             } else {
-                                Some(
-                                    dr.capabilities
-                                        .iter()
-                                        .map(|cap_list| cap_list.clone())
-                                        .collect(),
-                                )
+                                Some(dr.capabilities.to_vec())
                             },
                             options: if dr.options.is_empty() {
                                 None
@@ -1230,12 +1198,12 @@ async fn execute_deploy(
                     let mut e: Vec<String> = container
                         .env
                         .iter()
-                        .map(|(k, v)| format!("{}={}", k, v))
+                        .map(|(k, v)| format!("{k}={v}"))
                         .collect();
                     // Tier 3-2: inject decrypted secrets as additional env vars (user env takes precedence if duplicate)
                     for (k, v) in &secret_env_additions {
-                        if !e.iter().any(|entry| entry.starts_with(&format!("{}=", k))) {
-                            e.push(format!("{}={}", k, v));
+                        if !e.iter().any(|entry| entry.starts_with(&format!("{k}="))) {
+                            e.push(format!("{k}={v}"));
                         }
                     }
                     e
@@ -1416,7 +1384,7 @@ admin:
                     name: envoy_name.clone(),
                     ..Default::default()
                 };
-                let envoy_cfg = bollard::models::Config {
+                let envoy_cfg = bollard::container::Config {
                     image: Some("envoyproxy/envoy:v1.31-latest".to_string()),
                     cmd: Some(vec![
                         "envoy".to_string(),
@@ -1543,7 +1511,7 @@ static_resources:
                     name: envoy_name.clone(),
                     ..Default::default()
                 };
-                let envoy_cfg = bollard::models::Config {
+                let envoy_cfg = bollard::container::Config {
                     image: Some("envoyproxy/envoy:v1.31-latest".to_string()),
                     cmd: Some(vec![
                         "envoy".to_string(),
@@ -1606,7 +1574,7 @@ static_resources:
             count = spec.containers.len(),
             "Deploy job completed successfully (Docker)"
         );
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(feature = "docker"))]
@@ -1906,7 +1874,7 @@ async fn execute_stop(
                 }
             }
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(feature = "docker"))]
@@ -1917,18 +1885,19 @@ async fn execute_stop(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "docker"), allow(unused_variables))]
 async fn execute_command(
-    _docker: Option<&DockerClient>,
-    _target_container: Option<String>,
+    docker: Option<&DockerClient>,
+    target_container: Option<String>,
     command: Vec<String>,
     working_dir: Option<String>,
-    _user: Option<String>,
+    user: Option<String>,
     env: Vec<String>,
     tty: Option<bool>,
     privileged: Option<bool>,
-    _attach_stdin: Option<bool>,
-    _interactive_session_id: Option<String>,
-    _exec_output_tx: Option<tokio::sync::mpsc::Sender<crate::receiver::AgentMessage>>,
+    attach_stdin: Option<bool>,
+    interactive_session_id: Option<String>,
+    exec_output_tx: Option<tokio::sync::mpsc::Sender<crate::receiver::AgentMessage>>,
 ) -> Result<()> {
     #[cfg(feature = "docker")]
     {
@@ -1936,7 +1905,7 @@ async fn execute_command(
         use futures_util::StreamExt;
 
         let docker =
-            _docker.expect("Docker client required for exec when docker feature is enabled");
+            docker.expect("Docker client required for exec when docker feature is enabled");
 
         let container_id = match target_container {
             Some(id) => id,
@@ -1985,10 +1954,9 @@ async fn execute_command(
 
         // Interactive PTY streaming bridge: if session_id and tx provided, stream live output as ExecOutput
         // instead of blocking collection. This enables full character-by-character PTY from agent to frontend.
-        if let (Some(session_id), Some(tx)) = (&_interactive_session_id, &_exec_output_tx) {
+        if let (Some(session_id), Some(tx)) = (&interactive_session_id, &exec_output_tx) {
             let tx = tx.clone();
             let session_id = session_id.clone();
-            let container_id = container_id.clone();
 
             // Move the start_result into the spawn for the interactive case
             tokio::spawn(async move {
@@ -2006,7 +1974,7 @@ async fn execute_command(
                         while let Some(Ok(msg)) = output.next().await {
                             let text = msg.to_string().trim_end().to_string();
                             if !text.is_empty() {
-                                let s = format!("{:?}", msg);
+                                let s = format!("{msg:?}");
                                 let stream = if s.contains("StdOut") || s.contains("stdout") {
                                     "stdout"
                                 } else if s.contains("StdErr") || s.contains("stderr") {
@@ -2014,7 +1982,7 @@ async fn execute_command(
                                 } else {
                                     "stdout"
                                 };
-                                let data = format!("{}\n", text).into_bytes();
+                                let data = format!("{text}\n").into_bytes();
                                 let _ = tx
                                     .send(crate::receiver::AgentMessage::ExecOutput {
                                         session_id: session_id.clone(),
@@ -2060,7 +2028,7 @@ async fn execute_command(
                     let text = msg.to_string().trim_end().to_string();
                     if !text.is_empty() {
                         // Best-effort classification via the Display/Debug of LogOutput
-                        let s = format!("{:?}", msg);
+                        let s = format!("{msg:?}");
                         if s.contains("StdOut") || s.contains("stdout") {
                             info!(output = %text, "exec stdout");
                             stdout.push_str(&text);
@@ -2097,7 +2065,7 @@ async fn execute_command(
         // NOTE: stdout/stderr/exit_code are now fully materialized here at maximum fidelity.
         // Future work (result reporting channel) will surface these as first-class values to the control plane.
 
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(feature = "docker"))]
@@ -2251,7 +2219,7 @@ async fn execute_health_check(_docker: Option<&DockerClient>) -> Result<()> {
             }
             Err(e) => warn!(error = ?e, "HealthCheck: failed to list managed containers"),
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(feature = "docker"))]
@@ -2262,17 +2230,18 @@ async fn execute_health_check(_docker: Option<&DockerClient>) -> Result<()> {
 }
 
 /// Live in-place update of a running container (zero-downtime resource / policy changes).
+#[cfg_attr(not(feature = "docker"), allow(unused_variables))]
 async fn execute_update_container(
-    _docker: Option<&DockerClient>,
+    docker: Option<&DockerClient>,
     target: String,
-    _resources: Option<crate::job::ContainerResources>,
-    _restart_policy: Option<String>,
+    resources: Option<crate::job::ContainerResources>,
+    restart_policy: Option<String>,
 ) -> Result<()> {
     #[cfg(feature = "docker")]
     {
         use bollard::container::UpdateContainerOptions;
 
-        let docker = _docker
+        let docker = docker
             .expect("Docker client required for container update when docker feature is enabled");
 
         info!(target = %target, "Applying live container update");
@@ -2314,13 +2283,12 @@ async fn execute_update_container(
             Err(e) => {
                 error!(target = %target, error = ?e, "Live container update failed");
                 return Err(crate::AgentError::Internal(anyhow::anyhow!(
-                    "update_container failed: {}",
-                    e
+                    "update_container failed: {e}"
                 )));
             }
         }
 
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(feature = "docker"))]
@@ -2335,16 +2303,17 @@ async fn execute_update_container(
 /// (forge.deployment_id + forge.component=envoy-l7), regenerates (or accepts) the weighted
 /// config, and performs a fast stop+recreate of *only the sidecar* (apps stay running).
 /// This gives live promotion effect with seconds of L7 flap instead of full redeploy.
+#[cfg_attr(not(feature = "docker"), allow(unused_variables))]
 async fn execute_update_l7_config(
-    _docker: Option<&DockerClient>,
+    docker: Option<&DockerClient>,
     deployment_id: uuid::Uuid,
     canary_weight: u32,
-    _envoy_container: Option<String>,
-    _envoy_config_yaml: Option<String>,
+    envoy_container: Option<String>,
+    envoy_config_yaml: Option<String>,
 ) -> Result<()> {
     #[cfg(feature = "docker")]
     {
-        let docker = _docker
+        let docker = docker
             .expect("Docker client required for L7 config update when docker feature is enabled");
 
         let weight = canary_weight.min(100);
@@ -2410,9 +2379,9 @@ static_resources:
                   weighted_clusters:
                     clusters:
                     - name: main_cluster
-                      weight: {}
+                      weight: {main_w}
                     - name: canary_cluster
-                      weight: {}
+                      weight: {weight}
           http_filters:
           - name: envoy.filters.http.router
             typed_config:
@@ -2444,7 +2413,7 @@ static_resources:
               socket_address:
                 address: app-canary
                 port_value: 80
-"#, main_w, weight));
+"#));
 
         // Fast sidecar swap: stop/rm/recreate/start with new config (apps untouched)
         // This is the practical "dynamic update" until full ADS xDS gRPC server is added.
@@ -2465,7 +2434,7 @@ static_resources:
             name: target_name.clone(),
             ..Default::default()
         };
-        let cfg = bollard::models::Config {
+        let cfg = bollard::container::Config {
             image: Some("envoyproxy/envoy:v1.31-latest".to_string()),
             cmd: Some(vec![
                 "envoy".to_string(),
@@ -2508,8 +2477,7 @@ static_resources:
         if let Err(e) = docker.create_container(Some(create_opts), cfg).await {
             warn!(error = ?e, envoy = %target_name, "Failed to recreate Envoy for L7 weight update");
             return Err(crate::AgentError::Internal(anyhow::anyhow!(
-                "envoy l7 recreate failed: {}",
-                e
+                "envoy l7 recreate failed: {e}"
             )));
         }
         if let Err(e) = docker
@@ -2521,8 +2489,7 @@ static_resources:
         {
             warn!(error = ?e, envoy = %target_name, "Failed to start updated Envoy sidecar");
             return Err(crate::AgentError::Internal(anyhow::anyhow!(
-                "envoy start after update failed: {}",
-                e
+                "envoy start after update failed: {e}"
             )));
         }
 
@@ -2541,29 +2508,24 @@ static_resources:
 // New advanced Docker handlers (TTY resize, top, volume/network inspect+prune, attach)
 // =============================================================================
 
+#[cfg_attr(not(feature = "docker"), allow(unused_variables))]
 async fn execute_resize_exec(
-    _docker: Option<&DockerClient>,
+    docker: Option<&DockerClient>,
     exec_id: String,
-    _width: u16,
-    _height: u16,
+    width: u16,
+    height: u16,
 ) -> Result<()> {
     #[cfg(feature = "docker")]
     {
         use bollard::exec::ResizeExecOptions;
 
-        let docker = _docker.expect("Docker client required for exec resize");
+        let docker = docker.expect("Docker client required for exec resize");
 
         info!(exec_id = %exec_id, width = width, height = height, "Resizing exec TTY");
         docker
-            .resize_exec(
-                &exec_id,
-                ResizeExecOptions {
-                    width: width,
-                    height: height,
-                },
-            )
+            .resize_exec(&exec_id, ResizeExecOptions { width, height })
             .await?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(feature = "docker"))]
@@ -2573,29 +2535,24 @@ async fn execute_resize_exec(
     }
 }
 
+#[cfg_attr(not(feature = "docker"), allow(unused_variables))]
 async fn execute_resize_container(
-    _docker: Option<&DockerClient>,
+    docker: Option<&DockerClient>,
     target: String,
-    _width: u16,
-    _height: u16,
+    width: u16,
+    height: u16,
 ) -> Result<()> {
     #[cfg(feature = "docker")]
     {
         use bollard::container::ResizeContainerTtyOptions;
 
-        let docker = _docker.expect("Docker client required for container resize");
+        let docker = docker.expect("Docker client required for container resize");
 
         info!(target = %target, width = width, height = height, "Resizing container TTY");
         docker
-            .resize_container_tty(
-                &target,
-                ResizeContainerTtyOptions {
-                    width: width,
-                    height: height,
-                },
-            )
+            .resize_container_tty(&target, ResizeContainerTtyOptions { width, height })
             .await?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(feature = "docker"))]
@@ -2621,7 +2578,7 @@ async fn execute_container_top(_docker: Option<&DockerClient>, target: String) -
             }
             Err(e) => warn!(target = %target, error = ?e, "Failed to get container top"),
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(feature = "docker"))]
@@ -2642,7 +2599,7 @@ async fn execute_inspect_volume(_docker: Option<&DockerClient>, name: String) ->
             }
             Err(e) => warn!(name = %name, error = ?e, "Failed to inspect volume"),
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(feature = "docker"))]
@@ -2652,15 +2609,16 @@ async fn execute_inspect_volume(_docker: Option<&DockerClient>, name: String) ->
     }
 }
 
+#[cfg_attr(not(feature = "docker"), allow(unused_variables))]
 async fn execute_prune_volumes(
-    _docker: Option<&DockerClient>,
-    _filters: Vec<(String, Vec<String>)>,
+    docker: Option<&DockerClient>,
+    filters: Vec<(String, Vec<String>)>,
 ) -> Result<()> {
     #[cfg(feature = "docker")]
     {
         use bollard::volume::PruneVolumesOptions;
 
-        let docker = _docker.expect("Docker client required");
+        let docker = docker.expect("Docker client required");
 
         let mut filter_map = std::collections::HashMap::new();
         for (k, v) in filters {
@@ -2678,7 +2636,7 @@ async fn execute_prune_volumes(
             }
             Err(e) => warn!(error = ?e, "Failed to prune volumes"),
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(feature = "docker"))]
@@ -2688,14 +2646,15 @@ async fn execute_prune_volumes(
     }
 }
 
+#[cfg_attr(not(feature = "docker"), allow(unused_variables))]
 async fn execute_inspect_network(
-    _docker: Option<&DockerClient>,
+    docker: Option<&DockerClient>,
     name: String,
-    _verbose: Option<bool>,
+    verbose: Option<bool>,
 ) -> Result<()> {
     #[cfg(feature = "docker")]
     {
-        let docker = _docker.expect("Docker client required");
+        let docker = docker.expect("Docker client required");
 
         let opts = Some(bollard::network::InspectNetworkOptions::<String> {
             verbose: verbose.unwrap_or(false),
@@ -2708,7 +2667,7 @@ async fn execute_inspect_network(
             }
             Err(e) => warn!(name = %name, error = ?e, "Failed to inspect network"),
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(feature = "docker"))]
@@ -2718,15 +2677,16 @@ async fn execute_inspect_network(
     }
 }
 
+#[cfg_attr(not(feature = "docker"), allow(unused_variables))]
 async fn execute_prune_networks(
-    _docker: Option<&DockerClient>,
-    _filters: Vec<(String, Vec<String>)>,
+    docker: Option<&DockerClient>,
+    filters: Vec<(String, Vec<String>)>,
 ) -> Result<()> {
     #[cfg(feature = "docker")]
     {
         use bollard::network::PruneNetworksOptions;
 
-        let docker = _docker.expect("Docker client required");
+        let docker = docker.expect("Docker client required");
 
         let mut filter_map = std::collections::HashMap::new();
         for (k, v) in filters {
@@ -2744,7 +2704,7 @@ async fn execute_prune_networks(
             }
             Err(e) => warn!(error = ?e, "Failed to prune networks"),
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(feature = "docker"))]
@@ -2755,22 +2715,23 @@ async fn execute_prune_networks(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "docker"), allow(unused_variables))]
 async fn execute_container_attach(
-    _docker: Option<&DockerClient>,
+    docker: Option<&DockerClient>,
     target: String,
-    _stdin: Option<bool>,
-    _stdout: Option<bool>,
-    _stderr: Option<bool>,
-    _stream: Option<bool>,
-    _logs: Option<bool>,
-    _detach_keys: Option<String>,
+    stdin: Option<bool>,
+    stdout: Option<bool>,
+    stderr: Option<bool>,
+    stream: Option<bool>,
+    logs: Option<bool>,
+    detach_keys: Option<String>,
 ) -> Result<()> {
     #[cfg(feature = "docker")]
     {
         use bollard::container::AttachContainerOptions;
         use futures_util::StreamExt;
 
-        let docker = _docker.expect("Docker client required for attach");
+        let docker = docker.expect("Docker client required for attach");
 
         info!(target = %target, "Starting full hijack attach to container");
 
@@ -2792,7 +2753,7 @@ async fn execute_container_attach(
                 Ok(log) => {
                     let text = log.to_string();
                     if !text.trim().is_empty() {
-                        let s = format!("{:?}", log);
+                        let s = format!("{log:?}");
                         if s.contains("StdOut") {
                             info!(attach = %text.trim_end(), "attach stdout");
                         } else if s.contains("StdErr") {
@@ -2807,7 +2768,7 @@ async fn execute_container_attach(
         }
 
         info!(target = %target, "Container attach stream ended");
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(feature = "docker"))]
@@ -2819,16 +2780,17 @@ async fn execute_container_attach(
 
 /// Real container logs with full advanced options (follow, tail, timestamps, since/until, stdout/stderr).
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "docker"), allow(unused_variables))]
 async fn execute_container_logs(
-    _docker: Option<&DockerClient>,
+    docker: Option<&DockerClient>,
     target: String,
     follow: Option<bool>,
     tail: Option<String>,
-    _timestamps: Option<bool>,
-    _since: Option<String>,
-    _until: Option<String>,
-    _stdout: Option<bool>,
-    _stderr: Option<bool>,
+    timestamps: Option<bool>,
+    since: Option<String>,
+    until: Option<String>,
+    stdout: Option<bool>,
+    stderr: Option<bool>,
 ) -> Result<()> {
     #[cfg(feature = "docker")]
     {
@@ -2836,7 +2798,7 @@ async fn execute_container_logs(
         use futures_util::stream::StreamExt;
 
         let docker =
-            _docker.expect("Docker client required for logs when docker feature is enabled");
+            docker.expect("Docker client required for logs when docker feature is enabled");
 
         info!(target = %target, "Streaming container logs with advanced options");
 
@@ -2864,7 +2826,7 @@ async fn execute_container_logs(
                     let text = output.to_string();
                     if !text.trim().is_empty() {
                         // Defensive classification (LogOutput variant inspection)
-                        let s = format!("{:?}", output);
+                        let s = format!("{output:?}");
                         if s.contains("StdOut") || s.contains("stdout") {
                             info!(log = %text.trim_end(), "container stdout");
                         } else if s.contains("StdErr") || s.contains("stderr") {
@@ -2881,7 +2843,7 @@ async fn execute_container_logs(
         }
 
         info!(target = %target, "Container logs stream completed");
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(feature = "docker"))]
@@ -2948,6 +2910,8 @@ async fn execute_backup(
             Some(false),
             Some(false),
             Some(false),
+            None,
+            None,
         )
         .await;
 
@@ -2981,7 +2945,7 @@ async fn execute_backup(
                 Some("s3 upload failed (demo)".to_string())
             }
         } else {
-            Some(format!("volume://backup-{}/dump.sql", deployment_id))
+            Some(format!("volume://backup-{deployment_id}/dump.sql"))
         };
 
         info!(
@@ -2993,7 +2957,7 @@ async fn execute_backup(
 
         // The rich JobResultDetails::Backup will be populated in the caller once we wire the result channel better.
         // For now the correlation + job_type already route it correctly.
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(feature = "docker"))]
@@ -3101,6 +3065,234 @@ async fn execute_build_job(
                     error_message: Some(msg),
                 },
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod dispatcher_coverage_tests {
+    //! Anti-rot guard for the Docker job dispatcher.
+    //!
+    //! The `forge-agent` Docker layer once silently bit-rotted because the handler
+    //! bodies in [`execute_job`] drifted away from the [`Job`] enum while the feature
+    //! was excluded from the default build. These tests pin the two halves together:
+    //!
+    //! * [`job_kind`] is an EXHAUSTIVE match over every `Job` variant, destructuring the
+    //!   exact fields the real dispatcher relies on. If a variant is added, removed, or a
+    //!   field is renamed, this stops compiling — the same failure mode the dispatcher has,
+    //!   but caught by `cargo test` even when nobody is looking at the Docker path.
+    //! * [`constructs_and_classifies_every_variant`] builds one value of each variant from
+    //!   its JSON wire form (the shape the control plane signs and sends) and asserts the
+    //!   classifier agrees, so the on-wire contract can't drift unnoticed either.
+
+    use super::*;
+    use crate::job::Job;
+
+    /// Exhaustive classifier — intentionally NO wildcard arm. Mirrors the field
+    /// destructuring in `execute_job` so the same drift that would break the real
+    /// dispatcher breaks this at compile time.
+    fn job_kind(job: &Job) -> &'static str {
+        match job {
+            Job::Deploy {
+                deployment_id: _,
+                spec: _,
+            } => "deploy",
+            Job::SystemUpdate {
+                update_id: _,
+                version: _,
+                binary_ref: _,
+                binary_sha256: _,
+            } => "system_update",
+            Job::Stop { target: _ } => "stop",
+            Job::Exec {
+                target_container: _,
+                command: _,
+                working_dir: _,
+                user: _,
+                env: _,
+                tty: _,
+                privileged: _,
+                attach_stdin: _,
+                interactive_session_id: _,
+            } => "exec",
+            Job::InteractiveStdin {
+                session_id: _,
+                data: _,
+            } => "interactive_stdin",
+            Job::HealthCheck => "health_check",
+            Job::UpdateContainer {
+                target: _,
+                resources: _,
+                restart_policy: _,
+            } => "update_container",
+            Job::UpdateL7Config {
+                deployment_id: _,
+                canary_weight: _,
+                envoy_container: _,
+                envoy_config_yaml: _,
+            } => "update_l7_config",
+            Job::ContainerLogs {
+                target: _,
+                follow: _,
+                tail: _,
+                timestamps: _,
+                since: _,
+                until: _,
+                stdout: _,
+                stderr: _,
+            } => "container_logs",
+            Job::ResizeExec {
+                exec_id: _,
+                width: _,
+                height: _,
+            } => "resize_exec",
+            Job::ResizeContainer {
+                target: _,
+                width: _,
+                height: _,
+            } => "resize_container",
+            Job::ContainerTop { target: _ } => "container_top",
+            Job::InspectVolume { name: _ } => "inspect_volume",
+            Job::PruneVolumes { filters: _ } => "prune_volumes",
+            Job::InspectNetwork {
+                name: _,
+                verbose: _,
+            } => "inspect_network",
+            Job::PruneNetworks { filters: _ } => "prune_networks",
+            Job::ContainerAttach {
+                target: _,
+                stdin: _,
+                stdout: _,
+                stderr: _,
+                stream: _,
+                logs: _,
+                detach_keys: _,
+            } => "container_attach",
+            Job::Backup {
+                deployment_id: _,
+                target_container: _,
+                db_type: _,
+                database: _,
+                s3: _,
+            } => "backup",
+            Job::Build {
+                build_id: _,
+                spec: _,
+                target_image: _,
+                registry_auth: _,
+            } => "build",
+        }
+    }
+
+    /// `(json wire value, expected job_kind)` for every `Job` variant. The minimal-but-valid
+    /// JSON exercises the real serde contract the control plane produces.
+    fn sample_jobs() -> Vec<(serde_json::Value, &'static str)> {
+        let deployment_spec = serde_json::json!({
+            "containers": [],
+            "networks": [],
+            "network_specs": [],
+            "volumes": [],
+            "registry_credentials": [],
+            "build": null,
+        });
+        let build_spec = serde_json::json!({
+            "source": { "url": "https://example.com/r.git", "ref": "main", "commit_sha": "abc123" },
+            "builder": { "type": "dockerfile" },
+            "image_name": "registry.example.com/app",
+            "image_tag": "abc123",
+        });
+
+        vec![
+            (
+                serde_json::json!({ "type": "deploy", "deployment_id": Uuid::nil(), "spec": deployment_spec }),
+                "deploy",
+            ),
+            (
+                serde_json::json!({ "type": "system_update", "update_id": Uuid::nil(), "version": "1.0.0", "binary_ref": "https://x/agent", "binary_sha256": "deadbeef" }),
+                "system_update",
+            ),
+            (
+                serde_json::json!({ "type": "stop", "target": { "type": "container", "id": "c1" } }),
+                "stop",
+            ),
+            (
+                serde_json::json!({ "type": "exec", "target_container": "c1", "command": ["ls"], "env": [] }),
+                "exec",
+            ),
+            (
+                serde_json::json!({ "type": "interactive_stdin", "session_id": "s1", "data": [1, 2, 3] }),
+                "interactive_stdin",
+            ),
+            (
+                serde_json::json!({ "type": "health_check" }),
+                "health_check",
+            ),
+            (
+                serde_json::json!({ "type": "update_container", "target": "c1" }),
+                "update_container",
+            ),
+            (
+                serde_json::json!({ "type": "update_l7_config", "deployment_id": Uuid::nil(), "canary_weight": 25 }),
+                "update_l7_config",
+            ),
+            (
+                serde_json::json!({ "type": "container_logs", "target": "c1" }),
+                "container_logs",
+            ),
+            (
+                serde_json::json!({ "type": "resize_exec", "exec_id": "e1", "width": 80, "height": 24 }),
+                "resize_exec",
+            ),
+            (
+                serde_json::json!({ "type": "resize_container", "target": "c1", "width": 80, "height": 24 }),
+                "resize_container",
+            ),
+            (
+                serde_json::json!({ "type": "container_top", "target": "c1" }),
+                "container_top",
+            ),
+            (
+                serde_json::json!({ "type": "inspect_volume", "name": "v1" }),
+                "inspect_volume",
+            ),
+            (
+                serde_json::json!({ "type": "prune_volumes", "filters": [] }),
+                "prune_volumes",
+            ),
+            (
+                serde_json::json!({ "type": "inspect_network", "name": "n1" }),
+                "inspect_network",
+            ),
+            (
+                serde_json::json!({ "type": "prune_networks", "filters": [] }),
+                "prune_networks",
+            ),
+            (
+                serde_json::json!({ "type": "container_attach", "target": "c1" }),
+                "container_attach",
+            ),
+            (
+                serde_json::json!({ "type": "backup", "deployment_id": Uuid::nil(), "target_container": "c1", "db_type": "postgres" }),
+                "backup",
+            ),
+            (
+                serde_json::json!({ "type": "build", "build_id": Uuid::nil(), "spec": build_spec, "target_image": "registry.example.com/app:abc123" }),
+                "build",
+            ),
+        ]
+    }
+
+    #[test]
+    fn constructs_and_classifies_every_variant() {
+        for (value, expected) in sample_jobs() {
+            let job: Job = serde_json::from_value(value.clone()).unwrap_or_else(|e| {
+                panic!("variant {expected} failed to deserialize: {e}\n{value}")
+            });
+            assert_eq!(
+                job_kind(&job),
+                expected,
+                "classifier disagreed for {expected}"
+            );
         }
     }
 }
