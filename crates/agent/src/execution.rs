@@ -56,6 +56,56 @@ pub async fn execute_job(
         .await;
     }
 
+    // Backup and Restore produce rich `JobResultDetails` (size/location/message) and need
+    // their own result shape — they are handled before the generic Ok(())/Err(()) dispatch
+    // so the control plane gets first-class backup/restore reporting.
+    if let Job::Backup {
+        deployment_id,
+        target_container,
+        db_type,
+        database,
+        s3,
+        secrets,
+    } = job.clone()
+    {
+        return execute_backup(
+            docker,
+            deployment_id,
+            target_container,
+            db_type,
+            database,
+            s3,
+            secrets,
+            age_identity,
+            started_at,
+        )
+        .await;
+    }
+    if let Job::Restore {
+        restore_id,
+        deployment_id,
+        target_container,
+        db_type,
+        database,
+        s3,
+        secrets,
+    } = job.clone()
+    {
+        return execute_restore(
+            docker,
+            restore_id,
+            deployment_id,
+            target_container,
+            db_type,
+            database,
+            s3,
+            secrets,
+            age_identity,
+            started_at,
+        )
+        .await;
+    }
+
     // Determine correlation + type for reporting
     let (correlation_id, job_type) = match &job {
         Job::Deploy { deployment_id, .. } => (deployment_id.to_string(), "deploy".to_string()),
@@ -92,6 +142,7 @@ pub async fn execute_job(
             db_type,
             ..
         } => (deployment_id.to_string(), format!("backup_{db_type}")),
+        Job::Restore { restore_id, .. } => (restore_id.to_string(), "restore".to_string()),
         &Job::Build { .. } => ("build".to_string(), "build".to_string()),
     };
 
@@ -213,22 +264,14 @@ pub async fn execute_job(
             )
             .await
         }
-        Job::Backup {
-            deployment_id,
-            target_container,
-            db_type,
-            database,
-            s3,
-        } => {
-            execute_backup(
-                docker,
-                deployment_id,
-                target_container,
-                db_type,
-                database,
-                s3,
-            )
-            .await
+        Job::Backup { .. } => {
+            // Handled by the early `execute_backup` return at the top of this function (it
+            // produces a rich `JobResultDetails::Backup`). Kept for an exhaustive match.
+            unreachable!("Job::Backup is dispatched via execute_backup before this match")
+        }
+        Job::Restore { .. } => {
+            // Handled by the early `execute_restore` return at the top of this function.
+            unreachable!("Job::Restore is dispatched via execute_restore before this match")
         }
         Job::Build { .. } => {
             // `Job::Build` is fully handled by the early `execute_build_job` return at the top of
@@ -2903,10 +2946,48 @@ async fn execute_container_logs(
     }
 }
 
-/// Execute a database backup (v1 focused on Postgres via pg_dump inside the container).
-/// Uses the existing robust docker exec streaming path for the dump.
-/// If S3 config is provided, attempts upload via reqwest to the S3-compatible endpoint.
-#[allow(unused_variables)]
+/// Resolve the S3 secret key for a backup/restore from age-encrypted [`SecretRef`]s.
+///
+/// The control plane passes the S3 secret KEY as a secret named `s3_secret_key` (age
+/// envelope). We decrypt it with the agent identity and return the plaintext. The access
+/// key id is NOT secret and rides in [`S3BackupConfig::access_key`]. Returns `None` when no
+/// such secret is present (anonymous bucket / IAM-role path). Never logs the value.
+fn resolve_s3_secret_key(
+    secrets: &[crate::job::SecretRef],
+    age_identity: Option<&age::x25519::Identity>,
+) -> Option<String> {
+    let secret = secrets.iter().find(|s| s.name == "s3_secret_key")?;
+    let id = age_identity?;
+    match crate::job::decrypt_secret(&secret.ciphertext, id) {
+        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(_) => {
+            warn!("failed to decrypt s3_secret_key for backup/restore (fail-closed)");
+            None
+        }
+    }
+}
+
+/// Build an [`crate::s3::S3Client`] from an [`S3BackupConfig`] + a resolved secret key.
+/// Returns `None` when the config is incomplete (no creds) — the caller then falls back to a
+/// volume-local location for the dump.
+fn s3_client_from(cfg: &S3BackupConfig, secret_key: Option<&str>) -> Option<crate::s3::S3Client> {
+    let access = cfg.access_key.as_deref()?;
+    let secret = secret_key.or(cfg.secret_key.as_deref())?;
+    crate::s3::S3Client::new(
+        &cfg.endpoint,
+        &cfg.bucket,
+        cfg.region.as_deref(),
+        access,
+        secret,
+    )
+    .ok()
+}
+
+/// Execute a database backup. v1 supports Postgres via `pg_dump`; the dump bytes are
+/// captured and (when an S3 destination + credentials are supplied) uploaded with a SigV4-
+/// signed PUT. Returns a rich [`JobResultDetails::Backup`] with the real size + location.
+#[cfg_attr(not(feature = "docker"), allow(unused_variables))]
+#[allow(clippy::too_many_arguments)]
 async fn execute_backup(
     docker: Option<&DockerClient>,
     deployment_id: Uuid,
@@ -2914,107 +2995,314 @@ async fn execute_backup(
     db_type: String,
     database: Option<String>,
     s3: Option<S3BackupConfig>,
-) -> Result<()> {
+    secrets: Vec<crate::job::SecretRef>,
+    age_identity: Option<&age::x25519::Identity>,
+    started_at: i64,
+) -> JobResult {
+    let correlation_id = deployment_id.to_string();
+    let job_type = format!("backup_{db_type}");
+
+    let backup_result = |success: bool,
+                         size_bytes: Option<u64>,
+                         location: Option<String>,
+                         message: Option<String>|
+     -> JobResult {
+        JobResult {
+            correlation_id: correlation_id.clone(),
+            job_type: job_type.clone(),
+            success,
+            error: if success { None } else { message.clone() },
+            started_at,
+            finished_at: chrono::Utc::now().timestamp(),
+            details: JobResultDetails::Backup {
+                success,
+                size_bytes,
+                location,
+                message,
+                db_type: db_type.clone(),
+            },
+        }
+    };
+
     #[cfg(feature = "docker")]
     {
-        let docker = docker.expect("Docker client required for backup");
+        let Some(docker) = docker else {
+            return backup_result(false, None, None, Some("docker client unavailable".into()));
+        };
 
-        info!(
-            deployment = %deployment_id,
-            container = %target_container,
-            db_type = %db_type,
-            "Starting backup job"
-        );
+        info!(deployment = %deployment_id, container = %target_container, db_type = %db_type, "Starting backup job");
 
+        // Build the dump argv (no host shell; the engine client writes the dump to stdout).
         let dump_cmd = match db_type.as_str() {
             "postgres" | "postgresql" => {
-                let db = database.as_deref().unwrap_or("postgres");
-                // Use the password from the container's env if the deployment injected it (common pattern from catalog)
+                let db = database
+                    .as_deref()
+                    .filter(|d| crate::job::is_safe_db_identifier(d))
+                    .unwrap_or("postgres");
                 vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!(
-                        "pg_dump -U postgres -d {} --clean --if-exists --no-owner --no-privileges",
-                        db
-                    ),
+                    "pg_dump".to_string(),
+                    "-U".to_string(),
+                    "postgres".to_string(),
+                    "-d".to_string(),
+                    db.to_string(),
+                    "--clean".to_string(),
+                    "--if-exists".to_string(),
+                    "--no-owner".to_string(),
+                    "--no-privileges".to_string(),
                 ]
             }
-            _ => {
-                warn!(db_type = %db_type, "Unsupported db_type for backup in v1 — falling back to generic");
-                vec![
-                    "echo".to_string(),
-                    "Backup not yet implemented for this DB type".to_string(),
-                ]
+            other => {
+                return backup_result(
+                    false,
+                    None,
+                    None,
+                    Some(format!("backup not supported for db_type '{other}' in v1")),
+                );
             }
         };
 
-        // Reuse the battle-tested exec path (we capture stdout which will contain the dump or error)
-        // For real large dumps we would write to a volume + tar, but for v1 + demo we stream.
-        let _exec_res = execute_command(
-            Some(docker),
-            Some(target_container.clone()),
-            dump_cmd,
-            None,
-            None,
-            vec![],
-            Some(false),
-            Some(false),
-            Some(false),
-            None,
-            None,
-        )
-        .await;
-
-        // In a full implementation we would capture the actual dump bytes here and do S3 upload.
-        // For this slice we simulate success + size and optional S3 PUT using reqwest (already a dep).
-
-        let size = 42_000u64; // placeholder — real impl would measure the pg_dump output
-        let location = if let Some(s3cfg) = &s3 {
-            // Simple S3-compatible upload attempt (works great with MinIO from our catalog)
-            let url = format!(
-                "{}/{}/{}",
-                s3cfg.endpoint.trim_end_matches('/'),
-                s3cfg.bucket,
-                s3cfg.key
+        let (dump, exit_code) = match capture_exec_stdout(docker, &target_container, dump_cmd).await
+        {
+            Ok(v) => v,
+            Err(e) => return backup_result(false, None, None, Some(e.to_string())),
+        };
+        if exit_code.unwrap_or(0) != 0 || dump.is_empty() {
+            return backup_result(
+                false,
+                None,
+                None,
+                Some(format!("dump command exited with code {exit_code:?}")),
             );
-            // In production this would stream the real dump bytes.
-            // Here we do a tiny demo PUT so the flow is real.
-            if let Ok(client) = reqwest::Client::new()
-                .put(&url)
-                .header("Content-Type", "application/octet-stream")
-                .body(b"-- demo backup for ".to_vec())
-                .send()
-                .await
-            {
-                if client.status().is_success() {
-                    Some(format!("s3://{}/{}", s3cfg.bucket, s3cfg.key))
-                } else {
-                    Some("upload attempted (check agent logs)".to_string())
-                }
-            } else {
-                Some("s3 upload failed (demo)".to_string())
+        }
+
+        let size = dump.len() as u64;
+
+        // Upload to S3 when a destination + resolvable credentials are present; otherwise the
+        // dump location is the agent-local volume path (still a real, recorded outcome).
+        if let Some(cfg) = &s3 {
+            let secret_key = resolve_s3_secret_key(&secrets, age_identity);
+            match s3_client_from(cfg, secret_key.as_deref()) {
+                Some(client) => match client.put_object(&cfg.key, dump).await {
+                    Ok(location) => {
+                        info!(deployment = %deployment_id, size, "Backup uploaded to S3");
+                        backup_result(true, Some(size), Some(location), None)
+                    }
+                    Err(e) => backup_result(false, Some(size), None, Some(e.to_string())),
+                },
+                None => backup_result(
+                    false,
+                    Some(size),
+                    None,
+                    Some("S3 destination configured but credentials are incomplete".into()),
+                ),
             }
         } else {
-            Some(format!("volume://backup-{deployment_id}/dump.sql"))
-        };
-
-        info!(
-            deployment = %deployment_id,
-            size = size,
-            location = ?location,
-            "Backup job completed (v1 Postgres path)"
-        );
-
-        // The rich JobResultDetails::Backup will be populated in the caller once we wire the result channel better.
-        // For now the correlation + job_type already route it correctly.
-        Ok(())
+            let location = format!("volume://backup-{deployment_id}/dump.sql");
+            info!(deployment = %deployment_id, size, location = %location, "Backup stored to volume");
+            backup_result(true, Some(size), Some(location), None)
+        }
     }
 
     #[cfg(not(feature = "docker"))]
     {
         info!(deployment = %deployment_id, "Backup job (dry run)");
-        Ok(())
+        backup_result(true, Some(0), Some("dry-run".into()), None)
     }
+}
+
+/// Execute a database restore. DESTRUCTIVE: downloads the dump from S3 and pipes it to the
+/// engine client's stdin via an argv-only command (engine + database validated by
+/// [`crate::job::build_restore_argv`]). Returns a rich [`JobResultDetails::Restore`].
+#[cfg_attr(not(feature = "docker"), allow(unused_variables))]
+#[allow(clippy::too_many_arguments)]
+async fn execute_restore(
+    docker: Option<&DockerClient>,
+    restore_id: Uuid,
+    deployment_id: Uuid,
+    target_container: String,
+    db_type: String,
+    database: Option<String>,
+    s3: S3BackupConfig,
+    secrets: Vec<crate::job::SecretRef>,
+    age_identity: Option<&age::x25519::Identity>,
+    started_at: i64,
+) -> JobResult {
+    let correlation_id = restore_id.to_string();
+
+    let restore_result =
+        |success: bool, location: Option<String>, message: Option<String>| -> JobResult {
+            JobResult {
+                correlation_id: correlation_id.clone(),
+                job_type: "restore".to_string(),
+                success,
+                error: if success { None } else { message.clone() },
+                started_at,
+                finished_at: chrono::Utc::now().timestamp(),
+                details: JobResultDetails::Restore {
+                    success,
+                    location,
+                    message,
+                    db_type: db_type.clone(),
+                },
+            }
+        };
+
+    // Validate engine + database and build the argv BEFORE any network/Docker work. A bad
+    // engine or a metachar-laden database name fails closed here (OWASP A03/A08).
+    let argv = match crate::job::build_restore_argv(&db_type, database.as_deref()) {
+        Ok(a) => a,
+        Err(e) => return restore_result(false, None, Some(e.to_string())),
+    };
+
+    #[cfg(feature = "docker")]
+    {
+        let Some(docker) = docker else {
+            return restore_result(false, None, Some("docker client unavailable".into()));
+        };
+
+        info!(restore_id = %restore_id, deployment = %deployment_id, container = %target_container, db_type = %db_type, "Starting restore job (destructive)");
+
+        // Download the dump from S3 (credentials resolved from age-encrypted secrets).
+        let secret_key = resolve_s3_secret_key(&secrets, age_identity);
+        let Some(client) = s3_client_from(&s3, secret_key.as_deref()) else {
+            return restore_result(false, None, Some("S3 source credentials incomplete".into()));
+        };
+        let dump = match client.get_object(&s3.key).await {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            Ok(_) => return restore_result(false, None, Some("downloaded dump was empty".into())),
+            Err(e) => return restore_result(false, None, Some(e.to_string())),
+        };
+
+        match feed_exec_stdin(docker, &target_container, argv, dump).await {
+            Ok(exit_code) if exit_code.unwrap_or(0) == 0 => {
+                let location = format!("s3://{}/{}", s3.bucket, s3.key);
+                info!(restore_id = %restore_id, "Restore completed");
+                restore_result(true, Some(location), None)
+            }
+            Ok(exit_code) => restore_result(
+                false,
+                None,
+                Some(format!("restore command exited with code {exit_code:?}")),
+            ),
+            Err(e) => restore_result(false, None, Some(e.to_string())),
+        }
+    }
+
+    #[cfg(not(feature = "docker"))]
+    {
+        info!(restore_id = %restore_id, "Restore job (dry run)");
+        let _ = argv;
+        restore_result(true, Some("dry-run".into()), None)
+    }
+}
+
+/// Run `cmd` (argv) in `container` and collect its raw stdout bytes + exit code. Used to
+/// capture a database dump. No host shell — `cmd[0]` is the program, the rest are args.
+#[cfg(feature = "docker")]
+async fn capture_exec_stdout(
+    docker: &DockerClient,
+    container: &str,
+    cmd: Vec<String>,
+) -> Result<(Vec<u8>, Option<i64>)> {
+    use bollard::exec::{CreateExecOptions, StartExecOptions};
+    use futures_util::StreamExt;
+
+    let exec = docker
+        .create_exec(
+            container,
+            CreateExecOptions {
+                cmd: Some(cmd),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+    let start = docker
+        .start_exec(
+            &exec.id,
+            Some(StartExecOptions {
+                detach: false,
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+    let mut stdout: Vec<u8> = Vec::new();
+    if let bollard::exec::StartExecResults::Attached { mut output, .. } = start {
+        while let Some(Ok(msg)) = output.next().await {
+            if let bollard::container::LogOutput::StdOut { message } = msg {
+                stdout.extend_from_slice(&message);
+            }
+        }
+    }
+    let exit_code = docker
+        .inspect_exec(&exec.id)
+        .await
+        .ok()
+        .and_then(|i| i.exit_code);
+    Ok((stdout, exit_code))
+}
+
+/// Run `cmd` (argv) in `container` with `stdin` piped to its standard input, returning the
+/// exit code. Used to stream a downloaded dump into the engine client (restore). No shell.
+#[cfg(feature = "docker")]
+async fn feed_exec_stdin(
+    docker: &DockerClient,
+    container: &str,
+    cmd: Vec<String>,
+    stdin: Vec<u8>,
+) -> Result<Option<i64>> {
+    use bollard::exec::{CreateExecOptions, StartExecOptions};
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let exec = docker
+        .create_exec(
+            container,
+            CreateExecOptions {
+                cmd: Some(cmd),
+                attach_stdin: Some(true),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+    let start = docker
+        .start_exec(
+            &exec.id,
+            Some(StartExecOptions {
+                detach: false,
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+    if let bollard::exec::StartExecResults::Attached {
+        mut output,
+        mut input,
+    } = start
+    {
+        // Write the whole dump, then close stdin so the engine client sees EOF and exits.
+        input.write_all(&stdin).await.map_err(|e| {
+            crate::AgentError::Internal(anyhow::anyhow!("restore stdin write: {e}"))
+        })?;
+        input.flush().await.map_err(|e| {
+            crate::AgentError::Internal(anyhow::anyhow!("restore stdin flush: {e}"))
+        })?;
+        drop(input);
+        // Drain output so the exec runs to completion (we don't need the bytes).
+        while let Some(Ok(_)) = output.next().await {}
+    }
+
+    Ok(docker
+        .inspect_exec(&exec.id)
+        .await
+        .ok()
+        .and_then(|i| i.exit_code))
 }
 
 /// Execute a Build job (Phase B Source-to-Deploy core).
@@ -3346,7 +3634,17 @@ mod dispatcher_coverage_tests {
                 db_type: _,
                 database: _,
                 s3: _,
+                secrets: _,
             } => "backup",
+            Job::Restore {
+                restore_id: _,
+                deployment_id: _,
+                target_container: _,
+                db_type: _,
+                database: _,
+                s3: _,
+                secrets: _,
+            } => "restore",
             Job::Build {
                 build_id: _,
                 spec: _,
@@ -3447,6 +3745,11 @@ mod dispatcher_coverage_tests {
             (
                 serde_json::json!({ "type": "backup", "deployment_id": Uuid::nil(), "target_container": "c1", "db_type": "postgres" }),
                 "backup",
+            ),
+            (
+                serde_json::json!({ "type": "restore", "restore_id": Uuid::nil(), "deployment_id": Uuid::nil(), "target_container": "c1", "db_type": "postgres",
+                    "s3": { "endpoint": "https://s3.example", "bucket": "b", "key": "k", "access_key": null, "secret_key": null, "region": "us-east-1" } }),
+                "restore",
             ),
             (
                 serde_json::json!({ "type": "build", "build_id": Uuid::nil(), "spec": build_spec, "target_image": "registry.example.com/app:abc123" }),

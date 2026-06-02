@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO backup_schedules (\n                id, deployment_id, name, db_type, database_name,\n                schedule_type, schedule_value, retention_days, retention_count,\n                s3_endpoint, s3_bucket, s3_key_prefix, s3_region,\n                s3_access_key_id, s3_secret_id, target_container,\n                enabled, created_at, updated_at\n            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, true, $17, $17)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int4",
+        "Int4",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Uuid",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "24948004208060a6c1f48aa60e00ef82301f9dd34bf794843d758b28d0febe45"
+}

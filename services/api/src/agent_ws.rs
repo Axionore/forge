@@ -711,6 +711,20 @@ async fn handle_incoming_message(
                 }
             }
 
+            // Data tranche: terminal Backup result — update the linked backup_executions row
+            // (size/location/status) and fire backup.success / backup.failed notifications.
+            if result.job_type.starts_with("backup_") {
+                if let Err(e) = deployment_service.record_backup_job_result(&result).await {
+                    warn!(error = %e, "failed to record backup result");
+                }
+            }
+            // Data tranche: terminal Restore result — update restore_executions + notify.
+            if result.job_type == "restore" {
+                if let Err(e) = deployment_service.record_restore_job_result(&result).await {
+                    warn!(error = %e, "failed to record restore result");
+                }
+            }
+
             // Phase B: terminal Build result. Record the image/digest/error, then — and ONLY
             // on success — dispatch a Deploy using the produced image (fail-closed: a failed
             // build never deploys, threat-model A10).

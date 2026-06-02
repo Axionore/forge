@@ -91,6 +91,40 @@ pub struct BuildRecord {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// An enabled backup schedule, projected for the scheduler's due-evaluation + dispatch.
+/// Carries only the secret's id (never its plaintext).
+#[derive(Debug, Clone)]
+pub struct BackupScheduleRow {
+    pub id: Uuid,
+    pub deployment_id: Option<Uuid>,
+    pub db_type: String,
+    pub database_name: Option<String>,
+    pub schedule_type: String,
+    pub schedule_value: String,
+    pub retention_days: i32,
+    pub retention_count: Option<i32>,
+    pub s3_endpoint: Option<String>,
+    pub s3_bucket: Option<String>,
+    pub s3_key_prefix: Option<String>,
+    pub s3_region: Option<String>,
+    pub s3_access_key_id: Option<String>,
+    pub s3_secret_id: Option<Uuid>,
+    pub target_container: Option<String>,
+    pub last_run_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The resolved source of a restore (target container + S3 location/creds reference).
+#[derive(Debug, Clone)]
+pub struct RestoreSource {
+    pub target_container: String,
+    pub s3_endpoint: Option<String>,
+    pub s3_bucket: Option<String>,
+    pub s3_key: String,
+    pub s3_region: Option<String>,
+    pub s3_access_key_id: Option<String>,
+    pub s3_secret_id: Option<Uuid>,
+}
+
 /// API-friendly representation of a persisted JobResult.
 #[derive(Debug, Serialize)]
 pub struct JobResultRow {
@@ -1958,7 +1992,7 @@ impl DeploymentService {
     pub fn load_catalog() -> Vec<CatalogTemplate> {
         // For v1 we construct the core ones directly (matching the JSON files on disk).
         // This guarantees it compiles and works without fs at runtime.
-        vec![
+        let mut templates = vec![
             CatalogTemplate {
                 id: "postgres".to_string(),
                 name: "PostgreSQL 16".to_string(),
@@ -2082,6 +2116,389 @@ impl DeploymentService {
                     "networks": ["forge-default"]
                 }),
             },
+        ];
+        templates.extend(Self::catalog_breadth());
+        templates
+    }
+
+    /// Data tranche: one-click catalog breadth toward Coolify/Dokploy parity. Every template
+    /// is a real, runnable Compose-style spec (image + env + ports + volumes + healthcheck);
+    /// every credential is a `generate`d secret variable, never hardcoded.
+    fn catalog_breadth() -> Vec<CatalogTemplate> {
+        // Shared rolling strategy for stateful single-container services.
+        let stateful = || {
+            forge_core::DeploymentStrategy::Rolling(forge_core::RollingConfig {
+                max_unavailable: 1,
+                max_surge: 0,
+                health_check_grace_period_secs: 40,
+                rollback_on_failure: true,
+                failure_threshold: 3,
+            })
+        };
+        let gen_secret = |name: &str, label: &str| CatalogVariable {
+            name: name.into(),
+            label: label.into(),
+            r#type: "password".into(),
+            default: String::new(),
+            secret: true,
+            generate: true,
+            required: true,
+        };
+        let plain = |name: &str, label: &str, default: &str| CatalogVariable {
+            name: name.into(),
+            label: label.into(),
+            r#type: "string".into(),
+            default: default.into(),
+            secret: false,
+            generate: false,
+            required: true,
+        };
+
+        vec![
+            // --- Ghost (blogging/CMS) backed by MySQL ---
+            CatalogTemplate {
+                id: "ghost".into(),
+                name: "Ghost".into(),
+                description: "Professional publishing platform (Ghost) with a MySQL 8 backing store.".into(),
+                category: "cms".into(),
+                icon: Some("ghost".into()),
+                docs_url: Some("https://ghost.org/docs/".into()),
+                variables: vec![
+                    plain("GHOST_URL", "Public URL", "http://localhost:2368"),
+                    gen_secret("GHOST_DB_PASSWORD", "Database Password"),
+                ],
+                default_strategy: stateful(),
+                spec: serde_json::json!({
+                    "containers": [
+                        {
+                            "name": "ghost-db",
+                            "image": "mysql:8.0",
+                            "env": [
+                                ["MYSQL_DATABASE", "ghost"],
+                                ["MYSQL_USER", "ghost"],
+                                ["MYSQL_PASSWORD", "$GHOST_DB_PASSWORD"],
+                                ["MYSQL_RANDOM_ROOT_PASSWORD", "1"]
+                            ],
+                            "volumes": ["ghost-db:/var/lib/mysql"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD", "mysqladmin", "ping", "-h", "localhost"], "interval": 10000000000_i64, "timeout": 5000000000_i64, "retries": 5 }
+                        },
+                        {
+                            "name": "ghost",
+                            "image": "ghost:5-alpine",
+                            "env": [
+                                ["database__client", "mysql"],
+                                ["database__connection__host", "ghost-db"],
+                                ["database__connection__user", "ghost"],
+                                ["database__connection__password", "$GHOST_DB_PASSWORD"],
+                                ["database__connection__database", "ghost"],
+                                ["url", "$GHOST_URL"]
+                            ],
+                            "ports": ["2368:2368"],
+                            "volumes": ["ghost-content:/var/lib/ghost/content"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD-SHELL", "wget -qO- http://localhost:2368/ || exit 1"], "interval": 15000000000_i64, "timeout": 5000000000_i64, "retries": 5, "start_period": 30000000000_i64 }
+                        }
+                    ],
+                    "volumes": [{"name": "ghost-db"}, {"name": "ghost-content"}],
+                    "networks": ["forge-default"]
+                }),
+            },
+            // --- n8n (workflow automation) ---
+            CatalogTemplate {
+                id: "n8n".into(),
+                name: "n8n".into(),
+                description: "Workflow automation tool with basic-auth protected editor and persistent data.".into(),
+                category: "automation".into(),
+                icon: Some("workflow".into()),
+                docs_url: Some("https://docs.n8n.io/".into()),
+                variables: vec![
+                    plain("N8N_USER", "Editor User", "admin"),
+                    gen_secret("N8N_PASSWORD", "Editor Password"),
+                    gen_secret("N8N_ENCRYPTION_KEY", "Encryption Key"),
+                ],
+                default_strategy: stateful(),
+                spec: serde_json::json!({
+                    "containers": [{
+                        "name": "n8n",
+                        "image": "n8nio/n8n:latest",
+                        "env": [
+                            ["N8N_BASIC_AUTH_ACTIVE", "true"],
+                            ["N8N_BASIC_AUTH_USER", "$N8N_USER"],
+                            ["N8N_BASIC_AUTH_PASSWORD", "$N8N_PASSWORD"],
+                            ["N8N_ENCRYPTION_KEY", "$N8N_ENCRYPTION_KEY"]
+                        ],
+                        "ports": ["5678:5678"],
+                        "volumes": ["n8n-data:/home/node/.n8n"],
+                        "restart_policy": "unless-stopped",
+                        "healthcheck": { "test": ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz || exit 1"], "interval": 15000000000_i64, "timeout": 5000000000_i64, "retries": 5, "start_period": 20000000000_i64 }
+                    }],
+                    "volumes": [{"name": "n8n-data"}],
+                    "networks": ["forge-default"]
+                }),
+            },
+            // --- Plausible Analytics (web analytics) ---
+            CatalogTemplate {
+                id: "plausible".into(),
+                name: "Plausible Analytics".into(),
+                description: "Lightweight, privacy-friendly web analytics with Postgres + ClickHouse.".into(),
+                category: "analytics".into(),
+                icon: Some("chart".into()),
+                docs_url: Some("https://plausible.io/docs/self-hosting".into()),
+                variables: vec![
+                    plain("BASE_URL", "Public URL", "http://localhost:8000"),
+                    gen_secret("SECRET_KEY_BASE", "Secret Key Base"),
+                    gen_secret("PLAUSIBLE_DB_PASSWORD", "Postgres Password"),
+                ],
+                default_strategy: stateful(),
+                spec: serde_json::json!({
+                    "containers": [
+                        {
+                            "name": "plausible-db",
+                            "image": "postgres:16-alpine",
+                            "env": [["POSTGRES_DB", "plausible"], ["POSTGRES_USER", "plausible"], ["POSTGRES_PASSWORD", "$PLAUSIBLE_DB_PASSWORD"]],
+                            "volumes": ["plausible-db:/var/lib/postgresql/data"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD-SHELL", "pg_isready -U plausible"], "interval": 10000000000_i64, "timeout": 5000000000_i64, "retries": 5 }
+                        },
+                        {
+                            "name": "plausible-events-db",
+                            "image": "clickhouse/clickhouse-server:24.3-alpine",
+                            "volumes": ["plausible-events:/var/lib/clickhouse"],
+                            "restart_policy": "unless-stopped",
+                            "ulimits": [{"name": "nofile", "soft": 262144, "hard": 262144}]
+                        },
+                        {
+                            "name": "plausible",
+                            "image": "ghcr.io/plausible/community-edition:v2.1.4",
+                            "cmd": ["sh", "-c", "/entrypoint.sh db createdb && /entrypoint.sh db migrate && /entrypoint.sh run"],
+                            "env": [
+                                ["BASE_URL", "$BASE_URL"],
+                                ["SECRET_KEY_BASE", "$SECRET_KEY_BASE"],
+                                ["DATABASE_URL", "postgres://plausible:$PLAUSIBLE_DB_PASSWORD@plausible-db:5432/plausible"],
+                                ["CLICKHOUSE_DATABASE_URL", "http://plausible-events-db:8123/plausible_events_db"]
+                            ],
+                            "ports": ["8000:8000"],
+                            "restart_policy": "unless-stopped"
+                        }
+                    ],
+                    "volumes": [{"name": "plausible-db"}, {"name": "plausible-events"}],
+                    "networks": ["forge-default"]
+                }),
+            },
+            // --- Uptime Kuma (monitoring) ---
+            CatalogTemplate {
+                id: "uptime-kuma".into(),
+                name: "Uptime Kuma".into(),
+                description: "Self-hosted uptime monitoring with a clean dashboard and alerting.".into(),
+                category: "monitoring".into(),
+                icon: Some("activity".into()),
+                docs_url: Some("https://github.com/louislam/uptime-kuma/wiki".into()),
+                variables: vec![],
+                default_strategy: stateful(),
+                spec: serde_json::json!({
+                    "containers": [{
+                        "name": "uptime-kuma",
+                        "image": "louislam/uptime-kuma:1",
+                        "ports": ["3001:3001"],
+                        "volumes": ["uptime-kuma:/app/data"],
+                        "restart_policy": "unless-stopped",
+                        "healthcheck": { "test": ["CMD-SHELL", "node extra/healthcheck.js"], "interval": 60000000000_i64, "timeout": 10000000000_i64, "retries": 3, "start_period": 30000000000_i64 }
+                    }],
+                    "volumes": [{"name": "uptime-kuma"}],
+                    "networks": ["forge-default"]
+                }),
+            },
+            // --- Metabase (BI / dashboards) ---
+            CatalogTemplate {
+                id: "metabase".into(),
+                name: "Metabase".into(),
+                description: "Open-source business intelligence with a Postgres application database.".into(),
+                category: "analytics".into(),
+                icon: Some("chart".into()),
+                docs_url: Some("https://www.metabase.com/docs/latest/".into()),
+                variables: vec![gen_secret("METABASE_DB_PASSWORD", "App Database Password")],
+                default_strategy: stateful(),
+                spec: serde_json::json!({
+                    "containers": [
+                        {
+                            "name": "metabase-db",
+                            "image": "postgres:16-alpine",
+                            "env": [["POSTGRES_DB", "metabase"], ["POSTGRES_USER", "metabase"], ["POSTGRES_PASSWORD", "$METABASE_DB_PASSWORD"]],
+                            "volumes": ["metabase-db:/var/lib/postgresql/data"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD-SHELL", "pg_isready -U metabase"], "interval": 10000000000_i64, "timeout": 5000000000_i64, "retries": 5 }
+                        },
+                        {
+                            "name": "metabase",
+                            "image": "metabase/metabase:latest",
+                            "env": [
+                                ["MB_DB_TYPE", "postgres"],
+                                ["MB_DB_DBNAME", "metabase"],
+                                ["MB_DB_PORT", "5432"],
+                                ["MB_DB_USER", "metabase"],
+                                ["MB_DB_PASS", "$METABASE_DB_PASSWORD"],
+                                ["MB_DB_HOST", "metabase-db"]
+                            ],
+                            "ports": ["3000:3000"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"], "interval": 15000000000_i64, "timeout": 5000000000_i64, "retries": 5, "start_period": 60000000000_i64 }
+                        }
+                    ],
+                    "volumes": [{"name": "metabase-db"}],
+                    "networks": ["forge-default"]
+                }),
+            },
+            // --- Vaultwarden (Bitwarden-compatible password manager) ---
+            CatalogTemplate {
+                id: "vaultwarden".into(),
+                name: "Vaultwarden".into(),
+                description: "Lightweight Bitwarden-compatible password manager server.".into(),
+                category: "security".into(),
+                icon: Some("lock".into()),
+                docs_url: Some("https://github.com/dani-garcia/vaultwarden/wiki".into()),
+                variables: vec![gen_secret("ADMIN_TOKEN", "Admin Token")],
+                default_strategy: stateful(),
+                spec: serde_json::json!({
+                    "containers": [{
+                        "name": "vaultwarden",
+                        "image": "vaultwarden/server:latest",
+                        "env": [["ADMIN_TOKEN", "$ADMIN_TOKEN"], ["ROCKET_PORT", "80"]],
+                        "ports": ["8081:80"],
+                        "volumes": ["vaultwarden:/data"],
+                        "restart_policy": "unless-stopped",
+                        "healthcheck": { "test": ["CMD-SHELL", "curl -f http://localhost:80/alive || exit 1"], "interval": 30000000000_i64, "timeout": 5000000000_i64, "retries": 5, "start_period": 20000000000_i64 }
+                    }],
+                    "volumes": [{"name": "vaultwarden"}],
+                    "networks": ["forge-default"]
+                }),
+            },
+            // --- Gitea (self-hosted git) ---
+            CatalogTemplate {
+                id: "gitea".into(),
+                name: "Gitea".into(),
+                description: "Lightweight self-hosted Git service with web UI and SSH.".into(),
+                category: "developer".into(),
+                icon: Some("git".into()),
+                docs_url: Some("https://docs.gitea.com/".into()),
+                variables: vec![gen_secret("GITEA_DB_PASSWORD", "Database Password")],
+                default_strategy: stateful(),
+                spec: serde_json::json!({
+                    "containers": [
+                        {
+                            "name": "gitea-db",
+                            "image": "postgres:16-alpine",
+                            "env": [["POSTGRES_DB", "gitea"], ["POSTGRES_USER", "gitea"], ["POSTGRES_PASSWORD", "$GITEA_DB_PASSWORD"]],
+                            "volumes": ["gitea-db:/var/lib/postgresql/data"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD-SHELL", "pg_isready -U gitea"], "interval": 10000000000_i64, "timeout": 5000000000_i64, "retries": 5 }
+                        },
+                        {
+                            "name": "gitea",
+                            "image": "gitea/gitea:1.22",
+                            "env": [
+                                ["GITEA__database__DB_TYPE", "postgres"],
+                                ["GITEA__database__HOST", "gitea-db:5432"],
+                                ["GITEA__database__NAME", "gitea"],
+                                ["GITEA__database__USER", "gitea"],
+                                ["GITEA__database__PASSWD", "$GITEA_DB_PASSWORD"]
+                            ],
+                            "ports": ["3002:3000", "2222:22"],
+                            "volumes": ["gitea-data:/data"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD-SHELL", "curl -f http://localhost:3000/api/healthz || exit 1"], "interval": 15000000000_i64, "timeout": 5000000000_i64, "retries": 5, "start_period": 30000000000_i64 }
+                        }
+                    ],
+                    "volumes": [{"name": "gitea-db"}, {"name": "gitea-data"}],
+                    "networks": ["forge-default"]
+                }),
+            },
+            // --- Nextcloud (file sync & share) ---
+            CatalogTemplate {
+                id: "nextcloud".into(),
+                name: "Nextcloud".into(),
+                description: "Self-hosted file sync & share with a Postgres backing store.".into(),
+                category: "productivity".into(),
+                icon: Some("cloud".into()),
+                docs_url: Some("https://docs.nextcloud.com/".into()),
+                variables: vec![
+                    plain("NEXTCLOUD_ADMIN_USER", "Admin User", "admin"),
+                    gen_secret("NEXTCLOUD_ADMIN_PASSWORD", "Admin Password"),
+                    gen_secret("NEXTCLOUD_DB_PASSWORD", "Database Password"),
+                ],
+                default_strategy: stateful(),
+                spec: serde_json::json!({
+                    "containers": [
+                        {
+                            "name": "nextcloud-db",
+                            "image": "postgres:16-alpine",
+                            "env": [["POSTGRES_DB", "nextcloud"], ["POSTGRES_USER", "nextcloud"], ["POSTGRES_PASSWORD", "$NEXTCLOUD_DB_PASSWORD"]],
+                            "volumes": ["nextcloud-db:/var/lib/postgresql/data"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD-SHELL", "pg_isready -U nextcloud"], "interval": 10000000000_i64, "timeout": 5000000000_i64, "retries": 5 }
+                        },
+                        {
+                            "name": "nextcloud",
+                            "image": "nextcloud:29-apache",
+                            "env": [
+                                ["POSTGRES_HOST", "nextcloud-db"],
+                                ["POSTGRES_DB", "nextcloud"],
+                                ["POSTGRES_USER", "nextcloud"],
+                                ["POSTGRES_PASSWORD", "$NEXTCLOUD_DB_PASSWORD"],
+                                ["NEXTCLOUD_ADMIN_USER", "$NEXTCLOUD_ADMIN_USER"],
+                                ["NEXTCLOUD_ADMIN_PASSWORD", "$NEXTCLOUD_ADMIN_PASSWORD"]
+                            ],
+                            "ports": ["8082:80"],
+                            "volumes": ["nextcloud-data:/var/www/html"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD-SHELL", "curl -f http://localhost:80/status.php || exit 1"], "interval": 20000000000_i64, "timeout": 5000000000_i64, "retries": 5, "start_period": 60000000000_i64 }
+                        }
+                    ],
+                    "volumes": [{"name": "nextcloud-db"}, {"name": "nextcloud-data"}],
+                    "networks": ["forge-default"]
+                }),
+            },
+            // --- Supabase (Postgres + Studio, focused runnable subset) ---
+            CatalogTemplate {
+                id: "supabase".into(),
+                name: "Supabase (Postgres + Studio)".into(),
+                description: "Supabase Postgres with the Studio admin UI. A focused, runnable subset of the full stack.".into(),
+                category: "database".into(),
+                icon: Some("database".into()),
+                docs_url: Some("https://supabase.com/docs/guides/self-hosting".into()),
+                variables: vec![
+                    gen_secret("POSTGRES_PASSWORD", "Postgres Password"),
+                ],
+                default_strategy: stateful(),
+                spec: serde_json::json!({
+                    "containers": [
+                        {
+                            "name": "supabase-db",
+                            "image": "supabase/postgres:15.6.1.143",
+                            "env": [
+                                ["POSTGRES_PASSWORD", "$POSTGRES_PASSWORD"],
+                                ["POSTGRES_DB", "postgres"]
+                            ],
+                            "ports": ["5432:5432"],
+                            "volumes": ["supabase-db:/var/lib/postgresql/data"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD-SHELL", "pg_isready -U postgres"], "interval": 10000000000_i64, "timeout": 5000000000_i64, "retries": 5, "start_period": 20000000000_i64 }
+                        },
+                        {
+                            "name": "supabase-studio",
+                            "image": "supabase/studio:latest",
+                            "env": [
+                                ["POSTGRES_PASSWORD", "$POSTGRES_PASSWORD"],
+                                ["STUDIO_PG_META_URL", "http://supabase-db:5432"]
+                            ],
+                            "ports": ["3003:3000"],
+                            "restart_policy": "unless-stopped"
+                        }
+                    ],
+                    "volumes": [{"name": "supabase-db"}],
+                    "networks": ["forge-default"]
+                }),
+            },
         ]
     }
 
@@ -2121,6 +2538,19 @@ impl DeploymentService {
 
     // Mirrors the `backup_schedules` columns 1:1; grouping into a struct would just
     // duplicate the table shape, so the explicit parameter list is intentional.
+    /// Engines a backup schedule may target. Mirrors the agent's `RESTORE_ENGINES` allowlist
+    /// plus its dump support (v1: postgres). Validated so a bad engine never reaches an agent.
+    const BACKUP_ENGINES: [&str; 4] = ["postgres", "postgresql", "mysql", "mongodb"];
+
+    /// Validate a schedule's S3 endpoint: must be a syntactically-valid https URL to a
+    /// non-private literal host, length-bounded. SSRF risk is low (operator-configured object
+    /// storage) but we still enforce scheme + bound (OWASP A10), reusing the notify validator.
+    fn validate_s3_endpoint(endpoint: &str) -> Result<(), DeploymentError> {
+        crate::notify::validate_url_syntax(endpoint, false)
+            .map(|_| ())
+            .map_err(|e| DeploymentError::InvalidInput(format!("s3_endpoint: {e}")))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_backup_schedule(
         &self,
@@ -2131,12 +2561,56 @@ impl DeploymentService {
         schedule_type: &str,
         schedule_value: &str,
         retention_days: i32,
+        retention_count: Option<i32>,
         s3_endpoint: Option<&str>,
         s3_bucket: Option<&str>,
         s3_key_prefix: Option<&str>,
+        s3_region: Option<&str>,
+        s3_access_key_id: Option<&str>,
+        s3_secret_id: Option<Uuid>,
+        target_container: Option<&str>,
     ) -> Result<serde_json::Value, DeploymentError> {
-        if name.trim().is_empty() {
-            return Err(DeploymentError::InvalidInput("name is required".into()));
+        if name.trim().is_empty() || name.len() > 128 {
+            return Err(DeploymentError::InvalidInput(
+                "name must be 1-128 characters".into(),
+            ));
+        }
+        if !Self::BACKUP_ENGINES.contains(&db_type) {
+            return Err(DeploymentError::InvalidInput(format!(
+                "db_type must be one of: {}",
+                Self::BACKUP_ENGINES.join(", ")
+            )));
+        }
+        if schedule_type != "interval" && schedule_type != "cron" {
+            return Err(DeploymentError::InvalidInput(
+                "schedule_type must be 'interval' or 'cron'".into(),
+            ));
+        }
+        // Validate the schedule value: an interval is bounded seconds; a cron is a 5-field expr.
+        crate::schedule::validate_schedule(schedule_type, schedule_value)
+            .map_err(DeploymentError::InvalidInput)?;
+        if !(1..=3650).contains(&retention_days) {
+            return Err(DeploymentError::InvalidInput(
+                "retention_days must be 1-3650".into(),
+            ));
+        }
+        if let Some(rc) = retention_count {
+            if !(1..=10_000).contains(&rc) {
+                return Err(DeploymentError::InvalidInput(
+                    "retention_count must be 1-10000".into(),
+                ));
+            }
+        }
+        // If an S3 destination is configured, the endpoint must be a valid https URL and a
+        // bucket must be present. The secret KEY is referenced via s3_secret_id (age store),
+        // never accepted as plaintext here (OWASP A02).
+        if let Some(ep) = s3_endpoint.map(str::trim).filter(|s| !s.is_empty()) {
+            Self::validate_s3_endpoint(ep)?;
+            if s3_bucket.map(str::trim).is_none_or(str::is_empty) {
+                return Err(DeploymentError::InvalidInput(
+                    "s3_bucket is required when s3_endpoint is set".into(),
+                ));
+            }
         }
 
         let id = Uuid::now_v7();
@@ -2146,10 +2620,11 @@ impl DeploymentService {
             r#"
             INSERT INTO backup_schedules (
                 id, deployment_id, name, db_type, database_name,
-                schedule_type, schedule_value, retention_days,
-                s3_endpoint, s3_bucket, s3_key_prefix,
+                schedule_type, schedule_value, retention_days, retention_count,
+                s3_endpoint, s3_bucket, s3_key_prefix, s3_region,
+                s3_access_key_id, s3_secret_id, target_container,
                 enabled, created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true, $12, $12)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, true, $17, $17)
             "#,
             id,
             deployment_id,
@@ -2159,14 +2634,24 @@ impl DeploymentService {
             schedule_type,
             schedule_value,
             retention_days,
+            retention_count,
             s3_endpoint,
             s3_bucket,
             s3_key_prefix,
+            s3_region,
+            s3_access_key_id,
+            s3_secret_id,
+            target_container,
             now
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| DeploymentError::Internal(e.into()))?;
+        .map_err(|e| match e {
+            sqlx::Error::Database(ref db) if db.code().as_deref() == Some("23503") => {
+                DeploymentError::InvalidInput("deployment_id or s3_secret_id does not exist".into())
+            }
+            other => DeploymentError::Internal(other.into()),
+        })?;
 
         Ok(serde_json::json!({
             "id": id,
@@ -2371,6 +2856,381 @@ impl DeploymentService {
                 .await;
         }
 
+        Ok(())
+    }
+
+    // =====================================================================
+    // Data tranche: scheduled backup dispatch model + restore
+    // =====================================================================
+
+    /// An enabled backup schedule with everything the scheduler needs to assemble a
+    /// `Job::Backup` and decide whether it is due. No secret material (only the secret's id).
+    /// Returned by [`Self::list_enabled_backup_schedules`].
+    pub async fn list_enabled_backup_schedules(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<BackupScheduleRow>, DeploymentError> {
+        let rows = sqlx::query_as!(
+            BackupScheduleRow,
+            r#"
+            SELECT id, deployment_id, db_type, database_name, schedule_type, schedule_value,
+                   retention_days, retention_count,
+                   s3_endpoint, s3_bucket, s3_key_prefix, s3_region, s3_access_key_id,
+                   s3_secret_id, target_container, last_run_at
+            FROM backup_schedules
+            WHERE enabled = true
+            ORDER BY created_at
+            LIMIT $1
+            "#,
+            limit
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+        Ok(rows)
+    }
+
+    /// Stamp a schedule's `last_run_at` so the next due-evaluation measures from now.
+    pub async fn mark_backup_schedule_ran(
+        &self,
+        schedule_id: Uuid,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), DeploymentError> {
+        sqlx::query!(
+            "UPDATE backup_schedules SET last_run_at = $2, updated_at = $2 WHERE id = $1",
+            schedule_id,
+            at
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+        Ok(())
+    }
+
+    /// Resolve a stored secret's age envelope into a [`forge_agent::job::SecretRef`] targeting
+    /// `var`, so it can be carried inside a signed Job and decrypted by the running agent.
+    /// Returns `None` if the secret is missing or still a `pending` placeholder (no recipients
+    /// at creation time) — the caller then dispatches without S3 creds (volume-local backup).
+    pub async fn secret_ref_for(
+        &self,
+        secret_id: Uuid,
+        secret_name_in_job: &str,
+        var: &str,
+    ) -> Result<Option<forge_agent::job::SecretRef>, DeploymentError> {
+        let row = sqlx::query!(
+            "SELECT encrypted_blob FROM secrets WHERE id = $1 AND enabled = true",
+            secret_id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let ct: forge_core::spec::SecretCiphertext =
+            match serde_json::from_value(row.encrypted_blob) {
+                Ok(ct) => ct,
+                Err(_) => return Ok(None),
+            };
+        if ct.version != forge_core::spec::SecretCiphertext::VERSION_AGE_V1 {
+            // 'pending' placeholder or unknown version → not usable; fail open to no-creds.
+            return Ok(None);
+        }
+        Ok(Some(forge_agent::job::SecretRef {
+            name: secret_name_in_job.to_string(),
+            target: forge_core::spec::SecretTarget::Env {
+                var: var.to_string(),
+            },
+            ciphertext: ct,
+        }))
+    }
+
+    /// Retention prune: delete `success`/`failed` execution rows older than `retention_days`,
+    /// then (if `retention_count` is set) trim to the newest N successful executions. We prune
+    /// the execution ROWS; the actual S3 object lifecycle is the bucket's responsibility (the
+    /// agent cannot be assumed to hold delete creds), but the schedule's `retention_days`
+    /// records operator intent and the row set stays bounded (OWASP A10).
+    pub async fn prune_backup_executions(
+        &self,
+        schedule_id: Uuid,
+        retention_days: i32,
+        retention_count: Option<i32>,
+    ) -> Result<u64, DeploymentError> {
+        let cutoff = Utc::now() - chrono::Duration::days(i64::from(retention_days));
+        let mut pruned = sqlx::query!(
+            r#"
+            DELETE FROM backup_executions
+            WHERE schedule_id = $1
+              AND status IN ('success', 'failed', 'skipped')
+              AND created_at < $2
+            "#,
+            schedule_id,
+            cutoff
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?
+        .rows_affected();
+
+        if let Some(keep) = retention_count {
+            pruned += sqlx::query!(
+                r#"
+                DELETE FROM backup_executions
+                WHERE id IN (
+                    SELECT id FROM backup_executions
+                    WHERE schedule_id = $1 AND status = 'success'
+                    ORDER BY created_at DESC
+                    OFFSET $2
+                )
+                "#,
+                schedule_id,
+                i64::from(keep)
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DeploymentError::Internal(e.into()))?
+            .rows_affected();
+        }
+        Ok(pruned)
+    }
+
+    /// Record a backup JobResult (called from the agent WS layer on a `backup_*` result).
+    /// Updates the linked execution by deployment correlation and fires notifications.
+    pub async fn record_backup_job_result(
+        &self,
+        result: &JobResult,
+    ) -> Result<(), DeploymentError> {
+        let forge_agent::job::JobResultDetails::Backup {
+            success,
+            size_bytes,
+            location,
+            message,
+            ..
+        } = &result.details
+        else {
+            return Ok(());
+        };
+        let Ok(deployment_id) = Uuid::parse_str(&result.correlation_id) else {
+            return Ok(());
+        };
+
+        // Update the most recent pending/running execution for this deployment.
+        let exec = sqlx::query_scalar!(
+            r#"
+            SELECT id FROM backup_executions
+            WHERE deployment_id = $1 AND status IN ('pending', 'running')
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+            deployment_id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        if let Some(exec_id) = exec {
+            self.record_backup_result(
+                exec_id,
+                *success,
+                size_bytes.map(|s| i64::try_from(s).unwrap_or(i64::MAX)),
+                location.as_deref(),
+                message.as_deref(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Create a `pending` restore execution row. Returns its id so the caller can dispatch
+    /// the signed `Job::Restore`. The source execution provides the dump location + db_type.
+    pub async fn create_restore_execution(
+        &self,
+        deployment_id: Uuid,
+        source_execution_id: Uuid,
+        requested_by_principal_id: Option<Uuid>,
+    ) -> Result<(Uuid, RestoreSource), DeploymentError> {
+        // Load the source backup execution; it must belong to this deployment and have a location.
+        let src = sqlx::query!(
+            r#"
+            SELECT deployment_id, schedule_id, db_type, location, status
+            FROM backup_executions WHERE id = $1
+            "#,
+            source_execution_id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?
+        .ok_or(DeploymentError::DeploymentNotFound)?;
+
+        if src.deployment_id != Some(deployment_id) {
+            return Err(DeploymentError::InvalidInput(
+                "backup execution does not belong to this deployment".into(),
+            ));
+        }
+        if src.status != "success" {
+            return Err(DeploymentError::InvalidInput(
+                "can only restore from a successful backup".into(),
+            ));
+        }
+        let location = src.location.clone().ok_or_else(|| {
+            DeploymentError::InvalidInput("backup execution has no stored location".into())
+        })?;
+
+        let restore_id = Uuid::now_v7();
+        let now = Utc::now();
+        // target_container + s3 config come from the originating schedule (if any).
+        let source = self
+            .resolve_restore_source(src.schedule_id, &src.db_type, &location)
+            .await?;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO restore_executions
+                (id, deployment_id, source_execution_id, status, db_type, target_container,
+                 location, requested_by_principal_id, started_at, created_at)
+            VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $8)
+            "#,
+            restore_id,
+            deployment_id,
+            source_execution_id,
+            src.db_type,
+            source.target_container,
+            location,
+            requested_by_principal_id,
+            now
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        Ok((restore_id, source))
+    }
+
+    /// Resolve the restore source details (target container + S3 config) from the originating
+    /// schedule. When the backup had no schedule (manual backup), we derive the target
+    /// container from the deployment spec's first container and treat the location as an S3 key.
+    async fn resolve_restore_source(
+        &self,
+        schedule_id: Option<Uuid>,
+        _db_type: &str,
+        location: &str,
+    ) -> Result<RestoreSource, DeploymentError> {
+        if let Some(sid) = schedule_id {
+            let row = sqlx::query!(
+                r#"
+                SELECT s3_endpoint, s3_bucket, s3_key_prefix, s3_region, s3_access_key_id,
+                       s3_secret_id, target_container
+                FROM backup_schedules WHERE id = $1
+                "#,
+                sid
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| DeploymentError::Internal(e.into()))?;
+            if let Some(r) = row {
+                return Ok(RestoreSource {
+                    target_container: r.target_container.unwrap_or_default(),
+                    s3_endpoint: r.s3_endpoint,
+                    s3_bucket: r.s3_bucket,
+                    // The dump's key is encoded in `location` (s3://bucket/key); the agent uses it.
+                    s3_key: Self::s3_key_from_location(location, r.s3_key_prefix.as_deref()),
+                    s3_region: r.s3_region,
+                    s3_access_key_id: r.s3_access_key_id,
+                    s3_secret_id: r.s3_secret_id,
+                });
+            }
+        }
+        Ok(RestoreSource {
+            target_container: String::new(),
+            s3_endpoint: None,
+            s3_bucket: None,
+            s3_key: Self::s3_key_from_location(location, None),
+            s3_region: None,
+            s3_access_key_id: None,
+            s3_secret_id: None,
+        })
+    }
+
+    /// Extract the object key from a stored `s3://bucket/key` (or volume) location.
+    fn s3_key_from_location(location: &str, _prefix: Option<&str>) -> String {
+        if let Some(rest) = location.strip_prefix("s3://") {
+            // rest = bucket/key... — drop the bucket segment.
+            rest.split_once('/')
+                .map_or_else(|| rest.to_string(), |(_, k)| k.to_string())
+        } else {
+            location.to_string()
+        }
+    }
+
+    /// The db_type of a backup execution (used to build the matching restore job).
+    pub async fn restore_db_type(
+        &self,
+        execution_id: Uuid,
+    ) -> Result<Option<String>, DeploymentError> {
+        sqlx::query_scalar!(
+            "SELECT db_type FROM backup_executions WHERE id = $1",
+            execution_id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))
+    }
+
+    /// Record a restore JobResult terminal status + fire notifications.
+    pub async fn record_restore_job_result(
+        &self,
+        result: &JobResult,
+    ) -> Result<(), DeploymentError> {
+        let forge_agent::job::JobResultDetails::Restore {
+            success,
+            location,
+            message,
+            ..
+        } = &result.details
+        else {
+            return Ok(());
+        };
+        let Ok(restore_id) = Uuid::parse_str(&result.correlation_id) else {
+            return Ok(());
+        };
+        let status = if *success { "success" } else { "failed" };
+        let now = Utc::now();
+        let dep = sqlx::query_scalar!(
+            r#"
+            UPDATE restore_executions
+            SET status = $1, error = $2, location = COALESCE($3, location), finished_at = $4
+            WHERE id = $5
+            RETURNING deployment_id
+            "#,
+            status,
+            if *success { None } else { message.clone() },
+            location.clone(),
+            now,
+            restore_id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?
+        .flatten();
+
+        let event = if *success {
+            "restore.success"
+        } else {
+            "restore.failed"
+        };
+        let _ = self
+            .trigger_notifications(
+                event,
+                "deployment",
+                dep,
+                serde_json::json!({
+                    "restore_execution_id": restore_id,
+                    "success": success,
+                    "location": location,
+                }),
+            )
+            .await;
         Ok(())
     }
 
@@ -4399,5 +5259,158 @@ mod notification_delivery_tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert_eq!(status.as_deref(), Some("skipped"));
+    }
+}
+
+#[cfg(test)]
+mod backup_restore_tests {
+    //! Data tranche: catalog serde, S3-secret resolution from the age store (never plaintext),
+    //! and restore-source resolution. DB tests use `#[sqlx::test]` (isolated DB + migrations).
+    use super::*;
+    use std::sync::Arc;
+
+    fn svc(pool: PgPool) -> DeploymentService {
+        let rbac = Arc::new(crate::rbac::RbacService::new(pool.clone()));
+        DeploymentService::new(pool, rbac)
+    }
+
+    #[test]
+    fn catalog_breadth_templates_are_present_and_serde_round_trip() {
+        let catalog = DeploymentService::load_catalog();
+        // The breadth additions are all present.
+        for id in [
+            "ghost",
+            "n8n",
+            "plausible",
+            "uptime-kuma",
+            "metabase",
+            "vaultwarden",
+            "gitea",
+            "nextcloud",
+            "supabase",
+            "postgres",
+            "redis",
+            "minio",
+        ] {
+            assert!(catalog.iter().any(|t| t.id == id), "catalog missing {id}");
+        }
+        // Every template (de)serializes losslessly through JSON.
+        for t in &catalog {
+            let json = serde_json::to_string(t).unwrap();
+            let back: CatalogTemplate = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.id, t.id);
+            assert!(
+                back.spec.get("containers").is_some(),
+                "{} has no containers",
+                t.id
+            );
+        }
+    }
+
+    #[test]
+    fn generated_secret_vars_carry_no_hardcoded_value() {
+        let catalog = DeploymentService::load_catalog();
+        let ghost = catalog.iter().find(|t| t.id == "ghost").unwrap();
+        let pw = ghost
+            .variables
+            .iter()
+            .find(|v| v.name == "GHOST_DB_PASSWORD")
+            .unwrap();
+        // The credential is a generated secret with an EMPTY default (never hardcoded).
+        assert!(pw.secret && pw.generate, "must be a generated secret");
+        assert!(
+            pw.default.is_empty(),
+            "generated secret must not ship a default value"
+        );
+    }
+
+    #[sqlx::test]
+    async fn secret_ref_resolves_age_envelope_without_plaintext(pool: PgPool) {
+        let svc = svc(pool.clone());
+
+        // Enroll an agent recipient so create_secret produces a real age envelope.
+        let id = age::x25519::Identity::generate();
+        let recipient = id.to_public().to_string();
+        let agent_id = Uuid::now_v7();
+        sqlx::query!(
+            "INSERT INTO agents (id, hostname, public_key, age_recipient) VALUES ($1, 'a', $2, $3)",
+            agent_id,
+            agent_id.as_bytes().to_vec(),
+            recipient
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let created = svc
+            .create_secret("s3-key", None, "SUPERSECRETKEY")
+            .await
+            .unwrap();
+        let secret_id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+
+        let sref = svc
+            .secret_ref_for(secret_id, "s3_secret_key", "S3_SECRET_KEY")
+            .await
+            .unwrap()
+            .expect("secret ref should resolve");
+
+        // The SecretRef carries the age envelope, never the plaintext.
+        assert_eq!(sref.name, "s3_secret_key");
+        let wire = serde_json::to_string(&sref).unwrap();
+        assert!(
+            !wire.contains("SUPERSECRETKEY"),
+            "plaintext must never appear in the SecretRef wire form"
+        );
+        // And it really is the same secret — the enrolled agent identity can decrypt it.
+        let recovered = forge_agent::job::decrypt_secret(&sref.ciphertext, &id).unwrap();
+        assert_eq!(recovered, b"SUPERSECRETKEY");
+    }
+
+    #[sqlx::test]
+    async fn create_schedule_rejects_non_https_s3_endpoint(pool: PgPool) {
+        let svc = svc(pool.clone());
+        let app = svc.create_application("ep-app", None, None).await.unwrap();
+        let dep = svc
+            .create_deployment(
+                app.id,
+                serde_json::json!({ "containers": [{ "name": "db", "image": "postgres:16" }] }),
+                forge_core::DeploymentStrategy::default(),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let err = svc
+            .create_backup_schedule(
+                dep.id,
+                "bad",
+                "postgres",
+                None,
+                "interval",
+                "3600",
+                30,
+                None,
+                Some("http://insecure.example"), // not https
+                Some("bucket"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DeploymentError::InvalidInput(_)));
+    }
+
+    #[sqlx::test]
+    async fn restore_source_extracts_key_from_s3_location(pool: PgPool) {
+        let svc = svc(pool.clone());
+        // s3://bucket/prefix/dump.sql → key is "prefix/dump.sql"
+        let source = svc
+            .resolve_restore_source(None, "postgres", "s3://mybucket/nightly/backup-1.sql")
+            .await
+            .unwrap();
+        assert_eq!(source.s3_key, "nightly/backup-1.sql");
     }
 }

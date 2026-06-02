@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE restore_executions\n            SET status = $1, error = $2, location = COALESCE($3, location), finished_at = $4\n            WHERE id = $5\n            RETURNING deployment_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deployment_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "a03446c506c74672a938351d05db97fd584c671ad599955614955786ced00620"
+}

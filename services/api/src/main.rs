@@ -32,12 +32,14 @@ use uuid::Uuid;
 
 mod agent_ws;
 mod alerts;
+mod backup_scheduler;
 mod deployment;
 mod enrollment;
 mod metrics;
 mod notify;
 mod provisioning;
 mod rbac;
+mod schedule;
 mod xds;
 
 use crate::metrics::{ControlPlaneMetrics, SharedMetrics};
@@ -289,6 +291,20 @@ async fn main() {
     );
     info!("Alert threshold evaluator started (30s interval)");
 
+    // Scheduled backups: a bounded background task that scans enabled backup_schedules every
+    // 60s and dispatches signed Job::Backup to a connected agent (or durably queues when the
+    // agent is offline), applying retention. Fail-safe: per-schedule errors are logged and
+    // skipped, never panicking the loop; wired to its own watch-based shutdown signal.
+    let (_backup_shutdown_tx, backup_shutdown_rx) = tokio::sync::watch::channel(false);
+    let _backup_sched_handle = backup_scheduler::spawn_backup_scheduler(
+        (*state.pool).clone(),
+        state.deployment_service.clone(),
+        state.agent_registry.clone(),
+        state.signing_key.clone(),
+        backup_shutdown_rx,
+    );
+    info!("Backup scheduler started (60s interval)");
+
     // CORS for local dev UI (apps/web on :3001). In prod this is behind reverse proxy with proper origin allowlist.
     let cors = CorsLayer::new()
         .allow_origin(Any) // dev only — tighten in production
@@ -458,6 +474,10 @@ async fn main() {
         .route(
             "/applications/{app_id}/deployments/{dep_id}/backups",
             get(list_backup_executions),
+        )
+        .route(
+            "/applications/{app_id}/deployments/{dep_id}/backups/{execution_id}/restore",
+            post(restore_backup),
         )
         // Feature 5: Git Sources (admin)
         .route("/git-sources", get(list_git_sources))
@@ -3647,16 +3667,32 @@ struct CreateBackupScheduleBody {
     schedule_type: String,  // "interval" or "cron"
     schedule_value: String, // seconds or cron string
     retention_days: Option<i32>,
+    retention_count: Option<i32>,
     s3_endpoint: Option<String>,
     s3_bucket: Option<String>,
     s3_key_prefix: Option<String>,
+    s3_region: Option<String>,
+    /// Non-secret S3 access-key id. The matching secret KEY must be stored separately via the
+    /// secret store and referenced by `s3_secret_id` (never sent as plaintext here).
+    s3_access_key_id: Option<String>,
+    s3_secret_id: Option<Uuid>,
+    /// Container the scheduled dump runs against (defaults to the deployment's first container).
+    target_container: Option<String>,
 }
 
 async fn create_backup_schedule(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(dep_id): Path<Uuid>,
     Json(body): Json<CreateBackupScheduleBody>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // RBAC default-deny: managing backup schedules requires backups:write.
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "backups:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     match state
         .deployment_service
         .create_backup_schedule(
@@ -3667,13 +3703,23 @@ async fn create_backup_schedule(
             &body.schedule_type,
             &body.schedule_value,
             body.retention_days.unwrap_or(30),
+            body.retention_count,
             body.s3_endpoint.as_deref(),
             body.s3_bucket.as_deref(),
             body.s3_key_prefix.as_deref(),
+            body.s3_region.as_deref(),
+            body.s3_access_key_id.as_deref(),
+            body.s3_secret_id,
+            body.target_container.as_deref(),
         )
         .await
     {
         Ok(sch) => Ok((StatusCode::CREATED, Json(sch))),
+        Err(deployment::DeploymentError::InvalidInput(msg)) => Err(ApiError::Validation {
+            field: "schedule".into(),
+            message: msg,
+        }),
+        Err(deployment::DeploymentError::Forbidden) => Err(ApiError::Forbidden),
         Err(e) => {
             warn!(error = %e, "create_backup_schedule failed");
             Err(ApiError::Internal)
@@ -3751,6 +3797,163 @@ async fn list_backup_executions(
             Err(ApiError::Internal)
         }
     }
+}
+
+#[derive(Deserialize)]
+struct RestoreBody {
+    /// Confirm-required: a restore is destructive (it overwrites the target database). The
+    /// client MUST pass `confirm: true` to proceed — surfaced as a 422 otherwise so a UI can
+    /// force an explicit acknowledgement.
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// Restore a previously-captured backup into its deployment's database container.
+///
+/// DESTRUCTIVE. RBAC default-deny on `backups:write`. The restore command is built argv-only
+/// on the agent (engine + database validated against an allowlist; no host shell), and the
+/// dump is fetched from S3 using credentials resolved from the age secret store.
+async fn restore_backup(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Path((_app_id, dep_id, execution_id)): Path<(Uuid, Uuid, Uuid)>,
+    Json(body): Json<RestoreBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // RBAC default-deny: restore requires backups:write (fail fast before any dispatch).
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "backups:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
+    if !body.confirm {
+        return Err(ApiError::Validation {
+            field: "confirm".into(),
+            message: "restore is destructive; set confirm=true to proceed".into(),
+        });
+    }
+
+    // Create the pending restore execution (validates the source backup belongs to this
+    // deployment, is successful, and has a stored location) and resolve its source details.
+    let (restore_id, source) = match state
+        .deployment_service
+        .create_restore_execution(dep_id, execution_id, principal.principal_id())
+        .await
+    {
+        Ok(v) => v,
+        Err(deployment::DeploymentError::InvalidInput(msg)) => {
+            return Err(ApiError::Validation {
+                field: "execution_id".into(),
+                message: msg,
+            });
+        }
+        Err(deployment::DeploymentError::DeploymentNotFound) => return Err(ApiError::NotFound),
+        Err(e) => {
+            warn!(error = %e, "create_restore_execution failed");
+            return Err(ApiError::Internal);
+        }
+    };
+
+    // An S3 source is required to fetch the dump back (volume-local restore is out of scope).
+    let (Some(endpoint), Some(bucket)) = (source.s3_endpoint.clone(), source.s3_bucket.clone())
+    else {
+        return Err(ApiError::Validation {
+            field: "source".into(),
+            message: "this backup has no S3 source to restore from".into(),
+        });
+    };
+    if source.target_container.is_empty() {
+        return Err(ApiError::Validation {
+            field: "source".into(),
+            message: "could not resolve the target container for this restore".into(),
+        });
+    }
+
+    // Resolve the S3 secret KEY as an age SecretRef (never plaintext in the control plane).
+    let mut secrets = Vec::new();
+    if let Some(secret_id) = source.s3_secret_id {
+        match state
+            .deployment_service
+            .secret_ref_for(secret_id, "s3_secret_key", "S3_SECRET_KEY")
+            .await
+        {
+            Ok(Some(sr)) => secrets.push(sr),
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, "failed to resolve s3 secret for restore");
+                return Err(ApiError::Internal);
+            }
+        }
+    }
+
+    // Look up the source backup's db_type + an agent target for this deployment.
+    let targets = state
+        .deployment_service
+        .get_targets_for_deployment(dep_id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let Some(target) = targets.first() else {
+        return Err(ApiError::Validation {
+            field: "deployment".into(),
+            message: "deployment has no agent targets".into(),
+        });
+    };
+
+    let s3 = forge_core::spec::S3BackupConfig {
+        endpoint,
+        bucket,
+        key: source.s3_key.clone(),
+        access_key: source.s3_access_key_id.clone(),
+        secret_key: None, // travels age-encrypted in `secrets`
+        region: source.s3_region.clone(),
+    };
+
+    let db_type = state
+        .deployment_service
+        .restore_db_type(execution_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .unwrap_or_else(|| "postgres".to_string());
+
+    let job = Job::Restore {
+        restore_id,
+        deployment_id: dep_id,
+        target_container: source.target_container.clone(),
+        db_type,
+        database: None,
+        s3,
+        secrets,
+    };
+    let signer = crate::agent_ws::JobSigner::new((*state.signing_key).clone());
+    let signed = signer.sign(job);
+
+    let agent_id = target.agent_id;
+    let queued = if state
+        .agent_registry
+        .send_job(agent_id, signed.clone())
+        .await
+    {
+        info!(%restore_id, %agent_id, "dispatched Job::Restore to agent");
+        false
+    } else {
+        if let Err(e) = state
+            .deployment_service
+            .queue_pending_dispatch(dep_id, agent_id, &signed)
+            .await
+        {
+            warn!(error = %e, "failed to queue pending restore dispatch");
+        }
+        true
+    };
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "restore_execution_id": restore_id,
+            "queued_offline": queued,
+            "destructive": true,
+        })),
+    ))
 }
 
 // Interactive terminal WS (Feature 4)

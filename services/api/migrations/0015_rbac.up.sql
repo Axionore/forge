@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS principal_projects (
 -- Seed default roles (idempotent on re-run in dev)
 INSERT INTO roles (id, name, description, permissions) VALUES
     (gen_random_uuid(), 'viewer', 'Read-only access to deployments, agents, secrets, git sources', '{"deployments:read": true, "agents:read": true, "secrets:read": true, "git-sources:read": true}'),
-    (gen_random_uuid(), 'operator', 'Full deploy/git/secret-read + limited write', '{"deployments:*": true, "agents:read": true, "secrets:read": true, "git-sources:write": true, "webhooks:write": true}'),
+    (gen_random_uuid(), 'operator', 'Full deploy/git/secret-read + limited write', '{"deployments:*": true, "agents:read": true, "secrets:read": true, "git-sources:write": true, "webhooks:write": true, "backups:*": true}'),
     (gen_random_uuid(), 'admin', 'Full access (bootstrap equivalent for issued tokens)', '{"*": true}')
 ON CONFLICT (name) DO NOTHING;
 

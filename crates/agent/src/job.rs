@@ -334,9 +334,39 @@ pub enum Job {
         /// "postgres", "mysql", "mongodb" etc. (v1 focuses on postgres via pg_dump)
         db_type: String,
         database: Option<String>, // specific DB name, or all if None
-        /// Optional S3-compatible destination. If present, agent uploads the dump.
-        /// Credentials are passed securely in the signed job (in production they would be short-lived).
+        /// Optional S3-compatible destination. If present, agent uploads the dump. The S3
+        /// access-key id rides in [`S3BackupConfig::access_key`]; the secret KEY arrives
+        /// age-encrypted in [`Self::Backup::secrets`] (named `s3_secret_key`), never plaintext.
         s3: Option<S3BackupConfig>,
+        /// Age-encrypted secrets for this backup (e.g. the S3 secret key). Decrypted on the
+        /// agent with its identity. Defaults to empty for backward-compatible deserialization.
+        #[serde(default)]
+        secrets: Vec<SecretRef>,
+    },
+
+    /// Restore a previously-captured dump back into the target database container.
+    ///
+    /// DESTRUCTIVE: this overwrites the target database. The control plane gates it behind
+    /// `backups:write` + confirm-required semantics; the agent additionally validates the
+    /// engine against [`RESTORE_ENGINES`] and builds the restore command **argv-only** (the
+    /// dump is streamed to the engine client's stdin; no repo/user string is ever passed
+    /// through a host shell), mitigating OWASP A03 command injection.
+    Restore {
+        /// Restore-execution id (control-plane correlation; the JobResult routes back to it).
+        restore_id: Uuid,
+        deployment_id: Uuid,
+        target_container: String,
+        /// Engine to restore with. Validated against [`RESTORE_ENGINES`] on the agent.
+        db_type: String,
+        /// Optional specific database name to restore into.
+        database: Option<String>,
+        /// Where the dump is fetched from (S3-compatible object storage). Credentials, when
+        /// present, arrive age-encrypted in [`Self::secrets`], never in this struct.
+        s3: S3BackupConfig,
+        /// Age-encrypted secrets for this restore (e.g. the S3 secret key). Decrypted on the
+        /// agent with its identity, exactly like Deploy secrets.
+        #[serde(default)]
+        secrets: Vec<SecretRef>,
     },
 
     /// Execute a build from source (Git + Dockerfile or buildpack) and produce a container image.
@@ -366,6 +396,170 @@ pub enum Job {
 
 // (The re-export of spec types from forge-core is at the top of this file for
 // visibility to the Job enum and other items.)
+
+/// Database engines the agent will restore into. Anything outside this allowlist is
+/// rejected before any command is built (fail-closed; OWASP A03/A08). The corresponding
+/// client binaries (`pg_restore`/`psql`, `mysql`, `mongorestore`) must be present in the
+/// target container.
+pub const RESTORE_ENGINES: [&str; 4] = ["postgres", "postgresql", "mysql", "mongodb"];
+
+/// Errors building a restore command. Carries no secret material; the `Display` text is a
+/// stable category safe to surface and log.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RestoreCommandError {
+    #[error("unsupported restore engine")]
+    UnsupportedEngine,
+    #[error("invalid database name")]
+    InvalidDatabase,
+}
+
+/// True when `s` is a safe database identifier: ASCII alphanumerics, `_`, `-`, `.` only,
+/// 1..=128 chars. Database names flow into the restore argv (e.g. `psql -d <db>`), so even
+/// though argv avoids a shell, we still reject anything that could be (mis)read as a flag or
+/// carry shell metacharacters — defense in depth against argv-injection / option-smuggling.
+#[must_use]
+pub fn is_safe_db_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        // Must not start with '-' (would be parsed as an option by the client binary).
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+/// Build the argv for restoring `db_type` into `database`, reading the dump from stdin.
+///
+/// Returns the full argv vector (program + flags). The command is run with the dump bytes
+/// piped to its stdin — **no host shell, no string interpolation of the dump or any
+/// untrusted value**. The engine is validated against [`RESTORE_ENGINES`] and the database
+/// name against [`is_safe_db_identifier`]. This is a pure function so it is unit- and
+/// property-testable without Docker.
+pub fn build_restore_argv(
+    db_type: &str,
+    database: Option<&str>,
+) -> Result<Vec<String>, RestoreCommandError> {
+    let engine = db_type.trim().to_ascii_lowercase();
+    if !RESTORE_ENGINES.contains(&engine.as_str()) {
+        return Err(RestoreCommandError::UnsupportedEngine);
+    }
+
+    // Validate the database name if one was supplied (argv-injection defense in depth).
+    let db = match database.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) if is_safe_db_identifier(d) => Some(d.to_string()),
+        Some(_) => return Err(RestoreCommandError::InvalidDatabase),
+        None => None,
+    };
+
+    let argv = match engine.as_str() {
+        "postgres" | "postgresql" => {
+            // Plain-SQL dumps (what `execute_backup` produces) restore via psql from stdin.
+            // `-v ON_ERROR_STOP=1` makes a partial/corrupt dump fail closed instead of
+            // leaving the DB half-restored.
+            let database = db.unwrap_or_else(|| "postgres".to_string());
+            vec![
+                "psql".to_string(),
+                "-U".to_string(),
+                "postgres".to_string(),
+                "-d".to_string(),
+                database,
+                "-v".to_string(),
+                "ON_ERROR_STOP=1".to_string(),
+            ]
+        }
+        "mysql" => {
+            let mut v = vec!["mysql".to_string()];
+            if let Some(database) = db {
+                v.push("--database".to_string());
+                v.push(database);
+            }
+            v
+        }
+        "mongodb" => {
+            // mongorestore reads a BSON archive from stdin via `--archive`.
+            let mut v = vec![
+                "mongorestore".to_string(),
+                "--archive".to_string(),
+                "--drop".to_string(),
+            ];
+            if let Some(database) = db {
+                v.push("--nsInclude".to_string());
+                v.push(format!("{database}.*"));
+            }
+            v
+        }
+        // Unreachable: the allowlist check above already rejected anything else.
+        _ => return Err(RestoreCommandError::UnsupportedEngine),
+    };
+
+    Ok(argv)
+}
+
+#[cfg(test)]
+mod restore_command_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unknown_engine() {
+        assert_eq!(
+            build_restore_argv("sqlite", Some("app")),
+            Err(RestoreCommandError::UnsupportedEngine)
+        );
+        // An attempt to smuggle a shell command as an "engine" is rejected by the allowlist.
+        assert_eq!(
+            build_restore_argv("postgres; rm -rf /", Some("app")),
+            Err(RestoreCommandError::UnsupportedEngine)
+        );
+    }
+
+    #[test]
+    fn rejects_shell_metachar_database() {
+        for bad in [
+            "app; DROP DATABASE app",
+            "app && curl evil",
+            "app$(whoami)",
+            "app`id`",
+            "--dbname=evil",
+            "app|nc",
+            "app name",
+        ] {
+            assert_eq!(
+                build_restore_argv("postgres", Some(bad)),
+                Err(RestoreCommandError::InvalidDatabase),
+                "must reject database name {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_argv_is_program_and_flags_only() {
+        let argv = build_restore_argv("postgres", Some("app_db")).unwrap();
+        assert_eq!(argv[0], "psql");
+        // The whole command is discrete argv tokens — no shell, no concatenation.
+        assert!(argv.iter().any(|a| a == "app_db"));
+        assert!(argv.iter().any(|a| a == "ON_ERROR_STOP=1"));
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a.contains(';') || a.contains('|') || a.contains('&'))
+        );
+    }
+
+    #[test]
+    fn engine_match_is_case_insensitive_and_trimmed() {
+        assert!(build_restore_argv("  PostgreSQL ", Some("app")).is_ok());
+        assert!(build_restore_argv("MONGODB", None).is_ok());
+    }
+
+    #[test]
+    fn safe_identifier_boundaries() {
+        assert!(is_safe_db_identifier("app"));
+        assert!(is_safe_db_identifier("my-app_db.1"));
+        assert!(!is_safe_db_identifier(""));
+        assert!(!is_safe_db_identifier("-flag"));
+        assert!(!is_safe_db_identifier(&"a".repeat(129)));
+        assert!(!is_safe_db_identifier("a b"));
+    }
+}
 
 /// Structured result of a job execution, sent back to the control plane for
 /// observability, auditing, and UI updates.
@@ -424,6 +618,15 @@ pub enum JobResultDetails {
         /// S3 key or local volume path where the backup was stored.
         location: Option<String>,
         /// Short log excerpt or error details for UI.
+        message: Option<String>,
+        db_type: String,
+    },
+    /// Result of a Restore job (download dump from S3 + engine restore into the container).
+    Restore {
+        success: bool,
+        /// The S3 key / location the dump was restored from.
+        location: Option<String>,
+        /// Sanitized log excerpt or error details for UI (never secrets).
         message: Option<String>,
         db_type: String,
     },

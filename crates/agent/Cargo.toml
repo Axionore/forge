@@ -40,6 +40,11 @@ reqwest = { workspace = true, features = ["stream"] }
 sha2 = "0.10"
 tokio-util = { version = "0.7", features = ["io"] }
 
+# AWS SigV4 signing for S3-compatible backup upload / restore download (HMAC-SHA256).
+# Already transitive via the TLS/crypto stack; promoted to direct deps so the signer is auditable.
+hmac = "0.12"
+hex = "0.4"
+
 # Docker support
 bollard = { workspace = true, optional = true }
 futures-util = "0.3"

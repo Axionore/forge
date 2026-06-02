@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO agents (id, hostname, public_key, age_recipient) VALUES ($1, 'a', $2, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0cea4c129268664da180d3d77b9c3d749fa6e1a7433aee2f48f92ea77b9f4801"
+}
