@@ -14,6 +14,7 @@ path = "src/main.rs"
 forge-core = { path = "../../crates/core" }
 forge-agent = { path = "../../crates/agent" }   # For SignedJob, Job, etc. during Slice 2 (will move to forge-core)
 forge-provider-hetzner = { path = "../../crates/providers/hetzner" }
+forge-providers = { path = "../../crates/providers" }
 
 tokio.workspace = true
 axum.workspace = true

@@ -2214,13 +2214,35 @@ async fn create_hetzner_server(
         });
     };
 
-    let provider =
-        forge_provider_hetzner::HetznerProvider::new(forge_provider_hetzner::HetznerConfig {
+    use forge_providers::{CloudProvider, ServerSpec};
+
+    let provider = forge_provider_hetzner::HetznerProvider::from_config(
+        forge_provider_hetzner::HetznerConfig {
             api_token: effective_hetzner_token,
-            default_location: req.location.clone(),
-            default_server_type: req.server_type.clone(),
-            default_image: None,
-        });
+            dns_token: None,
+        },
+    );
+
+    let server_type = req
+        .server_type
+        .clone()
+        .unwrap_or_else(|| "cx22".to_string());
+    let location = req.location.clone().unwrap_or_else(|| "fsn1".to_string());
+
+    // If a private network was requested, ensure it exists once for this batch.
+    let mut network_ids: Vec<String> = Vec::new();
+    if let Some(net_name) = req.private_network_name.as_deref() {
+        let ip_range = req
+            .private_network_ip_range
+            .as_deref()
+            .unwrap_or("10.0.0.0/16");
+        match provider.create_network(net_name, ip_range).await {
+            Ok(net) => network_ids.push(net.id),
+            Err(e) => {
+                warn!(error = %e, network = %net_name, "Failed to create private network; servers will be created without it")
+            }
+        }
+    }
 
     let mut created_servers = vec![];
 
@@ -2243,21 +2265,25 @@ async fn create_hetzner_server(
             .await
             .map_err(|_| ApiError::Internal)?;
 
-        let user_data =
-            provider.build_agent_cloud_init(&cp_url, &enrollment.raw_token, Some(&server_name));
+        let user_data = forge_provider_hetzner::build_agent_cloud_init(
+            &cp_url,
+            &enrollment.raw_token,
+            Some(&server_name),
+        );
 
-        match provider
-            .create_server(
-                &server_name,
-                req.server_type.as_deref(),
-                None,
-                req.location.as_deref(),
-                Some(&user_data),
-                req.private_network_name.as_deref(),
-                req.private_network_ip_range.as_deref(),
-            )
-            .await
-        {
+        let spec = ServerSpec {
+            name: server_name.clone(),
+            size: server_type.clone(),
+            image: "ubuntu-24.04".to_string(),
+            region: location.clone(),
+            user_data: Some(user_data),
+            ssh_key_ids: Vec::new(),
+            network_ids: network_ids.clone(),
+            firewall_ids: Vec::new(),
+            labels: std::collections::BTreeMap::new(),
+        };
+
+        match provider.provision_server(&spec).await {
             Ok(server) => {
                 created_servers.push(serde_json::json!({
                     "server": server,

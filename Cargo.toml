@@ -4,9 +4,13 @@ members = [
     "crates/agent",
     "crates/core",
     "services/api",
+    "crates/providers",
     "crates/providers/hetzner",
+    "crates/providers/aws",
+    "crates/providers/gcp",
+    "crates/providers/azure",
+    "crates/providers/digitalocean",
     # Future members (will be added as we build):
-    # "crates/providers/digitalocean",
     # "crates/providers/ssh",
     # "services/worker",
 ]
@@ -37,6 +41,12 @@ toml = "0.8"
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
+
+# Async traits (dyn-safe provider abstraction)
+async-trait = "0.1"
+
+# HTTP mocking for tests
+wiremock = "0.6"
 
 # Observability
 tracing = "0.1"
