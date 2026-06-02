@@ -4399,8 +4399,14 @@ async fn list_roles(State(state): State<AppState>) -> Result<Json<Vec<rbac::Role
 
 async fn create_role(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Json(body): Json<CreateRoleRequest>,
 ) -> Result<(StatusCode, Json<rbac::Role>), ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "iam:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
     if body.name.len() > 64 {
         return Err(ApiError::Validation {
             field: "name".into(),
@@ -4439,8 +4445,14 @@ async fn list_principals(
 
 async fn create_principal(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Json(body): Json<CreatePrincipalRequest>,
 ) -> Result<(StatusCode, Json<rbac::Principal>), ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "iam:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
     match state
         .rbac_service
         .create_principal(&body.name, &body.principal_type, None)
@@ -4471,9 +4483,17 @@ struct AssignRoleRequest {
 /// so this is the operator path that makes per-principal RBAC usable.
 async fn assign_principal_role(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(principal_id): Path<Uuid>,
     Json(body): Json<AssignRoleRequest>,
 ) -> Result<StatusCode, ApiError> {
+    // CRITICAL: gate role assignment behind iam:write so an issued token cannot
+    // self-grant privileges. Bootstrap (None) is allowed; everyone else default-deny.
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "iam:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
     match state
         .rbac_service
         .assign_role(principal_id, body.role_id, None)
@@ -4504,8 +4524,14 @@ async fn list_admin_tokens(
 
 async fn create_admin_token(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Json(body): Json<CreateAdminTokenRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "iam:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
     match state
         .rbac_service
         .create_admin_token(
@@ -4542,8 +4568,14 @@ async fn create_admin_token(
 
 async fn revoke_admin_token(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(prefix): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "iam:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
     if prefix.len() < 4 {
         return Err(ApiError::Validation {
             field: "prefix".into(),
