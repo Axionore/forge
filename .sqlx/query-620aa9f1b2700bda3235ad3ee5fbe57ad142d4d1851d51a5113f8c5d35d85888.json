@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO notification_channels (id, name, channel_type, config, enabled)\n            VALUES ($1, 'test', 'webhook', '{\"url\":\"https://example.com/h\"}'::jsonb, false)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "620aa9f1b2700bda3235ad3ee5fbe57ad142d4d1851d51a5113f8c5d35d85888"
+}

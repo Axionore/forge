@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO deployment_metrics (deployment_id, agent_id, metric_name, value, labels, timestamp)\n            VALUES (NULL, NULL, $1, $2, '{}'::jsonb, $3)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Float8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "477b56baecd803a0b0eb746048e6fb5d1cb8cb35ab632cd133ee7e08d0b44241"
+}

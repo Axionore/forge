@@ -31,6 +31,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 mod agent_ws;
+mod alerts;
 mod deployment;
 mod enrollment;
 mod metrics;
@@ -91,6 +92,10 @@ struct AppState {
 
     /// Cloud provisioning service (Phase A.2): provider registry + provisioned_resources tracking.
     provisioning_service: Arc<provisioning::ProvisioningService>,
+
+    /// Monitoring threshold alerts: rule CRUD + event reads. The background evaluator runs
+    /// independently (spawned in `main`) and shares the same pool + deployment service.
+    alert_service: Arc<alerts::AlertService>,
 }
 
 /// Configuration for public-facing TLS (supports static certs or automatic Let's Encrypt via ACME).
@@ -242,6 +247,8 @@ async fn main() {
         )),
     ));
 
+    let alert_service = Arc::new(alerts::AlertService::new((*pool).clone()));
+
     let xds_state = crate::xds::XdsState::new();
 
     // Create mTLS authority once at startup so we can auto-issue client certs during enrollment.
@@ -267,7 +274,20 @@ async fn main() {
         rbac_service,
         hetzner_cp_age_secret,
         provisioning_service,
+        alert_service: alert_service.clone(),
     };
+
+    // Monitoring threshold alert evaluator: a bounded background task that scans enabled
+    // rules every 30s, fires/resolves alert_events, and triggers notifications. Wired to a
+    // watch-based shutdown signal for graceful stop (the loop is fail-safe: per-rule DB
+    // errors are logged and skipped, never panicking the task).
+    let (_alert_shutdown_tx, alert_shutdown_rx) = tokio::sync::watch::channel(false);
+    let _alert_eval_handle = alerts::spawn_alert_evaluator(
+        (*state.pool).clone(),
+        state.deployment_service.clone(),
+        alert_shutdown_rx,
+    );
+    info!("Alert threshold evaluator started (30s interval)");
 
     // CORS for local dev UI (apps/web on :3001). In prod this is behind reverse proxy with proper origin allowlist.
     let cors = CorsLayer::new()
@@ -353,6 +373,14 @@ async fn main() {
             "/deployments/{dep_id}/notifications/test",
             post(test_notification_trigger),
         )
+        // Monitoring threshold alerts (rule CRUD + fired-event feed). Mutations are
+        // RBAC-gated on `alerts:write`; reads are open to authenticated admins.
+        .route("/alert-rules", get(list_alert_rules))
+        .route("/alert-rules", post(create_alert_rule))
+        .route("/alert-rules/{id}", get(get_alert_rule))
+        .route("/alert-rules/{id}", put(update_alert_rule))
+        .route("/alert-rules/{id}", delete(delete_alert_rule))
+        .route("/alert-events", get(list_alert_events))
         // Feature 2: Service Catalog
         .route("/catalog", get(list_catalog))
         .route(
@@ -2736,6 +2764,132 @@ async fn test_notification_trigger(
             Err(ApiError::Internal)
         }
     }
+}
+
+// =====================================================================
+// Monitoring threshold alerts (rule CRUD + event feed)
+// =====================================================================
+
+/// Map an `AlertError` to an HTTP error without leaking internals. Invalid input → 422,
+/// not-found → 404, everything else → 500 (logged at the call site). Authorization (403)
+/// is enforced at the handler boundary via `enforce_action`, before the service is called.
+fn map_alert_err(e: alerts::AlertError) -> ApiError {
+    use alerts::AlertError as E;
+    match e {
+        E::InvalidInput(msg) => ApiError::Validation {
+            field: "alert_rule".into(),
+            message: msg,
+        },
+        E::NotFound => ApiError::NotFound,
+        E::Internal(err) => {
+            warn!(error = %err, "alert service error");
+            ApiError::Internal
+        }
+    }
+}
+
+async fn create_alert_rule(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Json(input): Json<alerts::AlertRuleInput>,
+) -> Result<(StatusCode, Json<alerts::AlertRule>), ApiError> {
+    // RBAC default-deny: mutating alert rules requires alerts:write. Bootstrap (None) is
+    // allowed; an issued principal without the action is rejected 403 before any write.
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "alerts:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
+    match state
+        .alert_service
+        .create_rule(&input, principal.principal_id())
+        .await
+    {
+        Ok(rule) => Ok((StatusCode::CREATED, Json(rule))),
+        Err(e) => Err(map_alert_err(e)),
+    }
+}
+
+async fn list_alert_rules(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<alerts::AlertRule>>, ApiError> {
+    state
+        .alert_service
+        .list_rules()
+        .await
+        .map(Json)
+        .map_err(map_alert_err)
+}
+
+async fn get_alert_rule(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<alerts::AlertRule>, ApiError> {
+    state
+        .alert_service
+        .get_rule(id)
+        .await
+        .map(Json)
+        .map_err(map_alert_err)
+}
+
+async fn update_alert_rule(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Path(id): Path<Uuid>,
+    Json(input): Json<alerts::AlertRuleInput>,
+) -> Result<Json<alerts::AlertRule>, ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "alerts:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
+    state
+        .alert_service
+        .update_rule(id, &input)
+        .await
+        .map(Json)
+        .map_err(map_alert_err)
+}
+
+async fn delete_alert_rule(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "alerts:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
+    state
+        .alert_service
+        .delete_rule(id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(map_alert_err)
+}
+
+async fn list_alert_events(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let state_filter = params.get("state").map(String::as_str);
+    let severity_filter = params.get("severity").map(String::as_str);
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(100);
+
+    state
+        .alert_service
+        .list_events(state_filter, severity_filter, limit)
+        .await
+        .map(Json)
+        .map_err(map_alert_err)
 }
 
 // =====================================================================

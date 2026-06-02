@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, name, scope, target_id, metric_name, comparator, threshold,\n                   duration_secs, severity, enabled, cooldown_secs,\n                   created_by_principal_id, created_at, updated_at\n            FROM alert_rules\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "scope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "target_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "metric_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "comparator",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "threshold",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 7,
+        "name": "duration_secs",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "severity",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "cooldown_secs",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 11,
+        "name": "created_by_principal_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "3d28c36949774c28fb7051794196fb066c094083a3a25c396924ae64bc1f32e0"
+}
