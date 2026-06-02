@@ -1350,6 +1350,18 @@ async fn trigger_build(
     //    agents' recipients so whichever agent runs the build can decrypt them.
     let mut build_secrets: Vec<SecretRef> = Vec::new();
     if !req.build_secret_names.is_empty() {
+        // RBAC gate (A01): embedding a decryptable secret into a BuildSpec requires the
+        // caller to hold `secrets:use`. `principal_id == None` is the already-authenticated
+        // bootstrap X-Admin-Token path, consistent with `create_build`/`enforce`.
+        state
+            .deployment_service
+            .enforce_action(principal_id, "secrets:use")
+            .await
+            .map_err(|e| match e {
+                deployment::DeploymentError::Forbidden => ApiError::Forbidden,
+                _ => ApiError::Internal,
+            })?;
+
         let recipients = state
             .deployment_service
             .agent_age_recipients()
@@ -1357,8 +1369,14 @@ async fn trigger_build(
             .map_err(|_| ApiError::Internal)?;
         for name in &req.build_secret_names {
             // The named secret is already an age envelope; we reference it directly. Each
-            // secret becomes a BuildKit secret whose id is the secret name.
-            match state.deployment_service.get_build_secret_ref(name).await {
+            // secret becomes a BuildKit secret whose id is the secret name. Resolution is
+            // scoped to this application — a secret owned by another application never
+            // resolves here (cross-tenant IDOR is rejected as `unknown` below, fail-closed).
+            match state
+                .deployment_service
+                .get_build_secret_ref(name, app_id)
+                .await
+            {
                 Ok(Some(ct)) => build_secrets.push(SecretRef {
                     name: name.clone(),
                     target: forge_agent::job::SecretTarget::File {

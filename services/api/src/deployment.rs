@@ -251,6 +251,17 @@ impl DeploymentService {
         }
     }
 
+    /// Public default-deny RBAC check for callers outside the service (e.g. handlers that need
+    /// to gate an action before assembling a privileged payload). Same semantics as `enforce`:
+    /// a `None` principal is the already-authenticated bootstrap admin path and is allowed.
+    pub async fn enforce_action(
+        &self,
+        principal_id: Option<Uuid>,
+        action: &str,
+    ) -> Result<(), DeploymentError> {
+        self.enforce(principal_id, action).await
+    }
+
     // --- Applications ---
 
     pub async fn create_application(
@@ -2467,17 +2478,32 @@ impl DeploymentService {
         Ok(rows.into_iter().filter_map(|r| r.age_recipient).collect())
     }
 
-    /// Load a named, enabled secret's age envelope for use as a build secret. Returns the
-    /// stored `SecretCiphertext` (already encrypted to the agents' recipients) or `None` if
-    /// the name is unknown/disabled or its blob is a non-encrypted placeholder. Never logs
-    /// or returns plaintext.
+    /// Load a named, enabled secret's age envelope for use as a build secret, scoped to the
+    /// application the build belongs to. A secret resolves only if it is owned by `application_id`
+    /// or is an explicitly instance-global secret (`application_id IS NULL`). This closes the
+    /// IDOR (A01): a build for app A can never reference a secret owned by app B by name.
+    /// Returns the stored `SecretCiphertext` (already encrypted to the agents' recipients) or
+    /// `None` if the name is unknown/disabled/out-of-scope or its blob is a non-encrypted
+    /// placeholder. Never logs or returns plaintext.
     pub async fn get_build_secret_ref(
         &self,
         name: &str,
+        application_id: Uuid,
     ) -> Result<Option<forge_agent::job::SecretCiphertext>, DeploymentError> {
+        // Scope: app-owned secrets win over a same-named global secret (ORDER BY application_id
+        // NULLS LAST), and only enabled secrets in scope are eligible. A secret belonging to a
+        // *different* application is invisible here (fail closed — the caller rejects on None).
         let row = sqlx::query!(
-            "SELECT encrypted_blob FROM secrets WHERE name = $1 AND enabled = true ORDER BY created_at DESC LIMIT 1",
-            name
+            r#"
+            SELECT encrypted_blob FROM secrets
+            WHERE name = $1
+              AND enabled = true
+              AND (application_id = $2 OR application_id IS NULL)
+            ORDER BY application_id NULLS LAST, created_at DESC
+            LIMIT 1
+            "#,
+            name,
+            application_id
         )
         .fetch_optional(&self.pool)
         .await
@@ -3468,6 +3494,91 @@ mod build_pipeline_tests {
         assert!(
             res.get("created_build_id").is_none(),
             "push to an untracked branch must not create a build"
+        );
+    }
+
+    /// Insert an enabled age-v1 secret scoped to `app` (or global when `app` is `None`).
+    /// The payload is opaque to resolution — `get_build_secret_ref` only checks the version
+    /// tag and deserializes the envelope — so a synthetic envelope is sufficient here.
+    async fn seed_secret(pool: &PgPool, name: &str, app: Option<Uuid>, marker: &str) {
+        let envelope = serde_json::json!({
+            "version": forge_agent::job::SecretCiphertext::VERSION_AGE_V1,
+            "recipient": "age1examplerecipient",
+            "payload": marker, // stand-in for armored ciphertext; opaque to resolution
+        });
+        sqlx::query(
+            "INSERT INTO secrets (id, name, application_id, encrypted_blob, enabled, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,true,NOW(),NOW())",
+        )
+        .bind(Uuid::now_v7())
+        .bind(name)
+        .bind(app)
+        .bind(envelope)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn build_secret_resolution_is_application_scoped(pool: PgPool) {
+        // IDOR / cross-tenant secret access (A01). Two applications each own a secret of the
+        // SAME name. A build for app A must resolve A's secret and must NEVER see B's, and an
+        // out-of-scope-only name must fail closed (None → caller rejects 400).
+        let svc = svc_with(pool.clone());
+        let app_a = svc
+            .create_application("app-a", None, None)
+            .await
+            .unwrap()
+            .id;
+        let app_b = svc
+            .create_application("app-b", None, None)
+            .await
+            .unwrap()
+            .id;
+
+        seed_secret(&pool, "DB_PASSWORD", Some(app_a), "secret-of-A").await;
+        seed_secret(&pool, "DB_PASSWORD", Some(app_b), "secret-of-B").await;
+        // A secret that exists ONLY for app B (no global, no app-A copy).
+        seed_secret(&pool, "B_ONLY", Some(app_b), "B-only-value").await;
+        // An explicitly instance-global secret, shareable by design.
+        seed_secret(&pool, "SHARED", None, "global-value").await;
+
+        // In scope: app A resolves ITS OWN same-named secret, never app B's.
+        let a = svc
+            .get_build_secret_ref("DB_PASSWORD", app_a)
+            .await
+            .unwrap()
+            .expect("app A's own secret must resolve");
+        assert_eq!(a.payload, "secret-of-A");
+
+        let b = svc
+            .get_build_secret_ref("DB_PASSWORD", app_b)
+            .await
+            .unwrap()
+            .expect("app B's own secret must resolve");
+        assert_eq!(b.payload, "secret-of-B");
+
+        // Cross-tenant IDOR: app A requesting a name that exists only for app B must FAIL CLOSED.
+        let leaked = svc.get_build_secret_ref("B_ONLY", app_a).await.unwrap();
+        assert!(
+            leaked.is_none(),
+            "app A must NOT resolve a secret owned solely by app B (cross-tenant IDOR)"
+        );
+
+        // Explicitly-global secrets remain shareable across applications.
+        let shared = svc
+            .get_build_secret_ref("SHARED", app_a)
+            .await
+            .unwrap()
+            .expect("global secret must resolve for any application");
+        assert_eq!(shared.payload, "global-value");
+
+        // Unknown name resolves for nobody.
+        assert!(
+            svc.get_build_secret_ref("NOPE", app_a)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }

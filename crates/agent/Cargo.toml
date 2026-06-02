@@ -49,6 +49,10 @@ tempfile = { workspace = true }
 walkdir = { workspace = true }
 serde_yaml_ng = { workspace = true }
 
+# Strict, structural validation of user-supplied git remote URLs (scheme allowlist). Already a
+# transitive dep (reqwest); promoted to a direct dep so the parse is auditable here.
+url = "2.5"
+
 # Real control plane communication
 tokio-tungstenite = { version = "0.23", features = ["rustls-tls-native-roots"] }
 

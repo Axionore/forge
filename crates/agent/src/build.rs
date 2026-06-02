@@ -117,6 +117,56 @@ fn is_safe_git_token(s: &str) -> bool {
     })
 }
 
+/// Structurally validate a user-supplied git remote URL before it is ever handed to `git`.
+///
+/// `is_safe_git_token` is a *blocklist* — sufficient to stop shell metacharacters, but NOT
+/// sufficient to stop git's own remote-helper transports. A value such as `ext::sh -c <cmd>`
+/// contains no blocked metacharacter yet makes git invoke an arbitrary command at clone time
+/// (the Coolify-class RCE in the threat model). We therefore require the URL to parse as an
+/// absolute URL whose scheme is on a strict allowlist {https, ssh, git} — rejecting `ext::`,
+/// `transport::`, `file://`, and bare/relative refs outright (A03 / EoP, defense in depth on
+/// top of the `GIT_ALLOW_PROTOCOL` / `protocol.*.allow=never` env hardening in `run_git`).
+fn validate_git_url(raw: &str) -> Result<(), BuildError> {
+    if raw.is_empty() || raw.len() > 2048 {
+        return Err(BuildError::InvalidSpec(
+            "git url is empty or too long".into(),
+        ));
+    }
+    // No whitespace or quotes anywhere — these have no place in a real remote URL and are the
+    // building blocks of remote-helper argument smuggling (`ext::sh -c "..."`).
+    if raw
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\''))
+    {
+        return Err(BuildError::InvalidSpec(
+            "git url contains whitespace or quotes".into(),
+        ));
+    }
+
+    // Must parse as an absolute URL. `ext::sh ...`, `transport::...`, and relative paths fail
+    // here (they are not absolute URLs with a network scheme). This rejects the remote-helper
+    // smuggling class structurally rather than by enumerating bad prefixes.
+    let parsed = url::Url::parse(raw)
+        .map_err(|_| BuildError::InvalidSpec("git url is not an absolute URL".into()))?;
+
+    match parsed.scheme() {
+        "https" | "ssh" | "git" => {}
+        _ => {
+            return Err(BuildError::InvalidSpec(
+                "git url scheme not allowed (only https, ssh, git)".into(),
+            ));
+        }
+    }
+
+    // A network transport must carry a host. `file://` would have been rejected by the scheme
+    // allowlist already; this rejects any in-allowlist scheme that resolved to an empty host.
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(BuildError::InvalidSpec("git url has no host".into()));
+    }
+
+    Ok(())
+}
+
 /// A 40- or 64-hex commit SHA. Anything else is rejected — we only ever build a pinned commit.
 fn is_valid_commit_sha(s: &str) -> bool {
     (s.len() == 40 || s.len() == 64) && s.chars().all(|c| c.is_ascii_hexdigit())
@@ -520,6 +570,10 @@ async fn run_build_inner(
 }
 
 fn validate_source(src: &GitCheckout) -> Result<(), BuildError> {
+    // Structural URL validation (scheme allowlist) first — closes the remote-helper smuggling
+    // class that the blocklist below cannot see. Then keep the metacharacter blocklist as a
+    // second, independent guard.
+    validate_git_url(&src.url)?;
     if !is_safe_git_token(&src.url) {
         return Err(BuildError::InvalidSpec("unsafe git url".into()));
     }
@@ -584,6 +638,24 @@ async fn git_fetch_pinned(
     Ok(())
 }
 
+/// Prepend git protocol-restriction config to an argv. `-c protocol.<x>.allow=never` disables
+/// the remote-helper (`ext`), local (`file`) transports; `protocol.allow=user` denies any
+/// transport git would otherwise follow indirectly (redirects, submodules) unless the user named
+/// it on the command line. These config flags MUST precede the git subcommand.
+fn harden_git_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut full = Vec::with_capacity(args.len() + 6);
+    full.extend_from_slice(&[
+        "-c",
+        "protocol.ext.allow=never",
+        "-c",
+        "protocol.file.allow=never",
+        "-c",
+        "protocol.allow=user",
+    ]);
+    full.extend_from_slice(args);
+    full
+}
+
 async fn run_git(args: &[&str], cwd: &Path, log_sink: &Option<LogSink>) -> Result<(), BuildError> {
     // Defense in depth: validate every argv token even though we control the literals.
     for a in args {
@@ -591,11 +663,17 @@ async fn run_git(args: &[&str], cwd: &Path, log_sink: &Option<LogSink>) -> Resul
             return Err(BuildError::Checkout("invalid git argument".into()));
         }
     }
+    // Protocol restriction (defense in depth): even if a malicious URL slipped past
+    // `validate_git_url`, deny git the dangerous transports. See `harden_git_args`.
+    let full_args = harden_git_args(args);
+
     let mut cmd = Command::new("git");
-    cmd.args(args)
+    cmd.args(&full_args)
         .current_dir(cwd)
         // Never prompt for credentials interactively (would hang the build).
         .env("GIT_TERMINAL_PROMPT", "0")
+        // Allowlist the only transports a real remote needs; blocks ext::/file:// helpers.
+        .env("GIT_ALLOW_PROTOCOL", "https:ssh:git")
         .env(
             "GIT_SSH_COMMAND",
             "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
@@ -974,6 +1052,61 @@ mod tests {
         assert!(!is_safe_git_token("a|b"));
         assert!(!is_safe_git_token("--upload-pack=evil"));
         assert!(!is_safe_git_token("a\nb"));
+    }
+
+    #[test]
+    fn validate_git_url_accepts_real_remotes() {
+        assert!(validate_git_url("https://github.com/org/repo.git").is_ok());
+        assert!(validate_git_url("ssh://git@github.com/org/repo.git").is_ok());
+        assert!(validate_git_url("git://example.com/repo.git").is_ok());
+    }
+
+    #[test]
+    fn validate_git_url_rejects_remote_helper_and_transport_smuggling() {
+        // git remote-helper command execution at clone time.
+        assert!(validate_git_url("ext::sh -c touch /tmp/pwned").is_err());
+        assert!(validate_git_url("ext::sh -c 'id'").is_err());
+        assert!(validate_git_url("transport::https://evil/").is_err());
+        // Local transport — reading host files / dirtied submodules.
+        assert!(validate_git_url("file:///etc/passwd").is_err());
+        // Disallowed schemes.
+        assert!(validate_git_url("http://insecure/repo.git").is_err());
+        assert!(validate_git_url("ftp://example.com/repo").is_err());
+        // Relative / bare refs are not absolute URLs.
+        assert!(validate_git_url("../../../etc/passwd").is_err());
+        assert!(validate_git_url("repo.git").is_err());
+        // Leading '-' (would also be caught downstream, but reject structurally too).
+        assert!(validate_git_url("-oProxyCommand=evil").is_err());
+        // Embedded whitespace / quotes (argument smuggling primitives).
+        assert!(validate_git_url("https://github.com/org/repo.git extra").is_err());
+        assert!(validate_git_url("https://github.com/\"; touch x").is_err());
+        // Empty / oversized.
+        assert!(validate_git_url("").is_err());
+        assert!(validate_git_url(&format!("https://h/{}", "a".repeat(3000))).is_err());
+    }
+
+    #[test]
+    fn git_args_carry_protocol_restrictions() {
+        let hardened = harden_git_args(&["fetch", "--depth", "1", "https://h/r.git", "abc"]);
+        // The protocol-restriction config must precede the subcommand.
+        let joined = hardened.join(" ");
+        assert!(joined.contains("-c protocol.ext.allow=never"));
+        assert!(joined.contains("-c protocol.file.allow=never"));
+        assert!(joined.contains("-c protocol.allow=user"));
+        let ext_pos = hardened
+            .iter()
+            .position(|a| *a == "protocol.ext.allow=never")
+            .unwrap();
+        let fetch_pos = hardened.iter().position(|a| *a == "fetch").unwrap();
+        assert!(
+            ext_pos < fetch_pos,
+            "config flags must come before the git subcommand"
+        );
+        // Original argv is preserved verbatim after the hardening flags.
+        assert_eq!(
+            &hardened[hardened.len() - 5..],
+            &["fetch", "--depth", "1", "https://h/r.git", "abc"]
+        );
     }
 
     #[test]

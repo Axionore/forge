@@ -104,6 +104,55 @@ actions (`deployments:write`, etc.) via `action_allowed`; default-deny. (Note: `
 currently takes only `pool` while `main.rs:196` tries to pass an rbac service — part of the 0016
 breakage to reconcile.)
 
+## ✅🔴 A01 — IDOR / cross-tenant build-secret access (source-to-deploy) — RESOLVED
+
+`trigger_build` (`main.rs`) resolved build secrets by NAME only
+(`get_build_secret_ref(name)`), so a build for application A could reference ANY secret in the
+instance by name — cross-application/cross-tenant disclosure of an age-encrypted secret into a
+`BuildSpec`.
+
+**✅ Resolved (2026-06-02).** Secret resolution is now application-scoped. The `secrets` table
+already carries `application_id` (migration 0013, nullable), so the scoping model is:
+_a secret resolves for a build iff it is owned by the build's application (`application_id = $app`)
+or is an explicitly instance-global secret (`application_id IS NULL`)_; an app-owned secret wins
+over a same-named global one (`ORDER BY application_id NULLS LAST`). `get_build_secret_ref` now
+takes `application_id` and filters `WHERE name=$1 AND enabled=true AND (application_id=$2 OR
+application_id IS NULL)`. `trigger_build` passes the build's `app_id`; a requested name that does
+not resolve in scope is rejected (`400 unknown build secret`) — fail closed, never silently
+skipped. Embedding any secret into a `BuildSpec` is additionally gated on the `secrets:use`
+per-action RBAC permission via `enforce_action` (default-deny; `None` principal = authenticated
+bootstrap admin, consistent with `create_build`). No new migration was required.
+Test: `deployment::build_pipeline_tests::build_secret_resolution_is_application_scoped`
+(`#[sqlx::test]`) proves app A cannot resolve app B's same-named or B-only secret, that an
+in-scope secret and an explicitly-global secret both resolve, and that unknown names resolve for
+nobody. Mutation-checked (dropping the `application_id` filter makes the test fail).
+
+## ✅🔴 A05/EoP — git remote-helper / argument-injection smuggling at clone time — RESOLVED
+
+`is_safe_git_token` (`crates/agent/src/build.rs`) was a metacharacter _blocklist_. A URL such as
+`ext::sh -c <cmd>` (a git remote helper) or `transport::`/`file://` transport tricks could smuggle
+command execution at clone time — the Coolify Jan-2026 RCE class — without tripping any blocked
+character.
+
+**✅ Resolved (2026-06-02).** Defense in depth, two independent layers:
+
+1. **Structural URL validation** — new `validate_git_url` requires `src.url` to parse via the
+   `url` crate as an absolute URL whose scheme is on a strict allowlist `{https, ssh, git}`;
+   rejects embedded whitespace/quotes, control chars, leading `-`, and host-less URLs. `ext::`,
+   `transport::`, `file://`, `http://`, and relative/bare refs are all rejected. Called _before_
+   the existing metacharacter blocklist in `validate_source`.
+2. **Transport hardening on every git invocation** — `run_git` now prepends
+   `-c protocol.ext.allow=never -c protocol.file.allow=never -c protocol.allow=user` and sets
+   `GIT_ALLOW_PROTOCOL=https:ssh:git`, so even a validation bypass cannot invoke a remote helper or
+   local transport (including indirect transports via redirects/submodules).
+   Tests (`crates/agent/src/build.rs`): `validate_git_url_accepts_real_remotes`,
+   `validate_git_url_rejects_remote_helper_and_transport_smuggling` (covers `ext::`, `transport::`,
+   `file://`, `http://`, relative, `-`-prefixed, whitespace, oversized), and
+   `git_args_carry_protocol_restrictions` (asserts the config flags precede the subcommand and the
+   original argv is preserved). Mutation-checked (adding `http` to the scheme allowlist makes the
+   rejection test fail). `url` was promoted from a transitive to a direct dependency of `forge-agent`
+   (no new code in the supply chain — already resolved at v2.5.8 in `Cargo.lock`).
+
 ## ✅ Cleared
 
 - **A01 (rollback endpoints):** `/deployments/{id}/{rollback,promote,redeploy}` and create are inside
