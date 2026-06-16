@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT deployment_id, schedule_id, db_type, location, status\n            FROM backup_executions WHERE id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deployment_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "schedule_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "db_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "location",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "status",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "148ad2d031dd47f0295f4edd061ea787a1bd277da48756417d3c39d98e355bc9"
+}

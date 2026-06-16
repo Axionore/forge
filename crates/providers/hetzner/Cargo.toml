@@ -16,12 +16,20 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+async-trait = { workspace = true }
 
-# Hetzner Cloud
-hcloud = { workspace = true }
+# Provider abstraction
+forge-providers = { path = ".." }
 
-# HTTP client (for now; hcloud may handle most of it)
+# HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # For cloud-init generation
 base64 = "0.22"
+
+[dev-dependencies]
+wiremock = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

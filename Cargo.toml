@@ -4,9 +4,13 @@ members = [
     "crates/agent",
     "crates/core",
     "services/api",
+    "crates/providers",
     "crates/providers/hetzner",
+    "crates/providers/aws",
+    "crates/providers/gcp",
+    "crates/providers/azure",
+    "crates/providers/digitalocean",
     # Future members (will be added as we build):
-    # "crates/providers/digitalocean",
     # "crates/providers/ssh",
     # "services/worker",
 ]
@@ -38,6 +42,12 @@ toml = "0.8"
 anyhow = "1.0"
 thiserror = "2.0"
 
+# Async traits (dyn-safe provider abstraction)
+async-trait = "0.1"
+
+# HTTP mocking for tests
+wiremock = "0.6"
+
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -50,6 +60,11 @@ bytes = "1.10"
 
 # Docker (for agent)
 bollard = { version = "0.18", features = ["rustls"] }
+
+# Build executor (agent): secure temp dirs + bounded build-context walk + compose YAML parsing
+tempfile = "3.10"
+walkdir = "2.5"
+serde_yaml_ng = "0.10"
 
 # Hetzner
 hcloud = "0.25"
@@ -67,6 +82,12 @@ ssh-key = { version = "0.6", features = ["ed25519", "alloc"] }
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# URL parsing for outbound notification targets (SSRF validation)
+url = "2.5"
+
+# SMTP email delivery for notification channels (rustls, no native-tls/OpenSSL dependency)
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls", "pool"] }
 
 # gRPC + xDS (ADS) for true dynamic Envoy control plane (no sidecar restarts on canary steps)
 tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "tls-ring"] }

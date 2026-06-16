@@ -66,6 +66,65 @@ pub enum DeploymentError {
     Internal(#[from] anyhow::Error),
 }
 
+/// API-friendly representation of a persisted build (migration 0020). No secret material.
+#[derive(Debug, Clone, Serialize)]
+pub struct BuildRecord {
+    pub id: Uuid,
+    pub application_id: Uuid,
+    pub git_source_id: Option<Uuid>,
+    pub commit_sha: String,
+    pub git_ref: Option<String>,
+    pub builder: String,
+    pub status: String,
+    pub image: Option<String>,
+    pub image_digest: Option<String>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub error: Option<String>,
+    pub created_by_principal_id: Option<Uuid>,
+    pub deployment_id: Option<Uuid>,
+    /// Phase C: whether the produced image was cosign-signed + provenance-attested.
+    pub signed: bool,
+    /// Phase C: non-secret SLSA provenance summary (subject digest + commit + builder).
+    pub provenance: Option<serde_json::Value>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// An enabled backup schedule, projected for the scheduler's due-evaluation + dispatch.
+/// Carries only the secret's id (never its plaintext).
+#[derive(Debug, Clone)]
+pub struct BackupScheduleRow {
+    pub id: Uuid,
+    pub deployment_id: Option<Uuid>,
+    pub db_type: String,
+    pub database_name: Option<String>,
+    pub schedule_type: String,
+    pub schedule_value: String,
+    pub retention_days: i32,
+    pub retention_count: Option<i32>,
+    pub s3_endpoint: Option<String>,
+    pub s3_bucket: Option<String>,
+    pub s3_key_prefix: Option<String>,
+    pub s3_region: Option<String>,
+    pub s3_access_key_id: Option<String>,
+    pub s3_secret_id: Option<Uuid>,
+    pub target_container: Option<String>,
+    pub last_run_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The resolved source of a restore (target container + S3 location/creds reference).
+#[derive(Debug, Clone)]
+pub struct RestoreSource {
+    pub target_container: String,
+    pub s3_endpoint: Option<String>,
+    pub s3_bucket: Option<String>,
+    pub s3_key: String,
+    pub s3_region: Option<String>,
+    pub s3_access_key_id: Option<String>,
+    pub s3_secret_id: Option<Uuid>,
+}
+
 /// API-friendly representation of a persisted JobResult.
 #[derive(Debug, Serialize)]
 pub struct JobResultRow {
@@ -228,6 +287,17 @@ impl DeploymentService {
             Ok(false) => Err(DeploymentError::Forbidden),
             Err(_) => Err(DeploymentError::Forbidden),
         }
+    }
+
+    /// Public default-deny RBAC check for callers outside the service (e.g. handlers that need
+    /// to gate an action before assembling a privileged payload). Same semantics as `enforce`:
+    /// a `None` principal is the already-authenticated bootstrap admin path and is allowed.
+    pub async fn enforce_action(
+        &self,
+        principal_id: Option<Uuid>,
+        action: &str,
+    ) -> Result<(), DeploymentError> {
+        self.enforce(principal_id, action).await
     }
 
     // --- Applications ---
@@ -1455,6 +1525,70 @@ impl DeploymentService {
     // (Discord/Slack/etc.) added in follow-up slices with proper secret handling.
     // =====================================================================
 
+    /// Validate a channel's `config` JSONB at creation time. URL-bearing channels
+    /// (discord/slack/webhook) must carry a syntactically-valid https URL to a
+    /// non-private literal host; telegram must carry a bounded token + chat_id; email
+    /// must carry host/from/to (or it is treated as "not configured" and will record a
+    /// `skipped` delivery rather than failing creation). Never surfaces secret values.
+    fn validate_channel_config(
+        channel_type: &str,
+        config: &serde_json::Value,
+    ) -> Result<(), DeploymentError> {
+        let url_field = |key: &str| -> Result<(), DeploymentError> {
+            let raw = config.get(key).and_then(|v| v.as_str()).unwrap_or("");
+            crate::notify::validate_url_syntax(raw, false)
+                .map(|_| ())
+                .map_err(|e| DeploymentError::InvalidInput(format!("{key}: {e}")))
+        };
+
+        match channel_type {
+            "discord" | "slack" | "webhook" => {
+                url_field("url")?;
+                // An optional generic-webhook signing secret is length-bounded.
+                if let Some(secret) = config.get("secret").and_then(|v| v.as_str()) {
+                    if secret.len() > 512 {
+                        return Err(DeploymentError::InvalidInput(
+                            "secret too long (max 512)".into(),
+                        ));
+                    }
+                }
+            }
+            "telegram" => {
+                let token = config.get("token").and_then(|v| v.as_str()).unwrap_or("");
+                if token.trim().is_empty() || token.len() > 256 {
+                    return Err(DeploymentError::InvalidInput(
+                        "telegram token is required (max 256 chars)".into(),
+                    ));
+                }
+                let has_chat = config
+                    .get("chat_id")
+                    .is_some_and(|v| v.is_string() || v.is_i64() || v.is_u64());
+                if !has_chat {
+                    return Err(DeploymentError::InvalidInput(
+                        "telegram chat_id is required".into(),
+                    ));
+                }
+            }
+            "email" => {
+                // host/from/to optional at creation: an unconfigured email channel is
+                // valid and yields an explicit `skipped` at send time. If present,
+                // length-bound them.
+                for key in ["host", "from", "to", "username"] {
+                    if let Some(v) = config.get(key).and_then(|v| v.as_str()) {
+                        if v.len() > 320 {
+                            return Err(DeploymentError::InvalidInput(format!(
+                                "{key} too long (max 320)"
+                            )));
+                        }
+                    }
+                }
+            }
+            // pushover and any future types: no URL to validate here.
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Create a new notification channel.
     pub async fn create_notification_channel(
         &self,
@@ -1473,6 +1607,13 @@ impl DeploymentService {
         if !allowed.contains(&channel_type) {
             return Err(DeploymentError::InvalidInput("invalid channel_type".into()));
         }
+
+        // Validate channel config up front so an SSRF-unsafe or malformed target is
+        // rejected at creation, not silently stored and only discovered at send time
+        // (OWASP A01/A10). URL-bearing channels must parse as https to a non-private
+        // literal host (DNS-level checks run again at send time to defeat rebinding).
+        // String inputs are length-bounded. We never echo secret material.
+        Self::validate_channel_config(channel_type, &config)?;
 
         let id = Uuid::now_v7();
         let now = Utc::now();
@@ -1623,8 +1764,17 @@ impl DeploymentService {
         Ok(out)
     }
 
-    /// Core trigger: called after important events (JobResult, canary promotion decision, system update, etc.).
-    /// For v1 we only audit (insert delivery rows). Real dispatch to channels happens in a later slice.
+    /// Core trigger: called after important events (JobResult, canary promotion
+    /// decision, system update, etc.). For each matching enabled subscription we insert
+    /// a `pending` delivery row, then spawn a NON-BLOCKING task that actually delivers
+    /// to the channel (Discord/Slack/Telegram/generic-webhook/email) and updates the
+    /// row with the real per-attempt outcome (`sent`/`failed`/`skipped` + status_code +
+    /// secret-free error). The caller (the deploy / canary path) never blocks on a slow
+    /// or hostile endpoint. Returns the number of deliveries enqueued.
+    ///
+    /// Channel `config` (which holds webhook URLs, bot tokens, SMTP creds, signing
+    /// secrets) is read inside the spawned task and NEVER written to the audit row or
+    /// logged — only the channel id + type and a coarse status are persisted (A09).
     pub async fn trigger_notifications(
         &self,
         event_type: &str,
@@ -1632,14 +1782,16 @@ impl DeploymentService {
         resource_id: Option<Uuid>,
         context: serde_json::Value,
     ) -> Result<u64, DeploymentError> {
-        // Find matching enabled subscriptions
+        // Join the channel so we have its type + config (and enabled flag) in one query.
         let subs = sqlx::query!(
             r#"
-            SELECT id, channel_id, events, filters
-            FROM notification_subscriptions
-            WHERE resource_type = $1
-              AND (resource_id IS NULL OR resource_id = $2)
-              AND enabled = true
+            SELECT s.id AS sub_id, s.channel_id, s.events,
+                   c.channel_type, c.config, c.enabled AS channel_enabled
+            FROM notification_subscriptions s
+            JOIN notification_channels c ON c.id = s.channel_id
+            WHERE s.resource_type = $1
+              AND (s.resource_id IS NULL OR s.resource_id = $2)
+              AND s.enabled = true
             "#,
             resource_type,
             resource_id
@@ -1648,31 +1800,31 @@ impl DeploymentService {
         .await
         .map_err(|e| DeploymentError::Internal(e.into()))?;
 
-        let mut delivered = 0u64;
+        let mut enqueued = 0u64;
 
         for sub in subs {
-            // Simple event match (events is JSONB array of strings)
+            // Simple event match (events is JSONB array of strings; "*" = all).
             let matches_event = if let Some(arr) = sub.events.as_array() {
                 arr.iter()
                     .any(|v| v.as_str().is_some_and(|s| s == event_type || s == "*"))
             } else {
                 true
             };
-
             if !matches_event {
                 continue;
             }
 
-            // Insert audit delivery row (v1: status 'logged' = would have sent)
             let delivery_id = Uuid::now_v7();
-            let _ = sqlx::query!(
+            // Insert the audit row as `pending`; the spawned task flips it to the real
+            // terminal status. payload is the event context (no channel secrets).
+            let inserted = sqlx::query!(
                 r#"
                 INSERT INTO notification_deliveries
                     (id, subscription_id, channel_id, event_type, resource_type, resource_id, payload, status, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, 'logged', NOW())
+                VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', NOW())
                 "#,
                 delivery_id,
-                sub.id,
+                sub.sub_id,
                 sub.channel_id,
                 event_type,
                 resource_type,
@@ -1682,10 +1834,152 @@ impl DeploymentService {
             .execute(&self.pool)
             .await;
 
-            delivered += 1;
+            if inserted.is_err() {
+                continue;
+            }
+
+            // A disabled channel: record an explicit skipped status, don't dispatch.
+            if !sub.channel_enabled {
+                let _ = Self::finalize_delivery(
+                    &self.pool,
+                    delivery_id,
+                    crate::notify::DeliveryOutcome {
+                        status: "skipped",
+                        status_code: None,
+                        error: Some("channel disabled".into()),
+                    },
+                )
+                .await;
+                continue;
+            }
+
+            // Spawn the actual egress so the caller is never blocked (A10: bounded
+            // timeout + retry happen inside the dispatcher).
+            let pool = self.pool.clone();
+            let channel_type = sub.channel_type.clone();
+            let config = sub.config.clone();
+            let channel_id = sub.channel_id;
+            let event = event_type.to_string();
+            let ctx = context.clone();
+            let rtype = resource_type.to_string();
+            tokio::spawn(async move {
+                let outcome = Self::dispatch_to_channel(
+                    &channel_type,
+                    &config,
+                    &event,
+                    &rtype,
+                    resource_id,
+                    &ctx,
+                )
+                .await;
+                // Structured, secret-free log: channel id + type + coarse status only.
+                match outcome.status {
+                    "sent" => tracing::info!(
+                        channel_id = %channel_id,
+                        channel_type = %channel_type,
+                        event = %event,
+                        status_code = outcome.status_code,
+                        "notification delivered"
+                    ),
+                    "skipped" => tracing::info!(
+                        channel_id = %channel_id,
+                        channel_type = %channel_type,
+                        event = %event,
+                        reason = outcome.error.as_deref().unwrap_or(""),
+                        "notification skipped"
+                    ),
+                    _ => tracing::warn!(
+                        channel_id = %channel_id,
+                        channel_type = %channel_type,
+                        event = %event,
+                        status_code = outcome.status_code,
+                        error = outcome.error.as_deref().unwrap_or(""),
+                        "notification delivery failed"
+                    ),
+                }
+                let _ = Self::finalize_delivery(&pool, delivery_id, outcome).await;
+            });
+
+            enqueued += 1;
         }
 
-        Ok(delivered)
+        Ok(enqueued)
+    }
+
+    /// Render a message + payload for an event and dispatch it to one channel. Returns
+    /// the real outcome. Never logs or returns secret material from `config`.
+    async fn dispatch_to_channel(
+        channel_type: &str,
+        config: &serde_json::Value,
+        event_type: &str,
+        resource_type: &str,
+        resource_id: Option<Uuid>,
+        context: &serde_json::Value,
+    ) -> crate::notify::DeliveryOutcome {
+        // Human-readable message for chat channels.
+        let rid = resource_id.map_or_else(|| "-".to_string(), |id| id.to_string());
+        let message = format!("[forge] {event_type} on {resource_type} {rid}");
+        // Structured event payload for generic webhooks (signed if a secret is set).
+        let payload = serde_json::json!({
+            "event": event_type,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "context": context,
+        });
+
+        match channel_type {
+            "discord" => crate::notify::deliver_discord(config, &message).await,
+            "slack" => crate::notify::deliver_slack(config, &message).await,
+            "telegram" => crate::notify::deliver_telegram(config, &message).await,
+            "webhook" => crate::notify::deliver_generic_webhook(config, &payload).await,
+            "email" => {
+                let subject = format!("[forge] {event_type}");
+                crate::notify::deliver_email(config, &subject, &message).await
+            }
+            // pushover not yet implemented: explicit skip, never a fake success.
+            other => crate::notify::DeliveryOutcome {
+                status: "skipped",
+                status_code: None,
+                error: Some(format!("channel type '{other}' not implemented")),
+            },
+        }
+    }
+
+    /// Write the terminal status of a delivery attempt back to its audit row. Error text
+    /// is already secret-free (the dispatchers guarantee it).
+    async fn finalize_delivery(
+        pool: &PgPool,
+        delivery_id: Uuid,
+        outcome: crate::notify::DeliveryOutcome,
+    ) -> Result<(), DeploymentError> {
+        let sent_at = if outcome.status == "sent" {
+            Some(Utc::now())
+        } else {
+            None
+        };
+        // status_code is not a column in notification_deliveries; fold it into the error
+        // text for failures so the audit row is self-describing without schema churn.
+        let error = match (outcome.status, outcome.status_code, outcome.error) {
+            ("sent", _, _) => None,
+            (_, Some(code), Some(msg)) => Some(format!("[{code}] {msg}")),
+            (_, Some(code), None) => Some(format!("[{code}]")),
+            (_, None, msg) => msg,
+        };
+        sqlx::query!(
+            r#"
+            UPDATE notification_deliveries
+            SET status = $1, error = $2, sent_at = $3
+            WHERE id = $4
+            "#,
+            outcome.status,
+            error,
+            sent_at,
+            delivery_id
+        )
+        .execute(pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+        Ok(())
     }
 
     // =====================================================================
@@ -1698,7 +1992,7 @@ impl DeploymentService {
     pub fn load_catalog() -> Vec<CatalogTemplate> {
         // For v1 we construct the core ones directly (matching the JSON files on disk).
         // This guarantees it compiles and works without fs at runtime.
-        vec![
+        let mut templates = vec![
             CatalogTemplate {
                 id: "postgres".to_string(),
                 name: "PostgreSQL 16".to_string(),
@@ -1822,6 +2116,389 @@ impl DeploymentService {
                     "networks": ["forge-default"]
                 }),
             },
+        ];
+        templates.extend(Self::catalog_breadth());
+        templates
+    }
+
+    /// Data tranche: one-click catalog breadth toward Coolify/Dokploy parity. Every template
+    /// is a real, runnable Compose-style spec (image + env + ports + volumes + healthcheck);
+    /// every credential is a `generate`d secret variable, never hardcoded.
+    fn catalog_breadth() -> Vec<CatalogTemplate> {
+        // Shared rolling strategy for stateful single-container services.
+        let stateful = || {
+            forge_core::DeploymentStrategy::Rolling(forge_core::RollingConfig {
+                max_unavailable: 1,
+                max_surge: 0,
+                health_check_grace_period_secs: 40,
+                rollback_on_failure: true,
+                failure_threshold: 3,
+            })
+        };
+        let gen_secret = |name: &str, label: &str| CatalogVariable {
+            name: name.into(),
+            label: label.into(),
+            r#type: "password".into(),
+            default: String::new(),
+            secret: true,
+            generate: true,
+            required: true,
+        };
+        let plain = |name: &str, label: &str, default: &str| CatalogVariable {
+            name: name.into(),
+            label: label.into(),
+            r#type: "string".into(),
+            default: default.into(),
+            secret: false,
+            generate: false,
+            required: true,
+        };
+
+        vec![
+            // --- Ghost (blogging/CMS) backed by MySQL ---
+            CatalogTemplate {
+                id: "ghost".into(),
+                name: "Ghost".into(),
+                description: "Professional publishing platform (Ghost) with a MySQL 8 backing store.".into(),
+                category: "cms".into(),
+                icon: Some("ghost".into()),
+                docs_url: Some("https://ghost.org/docs/".into()),
+                variables: vec![
+                    plain("GHOST_URL", "Public URL", "http://localhost:2368"),
+                    gen_secret("GHOST_DB_PASSWORD", "Database Password"),
+                ],
+                default_strategy: stateful(),
+                spec: serde_json::json!({
+                    "containers": [
+                        {
+                            "name": "ghost-db",
+                            "image": "mysql:8.0",
+                            "env": [
+                                ["MYSQL_DATABASE", "ghost"],
+                                ["MYSQL_USER", "ghost"],
+                                ["MYSQL_PASSWORD", "$GHOST_DB_PASSWORD"],
+                                ["MYSQL_RANDOM_ROOT_PASSWORD", "1"]
+                            ],
+                            "volumes": ["ghost-db:/var/lib/mysql"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD", "mysqladmin", "ping", "-h", "localhost"], "interval": 10000000000_i64, "timeout": 5000000000_i64, "retries": 5 }
+                        },
+                        {
+                            "name": "ghost",
+                            "image": "ghost:5-alpine",
+                            "env": [
+                                ["database__client", "mysql"],
+                                ["database__connection__host", "ghost-db"],
+                                ["database__connection__user", "ghost"],
+                                ["database__connection__password", "$GHOST_DB_PASSWORD"],
+                                ["database__connection__database", "ghost"],
+                                ["url", "$GHOST_URL"]
+                            ],
+                            "ports": ["2368:2368"],
+                            "volumes": ["ghost-content:/var/lib/ghost/content"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD-SHELL", "wget -qO- http://localhost:2368/ || exit 1"], "interval": 15000000000_i64, "timeout": 5000000000_i64, "retries": 5, "start_period": 30000000000_i64 }
+                        }
+                    ],
+                    "volumes": [{"name": "ghost-db"}, {"name": "ghost-content"}],
+                    "networks": ["forge-default"]
+                }),
+            },
+            // --- n8n (workflow automation) ---
+            CatalogTemplate {
+                id: "n8n".into(),
+                name: "n8n".into(),
+                description: "Workflow automation tool with basic-auth protected editor and persistent data.".into(),
+                category: "automation".into(),
+                icon: Some("workflow".into()),
+                docs_url: Some("https://docs.n8n.io/".into()),
+                variables: vec![
+                    plain("N8N_USER", "Editor User", "admin"),
+                    gen_secret("N8N_PASSWORD", "Editor Password"),
+                    gen_secret("N8N_ENCRYPTION_KEY", "Encryption Key"),
+                ],
+                default_strategy: stateful(),
+                spec: serde_json::json!({
+                    "containers": [{
+                        "name": "n8n",
+                        "image": "n8nio/n8n:latest",
+                        "env": [
+                            ["N8N_BASIC_AUTH_ACTIVE", "true"],
+                            ["N8N_BASIC_AUTH_USER", "$N8N_USER"],
+                            ["N8N_BASIC_AUTH_PASSWORD", "$N8N_PASSWORD"],
+                            ["N8N_ENCRYPTION_KEY", "$N8N_ENCRYPTION_KEY"]
+                        ],
+                        "ports": ["5678:5678"],
+                        "volumes": ["n8n-data:/home/node/.n8n"],
+                        "restart_policy": "unless-stopped",
+                        "healthcheck": { "test": ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz || exit 1"], "interval": 15000000000_i64, "timeout": 5000000000_i64, "retries": 5, "start_period": 20000000000_i64 }
+                    }],
+                    "volumes": [{"name": "n8n-data"}],
+                    "networks": ["forge-default"]
+                }),
+            },
+            // --- Plausible Analytics (web analytics) ---
+            CatalogTemplate {
+                id: "plausible".into(),
+                name: "Plausible Analytics".into(),
+                description: "Lightweight, privacy-friendly web analytics with Postgres + ClickHouse.".into(),
+                category: "analytics".into(),
+                icon: Some("chart".into()),
+                docs_url: Some("https://plausible.io/docs/self-hosting".into()),
+                variables: vec![
+                    plain("BASE_URL", "Public URL", "http://localhost:8000"),
+                    gen_secret("SECRET_KEY_BASE", "Secret Key Base"),
+                    gen_secret("PLAUSIBLE_DB_PASSWORD", "Postgres Password"),
+                ],
+                default_strategy: stateful(),
+                spec: serde_json::json!({
+                    "containers": [
+                        {
+                            "name": "plausible-db",
+                            "image": "postgres:16-alpine",
+                            "env": [["POSTGRES_DB", "plausible"], ["POSTGRES_USER", "plausible"], ["POSTGRES_PASSWORD", "$PLAUSIBLE_DB_PASSWORD"]],
+                            "volumes": ["plausible-db:/var/lib/postgresql/data"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD-SHELL", "pg_isready -U plausible"], "interval": 10000000000_i64, "timeout": 5000000000_i64, "retries": 5 }
+                        },
+                        {
+                            "name": "plausible-events-db",
+                            "image": "clickhouse/clickhouse-server:24.3-alpine",
+                            "volumes": ["plausible-events:/var/lib/clickhouse"],
+                            "restart_policy": "unless-stopped",
+                            "ulimits": [{"name": "nofile", "soft": 262144, "hard": 262144}]
+                        },
+                        {
+                            "name": "plausible",
+                            "image": "ghcr.io/plausible/community-edition:v2.1.4",
+                            "cmd": ["sh", "-c", "/entrypoint.sh db createdb && /entrypoint.sh db migrate && /entrypoint.sh run"],
+                            "env": [
+                                ["BASE_URL", "$BASE_URL"],
+                                ["SECRET_KEY_BASE", "$SECRET_KEY_BASE"],
+                                ["DATABASE_URL", "postgres://plausible:$PLAUSIBLE_DB_PASSWORD@plausible-db:5432/plausible"],
+                                ["CLICKHOUSE_DATABASE_URL", "http://plausible-events-db:8123/plausible_events_db"]
+                            ],
+                            "ports": ["8000:8000"],
+                            "restart_policy": "unless-stopped"
+                        }
+                    ],
+                    "volumes": [{"name": "plausible-db"}, {"name": "plausible-events"}],
+                    "networks": ["forge-default"]
+                }),
+            },
+            // --- Uptime Kuma (monitoring) ---
+            CatalogTemplate {
+                id: "uptime-kuma".into(),
+                name: "Uptime Kuma".into(),
+                description: "Self-hosted uptime monitoring with a clean dashboard and alerting.".into(),
+                category: "monitoring".into(),
+                icon: Some("activity".into()),
+                docs_url: Some("https://github.com/louislam/uptime-kuma/wiki".into()),
+                variables: vec![],
+                default_strategy: stateful(),
+                spec: serde_json::json!({
+                    "containers": [{
+                        "name": "uptime-kuma",
+                        "image": "louislam/uptime-kuma:1",
+                        "ports": ["3001:3001"],
+                        "volumes": ["uptime-kuma:/app/data"],
+                        "restart_policy": "unless-stopped",
+                        "healthcheck": { "test": ["CMD-SHELL", "node extra/healthcheck.js"], "interval": 60000000000_i64, "timeout": 10000000000_i64, "retries": 3, "start_period": 30000000000_i64 }
+                    }],
+                    "volumes": [{"name": "uptime-kuma"}],
+                    "networks": ["forge-default"]
+                }),
+            },
+            // --- Metabase (BI / dashboards) ---
+            CatalogTemplate {
+                id: "metabase".into(),
+                name: "Metabase".into(),
+                description: "Open-source business intelligence with a Postgres application database.".into(),
+                category: "analytics".into(),
+                icon: Some("chart".into()),
+                docs_url: Some("https://www.metabase.com/docs/latest/".into()),
+                variables: vec![gen_secret("METABASE_DB_PASSWORD", "App Database Password")],
+                default_strategy: stateful(),
+                spec: serde_json::json!({
+                    "containers": [
+                        {
+                            "name": "metabase-db",
+                            "image": "postgres:16-alpine",
+                            "env": [["POSTGRES_DB", "metabase"], ["POSTGRES_USER", "metabase"], ["POSTGRES_PASSWORD", "$METABASE_DB_PASSWORD"]],
+                            "volumes": ["metabase-db:/var/lib/postgresql/data"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD-SHELL", "pg_isready -U metabase"], "interval": 10000000000_i64, "timeout": 5000000000_i64, "retries": 5 }
+                        },
+                        {
+                            "name": "metabase",
+                            "image": "metabase/metabase:latest",
+                            "env": [
+                                ["MB_DB_TYPE", "postgres"],
+                                ["MB_DB_DBNAME", "metabase"],
+                                ["MB_DB_PORT", "5432"],
+                                ["MB_DB_USER", "metabase"],
+                                ["MB_DB_PASS", "$METABASE_DB_PASSWORD"],
+                                ["MB_DB_HOST", "metabase-db"]
+                            ],
+                            "ports": ["3000:3000"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"], "interval": 15000000000_i64, "timeout": 5000000000_i64, "retries": 5, "start_period": 60000000000_i64 }
+                        }
+                    ],
+                    "volumes": [{"name": "metabase-db"}],
+                    "networks": ["forge-default"]
+                }),
+            },
+            // --- Vaultwarden (Bitwarden-compatible password manager) ---
+            CatalogTemplate {
+                id: "vaultwarden".into(),
+                name: "Vaultwarden".into(),
+                description: "Lightweight Bitwarden-compatible password manager server.".into(),
+                category: "security".into(),
+                icon: Some("lock".into()),
+                docs_url: Some("https://github.com/dani-garcia/vaultwarden/wiki".into()),
+                variables: vec![gen_secret("ADMIN_TOKEN", "Admin Token")],
+                default_strategy: stateful(),
+                spec: serde_json::json!({
+                    "containers": [{
+                        "name": "vaultwarden",
+                        "image": "vaultwarden/server:latest",
+                        "env": [["ADMIN_TOKEN", "$ADMIN_TOKEN"], ["ROCKET_PORT", "80"]],
+                        "ports": ["8081:80"],
+                        "volumes": ["vaultwarden:/data"],
+                        "restart_policy": "unless-stopped",
+                        "healthcheck": { "test": ["CMD-SHELL", "curl -f http://localhost:80/alive || exit 1"], "interval": 30000000000_i64, "timeout": 5000000000_i64, "retries": 5, "start_period": 20000000000_i64 }
+                    }],
+                    "volumes": [{"name": "vaultwarden"}],
+                    "networks": ["forge-default"]
+                }),
+            },
+            // --- Gitea (self-hosted git) ---
+            CatalogTemplate {
+                id: "gitea".into(),
+                name: "Gitea".into(),
+                description: "Lightweight self-hosted Git service with web UI and SSH.".into(),
+                category: "developer".into(),
+                icon: Some("git".into()),
+                docs_url: Some("https://docs.gitea.com/".into()),
+                variables: vec![gen_secret("GITEA_DB_PASSWORD", "Database Password")],
+                default_strategy: stateful(),
+                spec: serde_json::json!({
+                    "containers": [
+                        {
+                            "name": "gitea-db",
+                            "image": "postgres:16-alpine",
+                            "env": [["POSTGRES_DB", "gitea"], ["POSTGRES_USER", "gitea"], ["POSTGRES_PASSWORD", "$GITEA_DB_PASSWORD"]],
+                            "volumes": ["gitea-db:/var/lib/postgresql/data"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD-SHELL", "pg_isready -U gitea"], "interval": 10000000000_i64, "timeout": 5000000000_i64, "retries": 5 }
+                        },
+                        {
+                            "name": "gitea",
+                            "image": "gitea/gitea:1.22",
+                            "env": [
+                                ["GITEA__database__DB_TYPE", "postgres"],
+                                ["GITEA__database__HOST", "gitea-db:5432"],
+                                ["GITEA__database__NAME", "gitea"],
+                                ["GITEA__database__USER", "gitea"],
+                                ["GITEA__database__PASSWD", "$GITEA_DB_PASSWORD"]
+                            ],
+                            "ports": ["3002:3000", "2222:22"],
+                            "volumes": ["gitea-data:/data"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD-SHELL", "curl -f http://localhost:3000/api/healthz || exit 1"], "interval": 15000000000_i64, "timeout": 5000000000_i64, "retries": 5, "start_period": 30000000000_i64 }
+                        }
+                    ],
+                    "volumes": [{"name": "gitea-db"}, {"name": "gitea-data"}],
+                    "networks": ["forge-default"]
+                }),
+            },
+            // --- Nextcloud (file sync & share) ---
+            CatalogTemplate {
+                id: "nextcloud".into(),
+                name: "Nextcloud".into(),
+                description: "Self-hosted file sync & share with a Postgres backing store.".into(),
+                category: "productivity".into(),
+                icon: Some("cloud".into()),
+                docs_url: Some("https://docs.nextcloud.com/".into()),
+                variables: vec![
+                    plain("NEXTCLOUD_ADMIN_USER", "Admin User", "admin"),
+                    gen_secret("NEXTCLOUD_ADMIN_PASSWORD", "Admin Password"),
+                    gen_secret("NEXTCLOUD_DB_PASSWORD", "Database Password"),
+                ],
+                default_strategy: stateful(),
+                spec: serde_json::json!({
+                    "containers": [
+                        {
+                            "name": "nextcloud-db",
+                            "image": "postgres:16-alpine",
+                            "env": [["POSTGRES_DB", "nextcloud"], ["POSTGRES_USER", "nextcloud"], ["POSTGRES_PASSWORD", "$NEXTCLOUD_DB_PASSWORD"]],
+                            "volumes": ["nextcloud-db:/var/lib/postgresql/data"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD-SHELL", "pg_isready -U nextcloud"], "interval": 10000000000_i64, "timeout": 5000000000_i64, "retries": 5 }
+                        },
+                        {
+                            "name": "nextcloud",
+                            "image": "nextcloud:29-apache",
+                            "env": [
+                                ["POSTGRES_HOST", "nextcloud-db"],
+                                ["POSTGRES_DB", "nextcloud"],
+                                ["POSTGRES_USER", "nextcloud"],
+                                ["POSTGRES_PASSWORD", "$NEXTCLOUD_DB_PASSWORD"],
+                                ["NEXTCLOUD_ADMIN_USER", "$NEXTCLOUD_ADMIN_USER"],
+                                ["NEXTCLOUD_ADMIN_PASSWORD", "$NEXTCLOUD_ADMIN_PASSWORD"]
+                            ],
+                            "ports": ["8082:80"],
+                            "volumes": ["nextcloud-data:/var/www/html"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD-SHELL", "curl -f http://localhost:80/status.php || exit 1"], "interval": 20000000000_i64, "timeout": 5000000000_i64, "retries": 5, "start_period": 60000000000_i64 }
+                        }
+                    ],
+                    "volumes": [{"name": "nextcloud-db"}, {"name": "nextcloud-data"}],
+                    "networks": ["forge-default"]
+                }),
+            },
+            // --- Supabase (Postgres + Studio, focused runnable subset) ---
+            CatalogTemplate {
+                id: "supabase".into(),
+                name: "Supabase (Postgres + Studio)".into(),
+                description: "Supabase Postgres with the Studio admin UI. A focused, runnable subset of the full stack.".into(),
+                category: "database".into(),
+                icon: Some("database".into()),
+                docs_url: Some("https://supabase.com/docs/guides/self-hosting".into()),
+                variables: vec![
+                    gen_secret("POSTGRES_PASSWORD", "Postgres Password"),
+                ],
+                default_strategy: stateful(),
+                spec: serde_json::json!({
+                    "containers": [
+                        {
+                            "name": "supabase-db",
+                            "image": "supabase/postgres:15.6.1.143",
+                            "env": [
+                                ["POSTGRES_PASSWORD", "$POSTGRES_PASSWORD"],
+                                ["POSTGRES_DB", "postgres"]
+                            ],
+                            "ports": ["5432:5432"],
+                            "volumes": ["supabase-db:/var/lib/postgresql/data"],
+                            "restart_policy": "unless-stopped",
+                            "healthcheck": { "test": ["CMD-SHELL", "pg_isready -U postgres"], "interval": 10000000000_i64, "timeout": 5000000000_i64, "retries": 5, "start_period": 20000000000_i64 }
+                        },
+                        {
+                            "name": "supabase-studio",
+                            "image": "supabase/studio:latest",
+                            "env": [
+                                ["POSTGRES_PASSWORD", "$POSTGRES_PASSWORD"],
+                                ["STUDIO_PG_META_URL", "http://supabase-db:5432"]
+                            ],
+                            "ports": ["3003:3000"],
+                            "restart_policy": "unless-stopped"
+                        }
+                    ],
+                    "volumes": [{"name": "supabase-db"}],
+                    "networks": ["forge-default"]
+                }),
+            },
         ]
     }
 
@@ -1861,6 +2538,19 @@ impl DeploymentService {
 
     // Mirrors the `backup_schedules` columns 1:1; grouping into a struct would just
     // duplicate the table shape, so the explicit parameter list is intentional.
+    /// Engines a backup schedule may target. Mirrors the agent's `RESTORE_ENGINES` allowlist
+    /// plus its dump support (v1: postgres). Validated so a bad engine never reaches an agent.
+    const BACKUP_ENGINES: [&str; 4] = ["postgres", "postgresql", "mysql", "mongodb"];
+
+    /// Validate a schedule's S3 endpoint: must be a syntactically-valid https URL to a
+    /// non-private literal host, length-bounded. SSRF risk is low (operator-configured object
+    /// storage) but we still enforce scheme + bound (OWASP A10), reusing the notify validator.
+    fn validate_s3_endpoint(endpoint: &str) -> Result<(), DeploymentError> {
+        crate::notify::validate_url_syntax(endpoint, false)
+            .map(|_| ())
+            .map_err(|e| DeploymentError::InvalidInput(format!("s3_endpoint: {e}")))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_backup_schedule(
         &self,
@@ -1871,12 +2561,56 @@ impl DeploymentService {
         schedule_type: &str,
         schedule_value: &str,
         retention_days: i32,
+        retention_count: Option<i32>,
         s3_endpoint: Option<&str>,
         s3_bucket: Option<&str>,
         s3_key_prefix: Option<&str>,
+        s3_region: Option<&str>,
+        s3_access_key_id: Option<&str>,
+        s3_secret_id: Option<Uuid>,
+        target_container: Option<&str>,
     ) -> Result<serde_json::Value, DeploymentError> {
-        if name.trim().is_empty() {
-            return Err(DeploymentError::InvalidInput("name is required".into()));
+        if name.trim().is_empty() || name.len() > 128 {
+            return Err(DeploymentError::InvalidInput(
+                "name must be 1-128 characters".into(),
+            ));
+        }
+        if !Self::BACKUP_ENGINES.contains(&db_type) {
+            return Err(DeploymentError::InvalidInput(format!(
+                "db_type must be one of: {}",
+                Self::BACKUP_ENGINES.join(", ")
+            )));
+        }
+        if schedule_type != "interval" && schedule_type != "cron" {
+            return Err(DeploymentError::InvalidInput(
+                "schedule_type must be 'interval' or 'cron'".into(),
+            ));
+        }
+        // Validate the schedule value: an interval is bounded seconds; a cron is a 5-field expr.
+        crate::schedule::validate_schedule(schedule_type, schedule_value)
+            .map_err(DeploymentError::InvalidInput)?;
+        if !(1..=3650).contains(&retention_days) {
+            return Err(DeploymentError::InvalidInput(
+                "retention_days must be 1-3650".into(),
+            ));
+        }
+        if let Some(rc) = retention_count {
+            if !(1..=10_000).contains(&rc) {
+                return Err(DeploymentError::InvalidInput(
+                    "retention_count must be 1-10000".into(),
+                ));
+            }
+        }
+        // If an S3 destination is configured, the endpoint must be a valid https URL and a
+        // bucket must be present. The secret KEY is referenced via s3_secret_id (age store),
+        // never accepted as plaintext here (OWASP A02).
+        if let Some(ep) = s3_endpoint.map(str::trim).filter(|s| !s.is_empty()) {
+            Self::validate_s3_endpoint(ep)?;
+            if s3_bucket.map(str::trim).is_none_or(str::is_empty) {
+                return Err(DeploymentError::InvalidInput(
+                    "s3_bucket is required when s3_endpoint is set".into(),
+                ));
+            }
         }
 
         let id = Uuid::now_v7();
@@ -1886,10 +2620,11 @@ impl DeploymentService {
             r#"
             INSERT INTO backup_schedules (
                 id, deployment_id, name, db_type, database_name,
-                schedule_type, schedule_value, retention_days,
-                s3_endpoint, s3_bucket, s3_key_prefix,
+                schedule_type, schedule_value, retention_days, retention_count,
+                s3_endpoint, s3_bucket, s3_key_prefix, s3_region,
+                s3_access_key_id, s3_secret_id, target_container,
                 enabled, created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true, $12, $12)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, true, $17, $17)
             "#,
             id,
             deployment_id,
@@ -1899,14 +2634,24 @@ impl DeploymentService {
             schedule_type,
             schedule_value,
             retention_days,
+            retention_count,
             s3_endpoint,
             s3_bucket,
             s3_key_prefix,
+            s3_region,
+            s3_access_key_id,
+            s3_secret_id,
+            target_container,
             now
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| DeploymentError::Internal(e.into()))?;
+        .map_err(|e| match e {
+            sqlx::Error::Database(ref db) if db.code().as_deref() == Some("23503") => {
+                DeploymentError::InvalidInput("deployment_id or s3_secret_id does not exist".into())
+            }
+            other => DeploymentError::Internal(other.into()),
+        })?;
 
         Ok(serde_json::json!({
             "id": id,
@@ -2111,6 +2856,381 @@ impl DeploymentService {
                 .await;
         }
 
+        Ok(())
+    }
+
+    // =====================================================================
+    // Data tranche: scheduled backup dispatch model + restore
+    // =====================================================================
+
+    /// An enabled backup schedule with everything the scheduler needs to assemble a
+    /// `Job::Backup` and decide whether it is due. No secret material (only the secret's id).
+    /// Returned by [`Self::list_enabled_backup_schedules`].
+    pub async fn list_enabled_backup_schedules(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<BackupScheduleRow>, DeploymentError> {
+        let rows = sqlx::query_as!(
+            BackupScheduleRow,
+            r#"
+            SELECT id, deployment_id, db_type, database_name, schedule_type, schedule_value,
+                   retention_days, retention_count,
+                   s3_endpoint, s3_bucket, s3_key_prefix, s3_region, s3_access_key_id,
+                   s3_secret_id, target_container, last_run_at
+            FROM backup_schedules
+            WHERE enabled = true
+            ORDER BY created_at
+            LIMIT $1
+            "#,
+            limit
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+        Ok(rows)
+    }
+
+    /// Stamp a schedule's `last_run_at` so the next due-evaluation measures from now.
+    pub async fn mark_backup_schedule_ran(
+        &self,
+        schedule_id: Uuid,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), DeploymentError> {
+        sqlx::query!(
+            "UPDATE backup_schedules SET last_run_at = $2, updated_at = $2 WHERE id = $1",
+            schedule_id,
+            at
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+        Ok(())
+    }
+
+    /// Resolve a stored secret's age envelope into a [`forge_agent::job::SecretRef`] targeting
+    /// `var`, so it can be carried inside a signed Job and decrypted by the running agent.
+    /// Returns `None` if the secret is missing or still a `pending` placeholder (no recipients
+    /// at creation time) — the caller then dispatches without S3 creds (volume-local backup).
+    pub async fn secret_ref_for(
+        &self,
+        secret_id: Uuid,
+        secret_name_in_job: &str,
+        var: &str,
+    ) -> Result<Option<forge_agent::job::SecretRef>, DeploymentError> {
+        let row = sqlx::query!(
+            "SELECT encrypted_blob FROM secrets WHERE id = $1 AND enabled = true",
+            secret_id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let ct: forge_core::spec::SecretCiphertext =
+            match serde_json::from_value(row.encrypted_blob) {
+                Ok(ct) => ct,
+                Err(_) => return Ok(None),
+            };
+        if ct.version != forge_core::spec::SecretCiphertext::VERSION_AGE_V1 {
+            // 'pending' placeholder or unknown version → not usable; fail open to no-creds.
+            return Ok(None);
+        }
+        Ok(Some(forge_agent::job::SecretRef {
+            name: secret_name_in_job.to_string(),
+            target: forge_core::spec::SecretTarget::Env {
+                var: var.to_string(),
+            },
+            ciphertext: ct,
+        }))
+    }
+
+    /// Retention prune: delete `success`/`failed` execution rows older than `retention_days`,
+    /// then (if `retention_count` is set) trim to the newest N successful executions. We prune
+    /// the execution ROWS; the actual S3 object lifecycle is the bucket's responsibility (the
+    /// agent cannot be assumed to hold delete creds), but the schedule's `retention_days`
+    /// records operator intent and the row set stays bounded (OWASP A10).
+    pub async fn prune_backup_executions(
+        &self,
+        schedule_id: Uuid,
+        retention_days: i32,
+        retention_count: Option<i32>,
+    ) -> Result<u64, DeploymentError> {
+        let cutoff = Utc::now() - chrono::Duration::days(i64::from(retention_days));
+        let mut pruned = sqlx::query!(
+            r#"
+            DELETE FROM backup_executions
+            WHERE schedule_id = $1
+              AND status IN ('success', 'failed', 'skipped')
+              AND created_at < $2
+            "#,
+            schedule_id,
+            cutoff
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?
+        .rows_affected();
+
+        if let Some(keep) = retention_count {
+            pruned += sqlx::query!(
+                r#"
+                DELETE FROM backup_executions
+                WHERE id IN (
+                    SELECT id FROM backup_executions
+                    WHERE schedule_id = $1 AND status = 'success'
+                    ORDER BY created_at DESC
+                    OFFSET $2
+                )
+                "#,
+                schedule_id,
+                i64::from(keep)
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DeploymentError::Internal(e.into()))?
+            .rows_affected();
+        }
+        Ok(pruned)
+    }
+
+    /// Record a backup JobResult (called from the agent WS layer on a `backup_*` result).
+    /// Updates the linked execution by deployment correlation and fires notifications.
+    pub async fn record_backup_job_result(
+        &self,
+        result: &JobResult,
+    ) -> Result<(), DeploymentError> {
+        let forge_agent::job::JobResultDetails::Backup {
+            success,
+            size_bytes,
+            location,
+            message,
+            ..
+        } = &result.details
+        else {
+            return Ok(());
+        };
+        let Ok(deployment_id) = Uuid::parse_str(&result.correlation_id) else {
+            return Ok(());
+        };
+
+        // Update the most recent pending/running execution for this deployment.
+        let exec = sqlx::query_scalar!(
+            r#"
+            SELECT id FROM backup_executions
+            WHERE deployment_id = $1 AND status IN ('pending', 'running')
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+            deployment_id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        if let Some(exec_id) = exec {
+            self.record_backup_result(
+                exec_id,
+                *success,
+                size_bytes.map(|s| i64::try_from(s).unwrap_or(i64::MAX)),
+                location.as_deref(),
+                message.as_deref(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Create a `pending` restore execution row. Returns its id so the caller can dispatch
+    /// the signed `Job::Restore`. The source execution provides the dump location + db_type.
+    pub async fn create_restore_execution(
+        &self,
+        deployment_id: Uuid,
+        source_execution_id: Uuid,
+        requested_by_principal_id: Option<Uuid>,
+    ) -> Result<(Uuid, RestoreSource), DeploymentError> {
+        // Load the source backup execution; it must belong to this deployment and have a location.
+        let src = sqlx::query!(
+            r#"
+            SELECT deployment_id, schedule_id, db_type, location, status
+            FROM backup_executions WHERE id = $1
+            "#,
+            source_execution_id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?
+        .ok_or(DeploymentError::DeploymentNotFound)?;
+
+        if src.deployment_id != Some(deployment_id) {
+            return Err(DeploymentError::InvalidInput(
+                "backup execution does not belong to this deployment".into(),
+            ));
+        }
+        if src.status != "success" {
+            return Err(DeploymentError::InvalidInput(
+                "can only restore from a successful backup".into(),
+            ));
+        }
+        let location = src.location.clone().ok_or_else(|| {
+            DeploymentError::InvalidInput("backup execution has no stored location".into())
+        })?;
+
+        let restore_id = Uuid::now_v7();
+        let now = Utc::now();
+        // target_container + s3 config come from the originating schedule (if any).
+        let source = self
+            .resolve_restore_source(src.schedule_id, &src.db_type, &location)
+            .await?;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO restore_executions
+                (id, deployment_id, source_execution_id, status, db_type, target_container,
+                 location, requested_by_principal_id, started_at, created_at)
+            VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $8)
+            "#,
+            restore_id,
+            deployment_id,
+            source_execution_id,
+            src.db_type,
+            source.target_container,
+            location,
+            requested_by_principal_id,
+            now
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        Ok((restore_id, source))
+    }
+
+    /// Resolve the restore source details (target container + S3 config) from the originating
+    /// schedule. When the backup had no schedule (manual backup), we derive the target
+    /// container from the deployment spec's first container and treat the location as an S3 key.
+    async fn resolve_restore_source(
+        &self,
+        schedule_id: Option<Uuid>,
+        _db_type: &str,
+        location: &str,
+    ) -> Result<RestoreSource, DeploymentError> {
+        if let Some(sid) = schedule_id {
+            let row = sqlx::query!(
+                r#"
+                SELECT s3_endpoint, s3_bucket, s3_key_prefix, s3_region, s3_access_key_id,
+                       s3_secret_id, target_container
+                FROM backup_schedules WHERE id = $1
+                "#,
+                sid
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| DeploymentError::Internal(e.into()))?;
+            if let Some(r) = row {
+                return Ok(RestoreSource {
+                    target_container: r.target_container.unwrap_or_default(),
+                    s3_endpoint: r.s3_endpoint,
+                    s3_bucket: r.s3_bucket,
+                    // The dump's key is encoded in `location` (s3://bucket/key); the agent uses it.
+                    s3_key: Self::s3_key_from_location(location, r.s3_key_prefix.as_deref()),
+                    s3_region: r.s3_region,
+                    s3_access_key_id: r.s3_access_key_id,
+                    s3_secret_id: r.s3_secret_id,
+                });
+            }
+        }
+        Ok(RestoreSource {
+            target_container: String::new(),
+            s3_endpoint: None,
+            s3_bucket: None,
+            s3_key: Self::s3_key_from_location(location, None),
+            s3_region: None,
+            s3_access_key_id: None,
+            s3_secret_id: None,
+        })
+    }
+
+    /// Extract the object key from a stored `s3://bucket/key` (or volume) location.
+    fn s3_key_from_location(location: &str, _prefix: Option<&str>) -> String {
+        if let Some(rest) = location.strip_prefix("s3://") {
+            // rest = bucket/key... — drop the bucket segment.
+            rest.split_once('/')
+                .map_or_else(|| rest.to_string(), |(_, k)| k.to_string())
+        } else {
+            location.to_string()
+        }
+    }
+
+    /// The db_type of a backup execution (used to build the matching restore job).
+    pub async fn restore_db_type(
+        &self,
+        execution_id: Uuid,
+    ) -> Result<Option<String>, DeploymentError> {
+        sqlx::query_scalar!(
+            "SELECT db_type FROM backup_executions WHERE id = $1",
+            execution_id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))
+    }
+
+    /// Record a restore JobResult terminal status + fire notifications.
+    pub async fn record_restore_job_result(
+        &self,
+        result: &JobResult,
+    ) -> Result<(), DeploymentError> {
+        let forge_agent::job::JobResultDetails::Restore {
+            success,
+            location,
+            message,
+            ..
+        } = &result.details
+        else {
+            return Ok(());
+        };
+        let Ok(restore_id) = Uuid::parse_str(&result.correlation_id) else {
+            return Ok(());
+        };
+        let status = if *success { "success" } else { "failed" };
+        let now = Utc::now();
+        let dep = sqlx::query_scalar!(
+            r#"
+            UPDATE restore_executions
+            SET status = $1, error = $2, location = COALESCE($3, location), finished_at = $4
+            WHERE id = $5
+            RETURNING deployment_id
+            "#,
+            status,
+            if *success { None } else { message.clone() },
+            location.clone(),
+            now,
+            restore_id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?
+        .flatten();
+
+        let event = if *success {
+            "restore.success"
+        } else {
+            "restore.failed"
+        };
+        let _ = self
+            .trigger_notifications(
+                event,
+                "deployment",
+                dep,
+                serde_json::json!({
+                    "restore_execution_id": restore_id,
+                    "success": success,
+                    "location": location,
+                }),
+            )
+            .await;
         Ok(())
     }
 
@@ -2428,6 +3548,352 @@ impl DeploymentService {
         Ok(result)
     }
 
+    // =====================================================================
+    // Phase B: Source-to-deploy builds
+    // =====================================================================
+
+    /// Collect the age recipients of all enrolled agents that reported one. Build secrets
+    /// are encrypted to every such recipient so whichever agent runs the build can decrypt
+    /// them (multi-recipient envelope — one ciphertext, any agent opens it). Never logs the
+    /// recipients themselves.
+    pub async fn agent_age_recipients(&self) -> Result<Vec<String>, DeploymentError> {
+        let rows = sqlx::query!(
+            "SELECT age_recipient FROM agents WHERE age_recipient IS NOT NULL AND age_recipient <> ''"
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+        Ok(rows.into_iter().filter_map(|r| r.age_recipient).collect())
+    }
+
+    /// Load a named, enabled secret's age envelope for use as a build secret, scoped to the
+    /// application the build belongs to. A secret resolves only if it is owned by `application_id`
+    /// or is an explicitly instance-global secret (`application_id IS NULL`). This closes the
+    /// IDOR (A01): a build for app A can never reference a secret owned by app B by name.
+    /// Returns the stored `SecretCiphertext` (already encrypted to the agents' recipients) or
+    /// `None` if the name is unknown/disabled/out-of-scope or its blob is a non-encrypted
+    /// placeholder. Never logs or returns plaintext.
+    pub async fn get_build_secret_ref(
+        &self,
+        name: &str,
+        application_id: Uuid,
+    ) -> Result<Option<forge_agent::job::SecretCiphertext>, DeploymentError> {
+        // Scope: app-owned secrets win over a same-named global secret (ORDER BY application_id
+        // NULLS LAST), and only enabled secrets in scope are eligible. A secret belonging to a
+        // *different* application is invisible here (fail closed — the caller rejects on None).
+        let row = sqlx::query!(
+            r#"
+            SELECT encrypted_blob FROM secrets
+            WHERE name = $1
+              AND enabled = true
+              AND (application_id = $2 OR application_id IS NULL)
+            ORDER BY application_id NULLS LAST, created_at DESC
+            LIMIT 1
+            "#,
+            name,
+            application_id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        // A "pending" placeholder (no agents at creation time) is not usable as a build secret.
+        let version = row.encrypted_blob.get("version").and_then(|v| v.as_str());
+        if version != Some(forge_agent::job::SecretCiphertext::VERSION_AGE_V1) {
+            return Ok(None);
+        }
+        match serde_json::from_value::<forge_agent::job::SecretCiphertext>(row.encrypted_blob) {
+            Ok(ct) => Ok(Some(ct)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Create a build record (status `pending`) for an application from a pinned commit.
+    /// `builder` is the `Builder` discriminant string for the CHECK constraint.
+    /// Default-deny RBAC: a real principal must hold `builds:create`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_build(
+        &self,
+        application_id: Uuid,
+        git_source_id: Option<Uuid>,
+        commit_sha: &str,
+        git_ref: Option<&str>,
+        builder: &str,
+        image: &str,
+        created_by_principal_id: Option<Uuid>,
+    ) -> Result<BuildRecord, DeploymentError> {
+        self.enforce(created_by_principal_id, "builds:create")
+            .await?;
+
+        // Validate the application exists (and is the authz/audit anchor).
+        let _ = self.get_application(application_id).await?;
+
+        if !matches!(builder, "dockerfile" | "nixpacks" | "compose" | "buildpack") {
+            return Err(DeploymentError::InvalidInput(
+                "builder must be one of: dockerfile, nixpacks, compose, buildpack".into(),
+            ));
+        }
+        // Commit SHA must be a real 40/64-hex hash — we only ever build a pinned commit.
+        let sha_ok = (commit_sha.len() == 40 || commit_sha.len() == 64)
+            && commit_sha.chars().all(|c| c.is_ascii_hexdigit());
+        if !sha_ok {
+            return Err(DeploymentError::InvalidInput(
+                "commit_sha must be a 40- or 64-character hex commit hash".into(),
+            ));
+        }
+        if image.trim().is_empty() || image.len() > 512 {
+            return Err(DeploymentError::InvalidInput(
+                "invalid image reference".into(),
+            ));
+        }
+
+        let id = Uuid::now_v7();
+        sqlx::query!(
+            r#"
+            INSERT INTO builds
+                (id, application_id, git_source_id, commit_sha, git_ref, builder, status,
+                 image, created_by_principal_id, logs_ref)
+            VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9)
+            "#,
+            id,
+            application_id,
+            git_source_id,
+            commit_sha,
+            git_ref,
+            builder,
+            image,
+            created_by_principal_id,
+            // The build id doubles as the live build-log WS topic key.
+            id.to_string(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        self.get_build(id)
+            .await?
+            .ok_or(DeploymentError::DeploymentNotFound)
+    }
+
+    /// Fetch a single build by id.
+    pub async fn get_build(&self, id: Uuid) -> Result<Option<BuildRecord>, DeploymentError> {
+        let row = sqlx::query!(
+            r#"
+            SELECT id, application_id, git_source_id, commit_sha, git_ref, builder, status,
+                   image, image_digest, started_at, finished_at, error,
+                   created_by_principal_id, deployment_id, signed, provenance,
+                   created_at, updated_at
+            FROM builds WHERE id = $1
+            "#,
+            id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        Ok(row.map(|r| BuildRecord {
+            id: r.id,
+            application_id: r.application_id,
+            git_source_id: r.git_source_id,
+            commit_sha: r.commit_sha,
+            git_ref: r.git_ref,
+            builder: r.builder,
+            status: r.status,
+            image: r.image,
+            image_digest: r.image_digest,
+            started_at: r.started_at,
+            finished_at: r.finished_at,
+            error: r.error,
+            created_by_principal_id: r.created_by_principal_id,
+            deployment_id: r.deployment_id,
+            signed: r.signed,
+            provenance: r.provenance,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }))
+    }
+
+    /// List recent builds for an application (newest first).
+    pub async fn list_builds(
+        &self,
+        application_id: Uuid,
+    ) -> Result<Vec<BuildRecord>, DeploymentError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, application_id, git_source_id, commit_sha, git_ref, builder, status,
+                   image, image_digest, started_at, finished_at, error,
+                   created_by_principal_id, deployment_id, signed, provenance,
+                   created_at, updated_at
+            FROM builds WHERE application_id = $1
+            ORDER BY created_at DESC LIMIT 100
+            "#,
+            application_id
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| BuildRecord {
+                id: r.id,
+                application_id: r.application_id,
+                git_source_id: r.git_source_id,
+                commit_sha: r.commit_sha,
+                git_ref: r.git_ref,
+                builder: r.builder,
+                status: r.status,
+                image: r.image,
+                image_digest: r.image_digest,
+                started_at: r.started_at,
+                finished_at: r.finished_at,
+                error: r.error,
+                created_by_principal_id: r.created_by_principal_id,
+                deployment_id: r.deployment_id,
+                signed: r.signed,
+                provenance: r.provenance,
+                created_at: r.created_at,
+                updated_at: r.updated_at,
+            })
+            .collect())
+    }
+
+    /// Mark a build as running (sets started_at).
+    pub async fn mark_build_running(&self, id: Uuid) -> Result<(), DeploymentError> {
+        sqlx::query!(
+            "UPDATE builds SET status = 'running', started_at = NOW(), updated_at = NOW() WHERE id = $1",
+            id
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+        Ok(())
+    }
+
+    /// Apply a terminal build result from an agent's `JobResultDetails::Build`.
+    ///
+    /// On success records the image + digest and returns the [`BuildRecord`] so the caller
+    /// can dispatch a Deploy. On failure records the sanitized error and returns the record
+    /// with status `failed` — the caller MUST NOT deploy a failed build (fail-closed, A10).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_build_result(
+        &self,
+        id: Uuid,
+        success: bool,
+        image: Option<&str>,
+        image_digest: Option<&str>,
+        signed: bool,
+        provenance: Option<&serde_json::Value>,
+        error: Option<&str>,
+    ) -> Result<Option<BuildRecord>, DeploymentError> {
+        let status = if success { "succeeded" } else { "failed" };
+        // Truncate any error to a bounded, sanitized length for the UI (never store secrets).
+        let error_trunc = error.map(|e| e.chars().take(2000).collect::<String>());
+
+        sqlx::query!(
+            r#"
+            UPDATE builds
+            SET status = $1, image = COALESCE($2, image), image_digest = $3,
+                signed = $4, provenance = $5, error = $6, finished_at = NOW(), updated_at = NOW()
+            WHERE id = $7
+            "#,
+            status,
+            image,
+            image_digest,
+            signed,
+            provenance,
+            error_trunc,
+            id
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+
+        self.get_build(id).await
+    }
+
+    /// Write the supply-chain audit row (Phase C): the verifiable chain
+    /// principal → commit → image digest → deployment. NO secret material is stored — only the
+    /// public attestation summary (OWASP A09). `event` is a short machine label (e.g.
+    /// `build_signed_and_deployed`, `deploy_refused_no_digest`). Best-effort: a failure to audit
+    /// is logged by the caller and never blocks the deploy decision (which is already made).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_supply_chain_audit(
+        &self,
+        principal_id: Option<Uuid>,
+        build_id: Uuid,
+        commit_sha: &str,
+        image_digest: Option<&str>,
+        deployment_id: Option<Uuid>,
+        signed: bool,
+        event: &str,
+    ) -> Result<(), DeploymentError> {
+        let after = serde_json::json!({
+            "event": event,
+            "build_id": build_id,
+            "commit_sha": commit_sha,
+            "image_digest": image_digest,
+            "deployment_id": deployment_id,
+            "signed": signed,
+        });
+        sqlx::query!(
+            r#"
+            INSERT INTO audit_logs (id, principal_id, action, resource_type, resource_id, after)
+            VALUES ($1, $2, 'supplychain:build_attested', 'build', $3, $4)
+            "#,
+            Uuid::now_v7(),
+            principal_id,
+            build_id,
+            after,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+        Ok(())
+    }
+
+    /// Stamp git provenance (source, commit, ref) onto a deployment — the deploy end of the
+    /// commit→image→deploy audit chain.
+    pub async fn set_deployment_git_metadata(
+        &self,
+        deployment_id: Uuid,
+        git_source_id: Option<Uuid>,
+        commit_sha: Option<&str>,
+        git_ref: Option<&str>,
+    ) -> Result<(), DeploymentError> {
+        sqlx::query!(
+            "UPDATE deployments SET git_source_id = $1, commit_sha = $2, ref = $3 WHERE id = $4",
+            git_source_id,
+            commit_sha,
+            git_ref,
+            deployment_id
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+        Ok(())
+    }
+
+    /// Link a build to the deployment it produced (the deploy side of the audit chain).
+    pub async fn link_build_deployment(
+        &self,
+        build_id: Uuid,
+        deployment_id: Uuid,
+    ) -> Result<(), DeploymentError> {
+        sqlx::query!(
+            "UPDATE builds SET deployment_id = $1, updated_at = NOW() WHERE id = $2",
+            deployment_id,
+            build_id
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DeploymentError::Internal(e.into()))?;
+        Ok(())
+    }
+
     /// Handle an incoming webhook from a Git provider.
     ///
     /// Verifies authenticity over the RAW request body using the stored webhook secret
@@ -2514,6 +3980,92 @@ impl DeploymentService {
                 .unwrap_or("push")
                 .to_string()
         };
+
+        // === Deploy-on-push (Phase B) ===
+        // For a non-PR push to the tracked branch, if the git source is wired to an
+        // application with build config, create a BUILD (not a preview deployment). The
+        // build runs on an agent; on success the Build JobResult path creates + dispatches a
+        // Deployment. Fail-closed: a failed build never deploys. The actual Build job
+        // dispatch is performed by the HTTP handler (which holds the agent registry/signer);
+        // here we create the durable build record and return its id + the spec inputs.
+        if !is_pr {
+            if let Some(build) = config.get("build").and_then(|b| b.as_object()) {
+                let app_id = config
+                    .get("application_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok());
+                let pushed_ref = payload["ref"]
+                    .as_str()
+                    .map(|r| r.trim_start_matches("refs/heads/").to_string());
+                let tracked_branch = build
+                    .get("branch")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                // Only build the tracked branch (when one is configured).
+                let branch_matches = match (&tracked_branch, &pushed_ref) {
+                    (Some(tb), Some(pr)) => tb == pr,
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                };
+
+                let commit_sha = payload["after"]
+                    .as_str()
+                    .or_else(|| payload["checkout_sha"].as_str())
+                    .unwrap_or_default();
+                let sha_ok = (commit_sha.len() == 40 || commit_sha.len() == 64)
+                    && commit_sha.chars().all(|c| c.is_ascii_hexdigit());
+
+                if let (Some(app_id), true, true) = (app_id, branch_matches, sha_ok) {
+                    let builder = build
+                        .get("builder")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("dockerfile");
+                    let image_name = build
+                        .get("image_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(repo_name.split('/').next_back().unwrap_or("app"));
+                    let registry = build.get("registry").and_then(|v| v.as_str());
+                    let tag: String = commit_sha.chars().take(12).collect();
+                    let image = match registry {
+                        Some(r) if !r.is_empty() => format!("{r}/{image_name}:{tag}"),
+                        _ => format!("{image_name}:{tag}"),
+                    };
+
+                    // builds:create is enforced; webhook path is system-initiated (None principal).
+                    match self
+                        .create_build(
+                            app_id,
+                            Some(source_id),
+                            commit_sha,
+                            pushed_ref.as_deref(),
+                            builder,
+                            &image,
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(record) => {
+                            return Ok(serde_json::json!({
+                                "received": true,
+                                "source_id": source_id,
+                                "is_preview": false,
+                                "created_build_id": record.id,
+                                "commit_sha": commit_sha,
+                                "builder": builder,
+                                "image": image,
+                                "repo_url": config.get("repo_url").and_then(|v| v.as_str()),
+                                "note": "Build created from push. On success it will deploy (fail-closed)."
+                            }));
+                        }
+                        Err(e) => {
+                            warn!(error = %e, %source_id, "deploy-on-push build creation failed");
+                            // Fall through to the legacy preview behavior below.
+                        }
+                    }
+                }
+            }
+        }
 
         let preview_name = format!(
             "{}-{}",
@@ -2828,6 +4380,400 @@ mod webhook_signature_tests {
 }
 
 #[cfg(test)]
+mod build_pipeline_tests {
+    //! Phase B source-to-deploy service-layer tests (`#[sqlx::test]` → isolated DB +
+    //! `./migrations`). These prove the webhook→build→deploy happy path and the fail-closed
+    //! guarantee, with agent dispatch mocked (we drive the service methods the WS layer
+    //! orchestrates, never a real agent).
+    use super::*;
+    use ring::hmac;
+    use sqlx::PgPool;
+
+    fn svc_with(pool: PgPool) -> DeploymentService {
+        let rbac = std::sync::Arc::new(crate::rbac::RbacService::new(pool.clone()));
+        DeploymentService::new(pool, rbac)
+    }
+
+    fn github_sig(secret: &str, body: &[u8]) -> String {
+        let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+        format!("sha256={}", hex::encode(hmac::sign(&key, body).as_ref()))
+    }
+
+    async fn seed_app(svc: &DeploymentService) -> Uuid {
+        svc.create_application("buildable", Some("test app"), None)
+            .await
+            .unwrap()
+            .id
+    }
+
+    #[sqlx::test]
+    async fn create_build_validates_commit_and_builder(pool: PgPool) {
+        let svc = svc_with(pool);
+        let app_id = seed_app(&svc).await;
+        let sha = "a".repeat(40);
+
+        // Bad commit SHA → rejected.
+        let err = svc
+            .create_build(
+                app_id,
+                None,
+                "main",
+                Some("main"),
+                "dockerfile",
+                "app:1",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DeploymentError::InvalidInput(_)));
+
+        // Bad builder → rejected.
+        let err = svc
+            .create_build(app_id, None, &sha, Some("main"), "make", "app:1", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DeploymentError::InvalidInput(_)));
+
+        // Valid → pending build record.
+        let b = svc
+            .create_build(
+                app_id,
+                None,
+                &sha,
+                Some("main"),
+                "dockerfile",
+                "app:abc",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(b.status, "pending");
+        assert_eq!(b.commit_sha, sha);
+        assert_eq!(b.image.as_deref(), Some("app:abc"));
+    }
+
+    #[sqlx::test]
+    async fn webhook_push_creates_build_then_success_deploys(pool: PgPool) {
+        let svc = svc_with(pool.clone());
+        let app_id = seed_app(&svc).await;
+        let sha = "b".repeat(40);
+
+        // Git source wired to the app with build config for the tracked branch.
+        let source_id = Uuid::now_v7();
+        sqlx::query("INSERT INTO git_sources (id, name, provider, config, enabled) VALUES ($1,$2,$3,$4,true)")
+            .bind(source_id)
+            .bind("acme")
+            .bind("github")
+            .bind(serde_json::json!({
+                "webhook_secret": "topsecret",
+                "application_id": app_id.to_string(),
+                "repo_url": "https://github.com/acme/app.git",
+                "build": { "builder": "dockerfile", "image_name": "acme/app", "branch": "main" }
+            }))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // A push to main with a real commit SHA.
+        let body = format!(
+            r#"{{"ref":"refs/heads/main","after":"{sha}","repository":{{"full_name":"acme/app"}}}}"#
+        );
+        let body = body.into_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sig = github_sig("topsecret", &body);
+
+        let res = svc
+            .handle_git_webhook(source_id, "github", Some(&sig), &body, payload)
+            .await
+            .unwrap();
+
+        // The webhook created a BUILD (not a preview deployment).
+        let build_id = res
+            .get("created_build_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .expect("push should create a build");
+        let build = svc.get_build(build_id).await.unwrap().unwrap();
+        assert_eq!(build.application_id, app_id);
+        assert_eq!(build.commit_sha, sha);
+        assert_eq!(build.image.as_deref(), Some("acme/app:bbbbbbbbbbbb"));
+
+        // Mock the agent: it ran the build and reported success with an image + digest.
+        // The WS layer would call record_build_result then create+dispatch a deployment;
+        // here we drive those service calls directly (dispatch is mocked away).
+        let digest = format!("sha256:{}", "d".repeat(64));
+        let provenance = serde_json::json!({
+            "predicate_type": forge_core::supplychain::FORGE_PREDICATE_TYPE,
+            "builder_id": forge_core::supplychain::FORGE_BUILDER_ID,
+            "source_commit": sha,
+            "image_digest": digest,
+        });
+        let updated = svc
+            .record_build_result(
+                build_id,
+                true,
+                Some("acme/app:bbbbbbbbbbbb"),
+                Some(&digest),
+                true,
+                Some(&provenance),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, "succeeded");
+        assert_eq!(updated.image_digest.as_deref(), Some(digest.as_str()));
+        // Phase C: signing + provenance persisted on the build record.
+        assert!(updated.signed, "build should be recorded as signed");
+        assert_eq!(
+            updated
+                .provenance
+                .as_ref()
+                .and_then(|p| p.get("builder_id")),
+            Some(&serde_json::json!(
+                forge_core::supplychain::FORGE_BUILDER_ID
+            ))
+        );
+
+        // On success → a deployment is created from the produced image, then linked.
+        let deployment = svc
+            .create_deployment(
+                updated.application_id,
+                serde_json::json!({"containers":[{"name":"app","image":"acme/app:bbbbbbbbbbbb"}]}),
+                forge_core::DeploymentStrategy::Rolling(forge_core::RollingConfig {
+                    max_unavailable: 0,
+                    max_surge: 1,
+                    health_check_grace_period_secs: 10,
+                    rollback_on_failure: true,
+                    failure_threshold: 2,
+                }),
+                vec![],
+            )
+            .await
+            .unwrap();
+        svc.link_build_deployment(build_id, deployment.id)
+            .await
+            .unwrap();
+        svc.set_deployment_git_metadata(deployment.id, Some(source_id), Some(&sha), Some("main"))
+            .await
+            .unwrap();
+
+        // Audit chain: build → deployment, with commit provenance on the deployment.
+        let linked = svc.get_build(build_id).await.unwrap().unwrap();
+        assert_eq!(linked.deployment_id, Some(deployment.id));
+        let dep_commit: Option<String> = sqlx::query_scalar!(
+            "SELECT commit_sha FROM deployments WHERE id = $1",
+            deployment.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(dep_commit.as_deref(), Some(sha.as_str()));
+
+        // Phase C: the verifiable supply-chain audit row (principal → commit → digest → deploy)
+        // is written and queryable.
+        svc.write_supply_chain_audit(
+            None,
+            build_id,
+            &sha,
+            Some(&digest),
+            Some(deployment.id),
+            true,
+            "build_signed_and_deployed",
+        )
+        .await
+        .unwrap();
+        let audit_after: serde_json::Value = sqlx::query_scalar!(
+            r#"SELECT after as "after!" FROM audit_logs
+               WHERE action = 'supplychain:build_attested' AND resource_id = $1"#,
+            build_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit_after["commit_sha"], serde_json::json!(sha));
+        assert_eq!(audit_after["image_digest"], serde_json::json!(digest));
+        assert_eq!(
+            audit_after["deployment_id"],
+            serde_json::json!(deployment.id)
+        );
+        assert_eq!(audit_after["signed"], serde_json::json!(true));
+    }
+
+    #[sqlx::test]
+    async fn failed_build_records_error_and_does_not_deploy(pool: PgPool) {
+        let svc = svc_with(pool.clone());
+        let app_id = seed_app(&svc).await;
+        let sha = "c".repeat(40);
+
+        let build = svc
+            .create_build(
+                app_id,
+                None,
+                &sha,
+                Some("main"),
+                "dockerfile",
+                "app:c",
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Agent reports failure → status failed, error recorded, NO image, NO deployment.
+        let updated = svc
+            .record_build_result(
+                build.id,
+                false,
+                None,
+                None,
+                false,
+                None,
+                Some("docker build returned non-zero"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, "failed");
+        assert!(updated.error.as_deref().unwrap().contains("non-zero"));
+        assert_eq!(updated.deployment_id, None);
+
+        // Fail-closed: no deployment was created for this application.
+        let deps: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) as \"c!\" FROM deployments WHERE application_id = $1",
+            app_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(deps, 0, "a failed build must never create a deployment");
+    }
+
+    #[sqlx::test]
+    async fn webhook_push_to_untracked_branch_does_not_build(pool: PgPool) {
+        let svc = svc_with(pool.clone());
+        let app_id = seed_app(&svc).await;
+        let sha = "d".repeat(40);
+
+        let source_id = Uuid::now_v7();
+        sqlx::query("INSERT INTO git_sources (id, name, provider, config, enabled) VALUES ($1,$2,$3,$4,true)")
+            .bind(source_id)
+            .bind("acme")
+            .bind("github")
+            .bind(serde_json::json!({
+                "webhook_secret": "topsecret",
+                "application_id": app_id.to_string(),
+                "repo_url": "https://github.com/acme/app.git",
+                "build": { "builder": "dockerfile", "image_name": "acme/app", "branch": "main" }
+            }))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Push to a DIFFERENT branch → must not create a build.
+        let body = format!(
+            r#"{{"ref":"refs/heads/dev","after":"{sha}","repository":{{"full_name":"acme/app"}}}}"#
+        )
+        .into_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sig = github_sig("topsecret", &body);
+
+        let res = svc
+            .handle_git_webhook(source_id, "github", Some(&sig), &body, payload)
+            .await
+            .unwrap();
+        assert!(
+            res.get("created_build_id").is_none(),
+            "push to an untracked branch must not create a build"
+        );
+    }
+
+    /// Insert an enabled age-v1 secret scoped to `app` (or global when `app` is `None`).
+    /// The payload is opaque to resolution — `get_build_secret_ref` only checks the version
+    /// tag and deserializes the envelope — so a synthetic envelope is sufficient here.
+    async fn seed_secret(pool: &PgPool, name: &str, app: Option<Uuid>, marker: &str) {
+        let envelope = serde_json::json!({
+            "version": forge_agent::job::SecretCiphertext::VERSION_AGE_V1,
+            "recipient": "age1examplerecipient",
+            "payload": marker, // stand-in for armored ciphertext; opaque to resolution
+        });
+        sqlx::query(
+            "INSERT INTO secrets (id, name, application_id, encrypted_blob, enabled, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,true,NOW(),NOW())",
+        )
+        .bind(Uuid::now_v7())
+        .bind(name)
+        .bind(app)
+        .bind(envelope)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn build_secret_resolution_is_application_scoped(pool: PgPool) {
+        // IDOR / cross-tenant secret access (A01). Two applications each own a secret of the
+        // SAME name. A build for app A must resolve A's secret and must NEVER see B's, and an
+        // out-of-scope-only name must fail closed (None → caller rejects 400).
+        let svc = svc_with(pool.clone());
+        let app_a = svc
+            .create_application("app-a", None, None)
+            .await
+            .unwrap()
+            .id;
+        let app_b = svc
+            .create_application("app-b", None, None)
+            .await
+            .unwrap()
+            .id;
+
+        seed_secret(&pool, "DB_PASSWORD", Some(app_a), "secret-of-A").await;
+        seed_secret(&pool, "DB_PASSWORD", Some(app_b), "secret-of-B").await;
+        // A secret that exists ONLY for app B (no global, no app-A copy).
+        seed_secret(&pool, "B_ONLY", Some(app_b), "B-only-value").await;
+        // An explicitly instance-global secret, shareable by design.
+        seed_secret(&pool, "SHARED", None, "global-value").await;
+
+        // In scope: app A resolves ITS OWN same-named secret, never app B's.
+        let a = svc
+            .get_build_secret_ref("DB_PASSWORD", app_a)
+            .await
+            .unwrap()
+            .expect("app A's own secret must resolve");
+        assert_eq!(a.payload, "secret-of-A");
+
+        let b = svc
+            .get_build_secret_ref("DB_PASSWORD", app_b)
+            .await
+            .unwrap()
+            .expect("app B's own secret must resolve");
+        assert_eq!(b.payload, "secret-of-B");
+
+        // Cross-tenant IDOR: app A requesting a name that exists only for app B must FAIL CLOSED.
+        let leaked = svc.get_build_secret_ref("B_ONLY", app_a).await.unwrap();
+        assert!(
+            leaked.is_none(),
+            "app A must NOT resolve a secret owned solely by app B (cross-tenant IDOR)"
+        );
+
+        // Explicitly-global secrets remain shareable across applications.
+        let shared = svc
+            .get_build_secret_ref("SHARED", app_a)
+            .await
+            .unwrap()
+            .expect("global secret must resolve for any application");
+        assert_eq!(shared.payload, "global-value");
+
+        // Unknown name resolves for nobody.
+        assert!(
+            svc.get_build_secret_ref("NOPE", app_a)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
 mod rollback_tests {
     //! Phase 2 rollback fix — integration tests against real Postgres (`#[sqlx::test]`
     //! provisions an isolated DB and runs `./migrations`). These prove `previous_spec`
@@ -2995,5 +4941,476 @@ mod rollback_tests {
             v2.rollout_state.get("phase").is_some(),
             "heartbeat source returns real rollout_state"
         );
+    }
+}
+
+#[cfg(test)]
+mod per_principal_rbac_tests {
+    //! A01 per-action RBAC — proves that an issued admin token (a real principal) is
+    //! constrained by its roles on mutating service paths, while the bootstrap path
+    //! (`principal_id = None`) is unconstrained. Integration tests against real Postgres.
+    use super::*;
+    use crate::rbac::RbacService;
+    use serde_json::json;
+    use sqlx::PgPool;
+    use std::sync::Arc;
+
+    fn svc_with(pool: PgPool) -> (DeploymentService, Arc<RbacService>) {
+        let rbac = Arc::new(RbacService::new(pool.clone()));
+        (DeploymentService::new(pool, rbac.clone()), rbac)
+    }
+
+    /// Create a principal holding exactly `perms` and return its id.
+    async fn principal_holding(rbac: &RbacService, perms: serde_json::Value) -> Uuid {
+        let p = rbac.create_principal("op", "user", None).await.unwrap();
+        let role = rbac.create_role("scoped", None, perms, None).await.unwrap();
+        rbac.assign_role(p.id, role.id, None).await.unwrap();
+        p.id
+    }
+
+    // --- enforce_action: the gate every handler calls ---
+
+    #[sqlx::test]
+    async fn enforce_action_denies_principal_without_grant(pool: PgPool) {
+        let (svc, rbac) = svc_with(pool);
+        let pid = principal_holding(&rbac, json!({"deployments:read": true})).await;
+
+        // Lacks cloud:provision → Forbidden.
+        let err = svc
+            .enforce_action(Some(pid), "cloud:provision")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DeploymentError::Forbidden));
+
+        // Lacks deployments:write → Forbidden.
+        let err = svc
+            .enforce_action(Some(pid), "deployments:write")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DeploymentError::Forbidden));
+
+        // Lacks secrets:use → Forbidden.
+        let err = svc
+            .enforce_action(Some(pid), "secrets:use")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DeploymentError::Forbidden));
+    }
+
+    #[sqlx::test]
+    async fn enforce_action_allows_bootstrap_none(pool: PgPool) {
+        let (svc, _rbac) = svc_with(pool);
+        // None = bootstrap superuser → allowed for any action.
+        svc.enforce_action(None, "cloud:provision").await.unwrap();
+        svc.enforce_action(None, "deployments:write").await.unwrap();
+        svc.enforce_action(None, "secrets:use").await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn enforce_action_allows_principal_with_grant(pool: PgPool) {
+        let (svc, rbac) = svc_with(pool);
+        // Wildcard namespace grant covers cloud:provision; exact grants for the rest.
+        let pid = principal_holding(
+            &rbac,
+            json!({"cloud:*": true, "deployments:write": true, "secrets:use": true}),
+        )
+        .await;
+
+        svc.enforce_action(Some(pid), "cloud:provision")
+            .await
+            .unwrap();
+        svc.enforce_action(Some(pid), "deployments:write")
+            .await
+            .unwrap();
+        svc.enforce_action(Some(pid), "secrets:use").await.unwrap();
+    }
+
+    // --- create_application: enforces applications:create inside the service ---
+
+    #[sqlx::test]
+    async fn create_application_rejects_principal_without_permission(pool: PgPool) {
+        let (svc, rbac) = svc_with(pool);
+        let pid = principal_holding(&rbac, json!({"deployments:read": true})).await;
+
+        let err = svc
+            .create_application("app", None, Some(pid))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DeploymentError::Forbidden),
+            "principal without applications:create is rejected"
+        );
+    }
+
+    #[sqlx::test]
+    async fn create_application_allows_bootstrap_and_granted_principal(pool: PgPool) {
+        let (svc, rbac) = svc_with(pool);
+
+        // Bootstrap (None) is allowed.
+        svc.create_application("boot-app", None, None)
+            .await
+            .unwrap();
+
+        // A principal holding applications:create is allowed.
+        let pid = principal_holding(&rbac, json!({"applications:create": true})).await;
+        let app = svc
+            .create_application("op-app", None, Some(pid))
+            .await
+            .unwrap();
+        assert_eq!(app.created_by_principal_id, Some(pid), "audit attribution");
+    }
+
+    // --- create_build: enforces builds:create inside the service ---
+
+    #[sqlx::test]
+    async fn create_build_rejects_principal_without_permission(pool: PgPool) {
+        let (svc, rbac) = svc_with(pool);
+        // Seed an application as bootstrap so the build has a valid anchor.
+        let app = svc.create_application("b-app", None, None).await.unwrap();
+        let pid = principal_holding(&rbac, json!({"deployments:read": true})).await;
+
+        let sha = "a".repeat(40);
+        let err = svc
+            .create_build(app.id, None, &sha, None, "dockerfile", "img:tag", Some(pid))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DeploymentError::Forbidden),
+            "principal without builds:create is rejected before any DB write"
+        );
+    }
+
+    #[sqlx::test]
+    async fn create_build_allows_granted_principal(pool: PgPool) {
+        let (svc, rbac) = svc_with(pool);
+        let app = svc.create_application("b-app2", None, None).await.unwrap();
+        let pid = principal_holding(&rbac, json!({"builds:create": true})).await;
+
+        let sha = "b".repeat(40);
+        let record = svc
+            .create_build(app.id, None, &sha, None, "dockerfile", "img:tag", Some(pid))
+            .await
+            .unwrap();
+        assert_eq!(record.created_by_principal_id, Some(pid));
+    }
+}
+
+#[cfg(test)]
+mod notification_delivery_tests {
+    //! Service-layer notification delivery tests (`#[sqlx::test]` → isolated DB +
+    //! `./migrations`). Cover the SSRF create-time gate, the audit-row lifecycle for
+    //! enabled-but-unreachable channels, and the explicit `skipped` path for an
+    //! unconfigured email channel. The actual HTTP egress shape/HMAC is covered by the
+    //! wiremock tests in the `notify` module.
+    use super::*;
+    use sqlx::PgPool;
+
+    fn svc_with(pool: PgPool) -> DeploymentService {
+        let rbac = std::sync::Arc::new(crate::rbac::RbacService::new(pool.clone()));
+        DeploymentService::new(pool, rbac)
+    }
+
+    #[sqlx::test]
+    async fn create_channel_rejects_ssrf_urls_at_creation(pool: PgPool) {
+        let svc = svc_with(pool);
+
+        for url in [
+            "https://127.0.0.1/hook",
+            "https://169.254.169.254/latest/meta-data", // cloud metadata
+            "https://10.1.2.3/hook",
+            "http://example.com/hook", // not https
+        ] {
+            let err = svc
+                .create_notification_channel("ssrf", "discord", serde_json::json!({ "url": url }))
+                .await
+                .expect_err(&format!("expected {url} rejected"));
+            assert!(matches!(err, DeploymentError::InvalidInput(_)), "{url}");
+        }
+
+        // A public https URL is accepted.
+        let ok = svc
+            .create_notification_channel(
+                "good",
+                "discord",
+                serde_json::json!({ "url": "https://discord.com/api/webhooks/x/y" }),
+            )
+            .await;
+        assert!(ok.is_ok(), "{ok:?}");
+    }
+
+    #[sqlx::test]
+    async fn trigger_writes_delivery_row_and_finalizes_failed_for_blocked_at_send(pool: PgPool) {
+        let svc = svc_with(pool.clone());
+
+        // Create the channel via a public host so the create-time gate passes, then
+        // re-point its stored config at a loopback host directly in the DB to simulate a
+        // DNS-rebinding / config-tamper scenario. At SEND time the runtime SSRF guard
+        // must catch it: the delivery row is written and finalized to 'failed' (a
+        // blocked host), never left 'pending' and never a fake 'sent'.
+        let chan = svc
+            .create_notification_channel(
+                "discord-rebind",
+                "discord",
+                serde_json::json!({ "url": "https://discord.com/api/webhooks/x/y" }),
+            )
+            .await
+            .unwrap();
+        let channel_id = Uuid::parse_str(chan["id"].as_str().unwrap()).unwrap();
+
+        // Tamper the stored config to point at loopback (bypassing the create-time gate).
+        sqlx::query!(
+            "UPDATE notification_channels SET config = $1 WHERE id = $2",
+            serde_json::json!({ "url": "https://127.0.0.1/webhook" }),
+            channel_id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Subscribe the system scope to all events on this channel.
+        svc.create_notification_subscription(
+            "system",
+            None,
+            channel_id,
+            serde_json::json!(["*"]),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        let enqueued = svc
+            .trigger_notifications(
+                "deploy.failed",
+                "system",
+                None,
+                serde_json::json!({"k":"v"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(enqueued, 1);
+
+        // The spawned delivery task must finalize the row off 'pending'. Poll briefly.
+        let mut finalized: Option<(String, Option<String>)> = None;
+        for _ in 0..40 {
+            let row = sqlx::query!(
+                "SELECT status, error FROM notification_deliveries WHERE channel_id = $1 ORDER BY created_at DESC LIMIT 1",
+                channel_id
+            )
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            if let Some(r) = row {
+                if r.status != "pending" {
+                    finalized = Some((r.status, r.error));
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, error) = finalized.expect("delivery row never finalized");
+        assert_eq!(status, "failed");
+        assert!(
+            error.as_deref().unwrap_or("").contains("not allowed"),
+            "expected blocked-host error, got {error:?}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn unconfigured_email_channel_is_skipped(pool: PgPool) {
+        let svc = svc_with(pool.clone());
+
+        // Email channel with no SMTP host/from/to → valid to create, skipped to send.
+        let chan = svc
+            .create_notification_channel("email-unset", "email", serde_json::json!({}))
+            .await
+            .unwrap();
+        let channel_id = Uuid::parse_str(chan["id"].as_str().unwrap()).unwrap();
+
+        svc.create_notification_subscription(
+            "system",
+            None,
+            channel_id,
+            serde_json::json!(["*"]),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        svc.trigger_notifications("deploy.healthy", "system", None, serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut status: Option<String> = None;
+        for _ in 0..20 {
+            let row = sqlx::query!(
+                "SELECT status, error FROM notification_deliveries WHERE channel_id = $1 ORDER BY created_at DESC LIMIT 1",
+                channel_id
+            )
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            if let Some(r) = row {
+                if r.status != "pending" {
+                    assert_eq!(r.error.as_deref(), Some("smtp not configured"));
+                    status = Some(r.status);
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(status.as_deref(), Some("skipped"));
+    }
+}
+
+#[cfg(test)]
+mod backup_restore_tests {
+    //! Data tranche: catalog serde, S3-secret resolution from the age store (never plaintext),
+    //! and restore-source resolution. DB tests use `#[sqlx::test]` (isolated DB + migrations).
+    use super::*;
+    use std::sync::Arc;
+
+    fn svc(pool: PgPool) -> DeploymentService {
+        let rbac = Arc::new(crate::rbac::RbacService::new(pool.clone()));
+        DeploymentService::new(pool, rbac)
+    }
+
+    #[test]
+    fn catalog_breadth_templates_are_present_and_serde_round_trip() {
+        let catalog = DeploymentService::load_catalog();
+        // The breadth additions are all present.
+        for id in [
+            "ghost",
+            "n8n",
+            "plausible",
+            "uptime-kuma",
+            "metabase",
+            "vaultwarden",
+            "gitea",
+            "nextcloud",
+            "supabase",
+            "postgres",
+            "redis",
+            "minio",
+        ] {
+            assert!(catalog.iter().any(|t| t.id == id), "catalog missing {id}");
+        }
+        // Every template (de)serializes losslessly through JSON.
+        for t in &catalog {
+            let json = serde_json::to_string(t).unwrap();
+            let back: CatalogTemplate = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.id, t.id);
+            assert!(
+                back.spec.get("containers").is_some(),
+                "{} has no containers",
+                t.id
+            );
+        }
+    }
+
+    #[test]
+    fn generated_secret_vars_carry_no_hardcoded_value() {
+        let catalog = DeploymentService::load_catalog();
+        let ghost = catalog.iter().find(|t| t.id == "ghost").unwrap();
+        let pw = ghost
+            .variables
+            .iter()
+            .find(|v| v.name == "GHOST_DB_PASSWORD")
+            .unwrap();
+        // The credential is a generated secret with an EMPTY default (never hardcoded).
+        assert!(pw.secret && pw.generate, "must be a generated secret");
+        assert!(
+            pw.default.is_empty(),
+            "generated secret must not ship a default value"
+        );
+    }
+
+    #[sqlx::test]
+    async fn secret_ref_resolves_age_envelope_without_plaintext(pool: PgPool) {
+        let svc = svc(pool.clone());
+
+        // Enroll an agent recipient so create_secret produces a real age envelope.
+        let id = age::x25519::Identity::generate();
+        let recipient = id.to_public().to_string();
+        let agent_id = Uuid::now_v7();
+        sqlx::query!(
+            "INSERT INTO agents (id, hostname, public_key, age_recipient) VALUES ($1, 'a', $2, $3)",
+            agent_id,
+            agent_id.as_bytes().to_vec(),
+            recipient
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let created = svc
+            .create_secret("s3-key", None, "SUPERSECRETKEY")
+            .await
+            .unwrap();
+        let secret_id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+
+        let sref = svc
+            .secret_ref_for(secret_id, "s3_secret_key", "S3_SECRET_KEY")
+            .await
+            .unwrap()
+            .expect("secret ref should resolve");
+
+        // The SecretRef carries the age envelope, never the plaintext.
+        assert_eq!(sref.name, "s3_secret_key");
+        let wire = serde_json::to_string(&sref).unwrap();
+        assert!(
+            !wire.contains("SUPERSECRETKEY"),
+            "plaintext must never appear in the SecretRef wire form"
+        );
+        // And it really is the same secret — the enrolled agent identity can decrypt it.
+        let recovered = forge_agent::job::decrypt_secret(&sref.ciphertext, &id).unwrap();
+        assert_eq!(recovered, b"SUPERSECRETKEY");
+    }
+
+    #[sqlx::test]
+    async fn create_schedule_rejects_non_https_s3_endpoint(pool: PgPool) {
+        let svc = svc(pool.clone());
+        let app = svc.create_application("ep-app", None, None).await.unwrap();
+        let dep = svc
+            .create_deployment(
+                app.id,
+                serde_json::json!({ "containers": [{ "name": "db", "image": "postgres:16" }] }),
+                forge_core::DeploymentStrategy::default(),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let err = svc
+            .create_backup_schedule(
+                dep.id,
+                "bad",
+                "postgres",
+                None,
+                "interval",
+                "3600",
+                30,
+                None,
+                Some("http://insecure.example"), // not https
+                Some("bucket"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DeploymentError::InvalidInput(_)));
+    }
+
+    #[sqlx::test]
+    async fn restore_source_extracts_key_from_s3_location(pool: PgPool) {
+        let svc = svc(pool.clone());
+        // s3://bucket/prefix/dump.sql → key is "prefix/dump.sql"
+        let source = svc
+            .resolve_restore_source(None, "postgres", "s3://mybucket/nightly/backup-1.sql")
+            .await
+            .unwrap();
+        assert_eq!(source.s3_key, "nightly/backup-1.sql");
     }
 }

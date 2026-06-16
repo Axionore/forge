@@ -4,6 +4,7 @@
 //!
 //! This is the primary security boundary of the Forge platform.
 
+pub mod build;
 pub mod config;
 pub mod error;
 pub mod execution;
@@ -11,6 +12,8 @@ pub mod health;
 pub mod identity;
 pub mod job;
 pub mod receiver;
+pub mod s3;
+pub mod supplychain;
 pub mod verification;
 pub mod wireguard;
 

@@ -40,9 +40,23 @@ reqwest = { workspace = true, features = ["stream"] }
 sha2 = "0.10"
 tokio-util = { version = "0.7", features = ["io"] }
 
+# AWS SigV4 signing for S3-compatible backup upload / restore download (HMAC-SHA256).
+# Already transitive via the TLS/crypto stack; promoted to direct deps so the signer is auditable.
+hmac = "0.12"
+hex = "0.4"
+
 # Docker support
 bollard = { workspace = true, optional = true }
 futures-util = "0.3"
+
+# Build executor (Phase B source-to-deploy): secure temp dirs + bounded context walk + compose YAML
+tempfile = { workspace = true }
+walkdir = { workspace = true }
+serde_yaml_ng = { workspace = true }
+
+# Strict, structural validation of user-supplied git remote URLs (scheme allowlist). Already a
+# transitive dep (reqwest); promoted to a direct dep so the parse is auditable here.
+url = "2.5"
 
 # Real control plane communication
 tokio-tungstenite = { version = "0.23", features = ["rustls-tls-native-roots"] }
@@ -60,6 +74,6 @@ defguard_wireguard_rs = { version = "0.4", optional = true }
 # defguard_wireguard_rs = { workspace = true, optional = true }
 
 [features]
-default = []
+default = ["docker"]
 docker = ["dep:bollard"]
 wireguard = ["dep:defguard_wireguard_rs"]

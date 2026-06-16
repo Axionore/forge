@@ -31,6 +31,13 @@ pub trait JobReceiver: Send + Sync {
     ///
     /// Default implementation is a no-op (used by mocks and testing receivers).
     async fn report_result(&self, _result: crate::job::JobResult) {}
+
+    /// Outbound channel for streaming messages (e.g. build/exec log output) to the control
+    /// plane. `None` for receivers that cannot stream (mocks). Used by the build executor to
+    /// forward redacted build-log lines as `ExecOutput` frames.
+    fn outbound_sender(&self) -> Option<mpsc::Sender<AgentMessage>> {
+        None
+    }
 }
 
 /// A simple in-memory receiver used for development and testing.
@@ -334,5 +341,9 @@ impl JobReceiver for ControlPlaneJobReceiver {
     async fn report_result(&self, result: crate::job::JobResult) {
         let msg = AgentMessage::JobResult { result };
         let _ = self.out_tx.send(msg).await;
+    }
+
+    fn outbound_sender(&self) -> Option<mpsc::Sender<AgentMessage>> {
+        Some(self.out_tx.clone())
     }
 }

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO agents (id, hostname, public_key) VALUES ($1, 'test', $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6ac1889f173fddf4d03b751a30dd5bfe14f92872f26fede467e9145ae5efb411"
+}

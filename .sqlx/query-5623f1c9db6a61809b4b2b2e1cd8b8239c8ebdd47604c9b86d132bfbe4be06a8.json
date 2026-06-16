@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE alert_events SET last_notified_at = $2, observed_value = $3 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5623f1c9db6a61809b4b2b2e1cd8b8239c8ebdd47604c9b86d132bfbe4be06a8"
+}

@@ -84,6 +84,23 @@ fi
 
 log "Binary installed to $INSTALL_DIR/forge-agent"
 
+# Supply-chain prerequisite check (Phase C). When a supply-chain policy of `sign` or
+# `sign-and-require-verify` is in effect, the agent shells out to the `cosign` binary to sign
+# built images by digest and to verify image signatures + SLSA provenance BEFORE running a
+# Forge-built image (fail-closed). cosign is therefore a prerequisite on any agent that builds
+# or runs signed images. We warn (not fail) here so docker-only nodes that never build/verify
+# still install cleanly; the agent itself fails closed at runtime if the policy requires cosign
+# and it is absent.
+if ! command -v cosign >/dev/null 2>&1; then
+  log "NOTE: 'cosign' not found on PATH. It is REQUIRED when the supply-chain policy is 'sign' or"
+  log "      'sign-and-require-verify' (signing built images + verify-before-run). Install it:"
+  log "        https://docs.sigstore.dev/cosign/installation"
+  log "      Also set FORGE_COSIGN_KEY (signing) and FORGE_COSIGN_PUBLIC_KEY (verify) in the agent env."
+else
+  log "cosign detected ($(command -v cosign)) — supply-chain signing/verification available."
+fi
+# Note: 'nixpacks' and 'docker'/'docker compose' remain prerequisites for those build strategies.
+
 # Create config directory with secure perms
 sudo mkdir -p "$CONFIG_DIR"
 sudo chmod 700 "$CONFIG_DIR"

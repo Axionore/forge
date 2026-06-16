@@ -1,0 +1,112 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, deployment_id, db_type, database_name, schedule_type, schedule_value,\n                   retention_days, retention_count,\n                   s3_endpoint, s3_bucket, s3_key_prefix, s3_region, s3_access_key_id,\n                   s3_secret_id, target_container, last_run_at\n            FROM backup_schedules\n            WHERE enabled = true\n            ORDER BY created_at\n            LIMIT $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "deployment_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "db_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "database_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "schedule_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "schedule_value",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "retention_days",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "retention_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "s3_endpoint",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "s3_bucket",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "s3_key_prefix",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "s3_region",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "s3_access_key_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "s3_secret_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 14,
+        "name": "target_container",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "last_run_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "49b4a8b1c7bfd1ceb65c6f0e8f9dffce94b2d5d757876cbc7f3ff069abc04142"
+}

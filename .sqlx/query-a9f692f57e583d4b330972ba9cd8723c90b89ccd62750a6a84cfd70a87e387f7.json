@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO restore_executions\n                (id, deployment_id, source_execution_id, status, db_type, target_container,\n                 location, requested_by_principal_id, started_at, created_at)\n            VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $8)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a9f692f57e583d4b330972ba9cd8723c90b89ccd62750a6a84cfd70a87e387f7"
+}

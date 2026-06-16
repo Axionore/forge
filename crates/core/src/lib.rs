@@ -5,6 +5,8 @@
 
 pub mod deployment;
 pub mod spec;
+pub mod supplychain;
 
 pub use deployment::*;
 pub use spec::*;
+pub use supplychain::*;

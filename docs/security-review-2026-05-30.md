@@ -14,8 +14,15 @@ pre-existing (not introduced by the rollback change) but must be fixed before an
 
 > **Update 2026-05-30 — all three 🔴 findings RESOLVED.** See the per-finding "Resolved" notes
 > below. Verified: `cargo clippy --all-targets --workspace -- -D warnings` clean and
-> `cargo test --workspace` green (forge-api suite: rbac 4 + rollback 4 + webhook 7 + enrollment 2 =
-> 17 tests, plus forge-agent 4 — 0 failures). The 🟠 A01 per-action RBAC item remains open.
+> `cargo test --workspace` green.
+>
+> **Update 2026-06-02 — 🟠 A01 per-action RBAC RESOLVED.** The authenticated principal now flows
+> from the auth layer into every per-action check; issued admin tokens are constrained by their
+> roles and only the bootstrap `FORGE_ADMIN_TOKEN` is unrestricted. Verified:
+> `cargo clippy --all-targets --workspace -- -D warnings` clean and `cargo test --workspace` green
+> (126 tests; forge-api lib+bin includes the new rbac `db_tests` (3) and deployment
+> `per_principal_rbac_tests` (7)). Mutation-checked (making `enforce` fail-open makes 3 deny-path
+> tests fail). See the resolved sections below.
 
 ---
 
@@ -90,19 +97,102 @@ check against real Postgres.
 
 ---
 
-## 🟠 A01 — No per-action authorization (coarse single admin gate)
+## ✅🟠 A01 — No per-action authorization (coarse single admin gate) — RESOLVED
 
-All `/admin/*` routes sit behind one `require_admin_auth` middleware
-(`main.rs:388-391`, constant-time check at `main.rs:563` ✅). But there is **no per-action RBAC**:
-`RbacService::principal_can` / `action_allowed` (`rbac.rs:410-448`) exist and are **never called**
-from handlers. Any holder of any admin token can rollback/promote/redeploy/delete **any** deployment
-(no ownership/tenant scoping). Acceptable only for a single-operator deployment; a production
-multi-user posture needs least-privilege.
+All `/admin/*` routes sit behind one `require_admin_auth` middleware (constant-time bootstrap
+check ✅). The per-action engine (`RbacService::principal_can` / `action_allowed`) existed but
+handlers either never called it or — worse — called `enforce_action(None, …)` with a **hardcoded
+`None`** (`require_cloud_provision`, `create_hetzner_server`, and the deployment/build/secret
+gates). `None` is the bootstrap-superuser sentinel, so per-action RBAC was a **no-op for every
+issued admin-token holder** (a HIGH fail-open: an operator token scoped to read-only could
+provision cloud infra, rotate secrets, rollback/promote/redeploy any deployment — CWE-636).
 
-**Fix (post-0016):** thread `RbacService` into the deployment handlers and gate state-changing
-actions (`deployments:write`, etc.) via `action_allowed`; default-deny. (Note: `DeploymentService::new`
-currently takes only `pool` while `main.rs:196` tries to pass an rbac service — part of the 0016
-breakage to reconcile.)
+**✅ Resolved (2026-06-02).** The authenticated principal now flows from the auth layer into every
+per-action check:
+
+1. **Auth resolves the principal.** `require_admin_auth` first constant-time-compares the presented
+   `X-Admin-Token` against the bootstrap `FORGE_ADMIN_TOKEN` → principal `None` (unconstrained
+   superuser). Otherwise it SHA-256 hashes the token and looks it up via
+   `RbacService::lookup_principal_for_token`, which returns the `principal_id` only when the row
+   exists, is **not revoked, and is not expired** — else a single enumeration-resistant `401`. Any
+   DB/RBAC error fails closed (deny). The resolved `AuthPrincipal(Option<Uuid>)` is inserted into
+   request extensions.
+2. **Extractor.** `AuthPrincipal` implements `FromRequestParts`, reading the value from extensions;
+   its absence (route reached without the middleware) fails closed to `401`.
+3. **Enforcement with the real principal.** Every in-scope mutation now passes
+   `principal.principal_id()` (never a hardcoded `None`): deployment create / rollback / promote /
+   redeploy / preview-promote / preview-destroy / catalog-deploy (`deployments:write`); build
+   trigger (`builds:create`, plus `secrets:use` when embedding named secrets); cloud provision —
+   server/firewall/network/volume/load-balancer/ip/dns, resource list+delete, and the legacy
+   Hetzner batch (`cloud:provision`); secret create / rotate / delete and SSH-key generate
+   (`secrets:use`); application create (`applications:create`) and service create
+   (`services:create`). Semantics: bootstrap `None` → allowed; a real principal → must hold the
+   action via `action_allowed` (default-deny, fail-closed).
+4. **Bootstrap is the only `None`.** Audited: no handler passes a hardcoded `None` to
+   `enforce_action`/the provisioning `principal_id` argument; the sole `None` is the genuine
+   bootstrap path produced by the constant-time match in `require_admin_auth`.
+
+A new `POST /admin/principals/{id}/roles` grant endpoint (`RbacService::assign_role`) makes the
+model usable — without it an issued token's principal would hold no roles and be denied everything.
+
+Tests: `rbac::db_tests` (`#[sqlx::test]`) prove a valid token resolves to its principal while
+unknown / revoked / expired tokens resolve to nobody, and `principal_can` is default-deny through
+real roles. `deployment::per_principal_rbac_tests` (`#[sqlx::test]`) prove a principal **without**
+`cloud:provision` / `deployments:write` / `secrets:use` (and `applications:create` /
+`builds:create`) is rejected `Forbidden` on the corresponding mutation, the bootstrap path (`None`)
+is allowed, and a principal holding the grant is allowed. Mutation-checked: making `enforce`
+fail-open (`Ok(_) => Ok(())`) makes the three deny-path tests fail; reverted. No migration was
+required (the 0015 RBAC schema already carries `admin_tokens.principal_id` + `expires_at` +
+`revoked_at`); `.sqlx` regenerated for the new queries.
+
+## ✅🔴 A01 — IDOR / cross-tenant build-secret access (source-to-deploy) — RESOLVED
+
+`trigger_build` (`main.rs`) resolved build secrets by NAME only
+(`get_build_secret_ref(name)`), so a build for application A could reference ANY secret in the
+instance by name — cross-application/cross-tenant disclosure of an age-encrypted secret into a
+`BuildSpec`.
+
+**✅ Resolved (2026-06-02).** Secret resolution is now application-scoped. The `secrets` table
+already carries `application_id` (migration 0013, nullable), so the scoping model is:
+_a secret resolves for a build iff it is owned by the build's application (`application_id = $app`)
+or is an explicitly instance-global secret (`application_id IS NULL`)_; an app-owned secret wins
+over a same-named global one (`ORDER BY application_id NULLS LAST`). `get_build_secret_ref` now
+takes `application_id` and filters `WHERE name=$1 AND enabled=true AND (application_id=$2 OR
+application_id IS NULL)`. `trigger_build` passes the build's `app_id`; a requested name that does
+not resolve in scope is rejected (`400 unknown build secret`) — fail closed, never silently
+skipped. Embedding any secret into a `BuildSpec` is additionally gated on the `secrets:use`
+per-action RBAC permission via `enforce_action` (default-deny; `None` principal = authenticated
+bootstrap admin, consistent with `create_build`). No new migration was required.
+Test: `deployment::build_pipeline_tests::build_secret_resolution_is_application_scoped`
+(`#[sqlx::test]`) proves app A cannot resolve app B's same-named or B-only secret, that an
+in-scope secret and an explicitly-global secret both resolve, and that unknown names resolve for
+nobody. Mutation-checked (dropping the `application_id` filter makes the test fail).
+
+## ✅🔴 A05/EoP — git remote-helper / argument-injection smuggling at clone time — RESOLVED
+
+`is_safe_git_token` (`crates/agent/src/build.rs`) was a metacharacter _blocklist_. A URL such as
+`ext::sh -c <cmd>` (a git remote helper) or `transport::`/`file://` transport tricks could smuggle
+command execution at clone time — the Coolify Jan-2026 RCE class — without tripping any blocked
+character.
+
+**✅ Resolved (2026-06-02).** Defense in depth, two independent layers:
+
+1. **Structural URL validation** — new `validate_git_url` requires `src.url` to parse via the
+   `url` crate as an absolute URL whose scheme is on a strict allowlist `{https, ssh, git}`;
+   rejects embedded whitespace/quotes, control chars, leading `-`, and host-less URLs. `ext::`,
+   `transport::`, `file://`, `http://`, and relative/bare refs are all rejected. Called _before_
+   the existing metacharacter blocklist in `validate_source`.
+2. **Transport hardening on every git invocation** — `run_git` now prepends
+   `-c protocol.ext.allow=never -c protocol.file.allow=never -c protocol.allow=user` and sets
+   `GIT_ALLOW_PROTOCOL=https:ssh:git`, so even a validation bypass cannot invoke a remote helper or
+   local transport (including indirect transports via redirects/submodules).
+   Tests (`crates/agent/src/build.rs`): `validate_git_url_accepts_real_remotes`,
+   `validate_git_url_rejects_remote_helper_and_transport_smuggling` (covers `ext::`, `transport::`,
+   `file://`, `http://`, relative, `-`-prefixed, whitespace, oversized), and
+   `git_args_carry_protocol_restrictions` (asserts the config flags precede the subcommand and the
+   original argv is preserved). Mutation-checked (adding `http` to the scheme allowlist makes the
+   rejection test fail). `url` was promoted from a transitive to a direct dependency of `forge-agent`
+   (no new code in the supply chain — already resolved at v2.5.8 in `Cargo.lock`).
 
 ## ✅ Cleared
 

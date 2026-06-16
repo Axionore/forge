@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT s.id AS sub_id, s.channel_id, s.events,\n                   c.channel_type, c.config, c.enabled AS channel_enabled\n            FROM notification_subscriptions s\n            JOIN notification_channels c ON c.id = s.channel_id\n            WHERE s.resource_type = $1\n              AND (s.resource_id IS NULL OR s.resource_id = $2)\n              AND s.enabled = true\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "sub_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "channel_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "events",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 3,
+        "name": "channel_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "config",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "channel_enabled",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b0b0df831c351510746b39f8dd0cfc6018ab87621b74a4d0bbaa3d8cc28cac2a"
+}

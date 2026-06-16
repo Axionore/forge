@@ -1,0 +1,124 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, application_id, git_source_id, commit_sha, git_ref, builder, status,\n                   image, image_digest, started_at, finished_at, error,\n                   created_by_principal_id, deployment_id, signed, provenance,\n                   created_at, updated_at\n            FROM builds WHERE application_id = $1\n            ORDER BY created_at DESC LIMIT 100\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "application_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "git_source_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "commit_sha",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "git_ref",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "builder",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "image",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "image_digest",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "finished_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "error",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "created_by_principal_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 13,
+        "name": "deployment_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 14,
+        "name": "signed",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 15,
+        "name": "provenance",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 16,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 17,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "1934cb8a663c6daa288b3c66a8412f0e21c49e6641cf2b95aebe78bee6eedd2c"
+}

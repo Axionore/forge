@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT s3_endpoint, s3_bucket, s3_key_prefix, s3_region, s3_access_key_id,\n                       s3_secret_id, target_container\n                FROM backup_schedules WHERE id = $1\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "s3_endpoint",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "s3_bucket",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "s3_key_prefix",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "s3_region",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "s3_access_key_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "s3_secret_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "target_container",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "ec51b0865a345e64f1b70f4bcdfd896d1d85054ecda01876ed70dc231f1ccad7"
+}

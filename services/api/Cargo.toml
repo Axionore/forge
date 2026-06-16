@@ -14,6 +14,11 @@ path = "src/main.rs"
 forge-core = { path = "../../crates/core" }
 forge-agent = { path = "../../crates/agent" }   # For SignedJob, Job, etc. during Slice 2 (will move to forge-core)
 forge-provider-hetzner = { path = "../../crates/providers/hetzner" }
+forge-provider-aws = { path = "../../crates/providers/aws" }
+forge-provider-gcp = { path = "../../crates/providers/gcp" }
+forge-provider-azure = { path = "../../crates/providers/azure" }
+forge-provider-digitalocean = { path = "../../crates/providers/digitalocean" }
+forge-providers = { path = "../../crates/providers" }
 
 tokio.workspace = true
 axum.workspace = true
@@ -24,6 +29,7 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -37,6 +43,8 @@ age = { workspace = true }
 ssh-key = { workspace = true }
 rand = "0.8"
 hex = "0.4"
+url.workspace = true
+lettre.workspace = true
 
 # Prometheus exposition format (lightweight, no heavy client)
 prometheus = { version = "0.13", features = ["process"] }
@@ -63,3 +71,4 @@ rustls-pemfile.workspace = true
 
 [dev-dependencies]
 tokio-test = "0.4"
+wiremock.workspace = true

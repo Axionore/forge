@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT encrypted_blob FROM secrets\n            WHERE name = $1\n              AND enabled = true\n              AND (application_id = $2 OR application_id IS NULL)\n            ORDER BY application_id NULLS LAST, created_at DESC\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "encrypted_blob",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "8ac3a97c23da63112b0fe09c38fea0930b648aa2b29a7735c44eb1de0d0009f4"
+}

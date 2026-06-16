@@ -31,10 +31,15 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 mod agent_ws;
+mod alerts;
+mod backup_scheduler;
 mod deployment;
 mod enrollment;
 mod metrics;
+mod notify;
+mod provisioning;
 mod rbac;
+mod schedule;
 mod xds;
 
 use crate::metrics::{ControlPlaneMetrics, SharedMetrics};
@@ -86,6 +91,13 @@ struct AppState {
     /// This allows the control plane itself to decrypt tokens when performing provisioning actions.
     /// Should be provided via FORGE_HETZNER_CP_AGE_SECRET (or equivalent secure config).
     hetzner_cp_age_secret: Option<Arc<String>>,
+
+    /// Cloud provisioning service (Phase A.2): provider registry + provisioned_resources tracking.
+    provisioning_service: Arc<provisioning::ProvisioningService>,
+
+    /// Monitoring threshold alerts: rule CRUD + event reads. The background evaluator runs
+    /// independently (spawned in `main`) and shares the same pool + deployment service.
+    alert_service: Arc<alerts::AlertService>,
 }
 
 /// Configuration for public-facing TLS (supports static certs or automatic Let's Encrypt via ACME).
@@ -192,6 +204,24 @@ async fn main() {
         "Control plane Ed25519 signing key ready"
     );
 
+    // Phase C — resolve + announce the supply-chain enforcement policy at startup. When no
+    // cosign key is configured the policy resolves to `disabled` and we emit a LOUD warning so
+    // an operator never assumes images are being signed/verified when they are not.
+    let supply_chain_policy = resolve_supply_chain_policy();
+    if matches!(
+        supply_chain_policy,
+        forge_core::supplychain::SupplyChainPolicy::Disabled
+    ) {
+        warn!(
+            policy = "disabled",
+            "SUPPLY-CHAIN ENFORCEMENT IS OFF — built images will NOT be cosign-signed and agents \
+             will NOT verify image provenance before run. Set FORGE_COSIGN_KEY (signing) + \
+             FORGE_COSIGN_PUBLIC_KEY (verify) on agents to enable the signed-artifact root of trust."
+        );
+    } else {
+        info!(policy = %supply_chain_policy.as_str(), "Supply-chain enforcement policy resolved");
+    }
+
     let agent_registry = crate::agent_ws::AgentRegistry::new();
 
     let metrics = Arc::new(ControlPlaneMetrics::new());
@@ -208,6 +238,18 @@ async fn main() {
     let hetzner_cp_age_secret = std::env::var("FORGE_HETZNER_CP_AGE_SECRET")
         .ok()
         .map(Arc::new);
+
+    // Cloud provisioning (Phase A.2): production provider registry resolves + decrypts
+    // stored credentials on demand. Tracks every created resource in provisioned_resources.
+    let provisioning_service = Arc::new(provisioning::ProvisioningService::new(
+        (*pool).clone(),
+        Arc::new(provisioning::ProviderRegistry::new(
+            (*pool).clone(),
+            hetzner_cp_age_secret.clone(),
+        )),
+    ));
+
+    let alert_service = Arc::new(alerts::AlertService::new((*pool).clone()));
 
     let xds_state = crate::xds::XdsState::new();
 
@@ -233,7 +275,35 @@ async fn main() {
         terminal_sessions: Arc::new(RwLock::new(HashMap::new())),
         rbac_service,
         hetzner_cp_age_secret,
+        provisioning_service,
+        alert_service: alert_service.clone(),
     };
+
+    // Monitoring threshold alert evaluator: a bounded background task that scans enabled
+    // rules every 30s, fires/resolves alert_events, and triggers notifications. Wired to a
+    // watch-based shutdown signal for graceful stop (the loop is fail-safe: per-rule DB
+    // errors are logged and skipped, never panicking the task).
+    let (_alert_shutdown_tx, alert_shutdown_rx) = tokio::sync::watch::channel(false);
+    let _alert_eval_handle = alerts::spawn_alert_evaluator(
+        (*state.pool).clone(),
+        state.deployment_service.clone(),
+        alert_shutdown_rx,
+    );
+    info!("Alert threshold evaluator started (30s interval)");
+
+    // Scheduled backups: a bounded background task that scans enabled backup_schedules every
+    // 60s and dispatches signed Job::Backup to a connected agent (or durably queues when the
+    // agent is offline), applying retention. Fail-safe: per-schedule errors are logged and
+    // skipped, never panicking the loop; wired to its own watch-based shutdown signal.
+    let (_backup_shutdown_tx, backup_shutdown_rx) = tokio::sync::watch::channel(false);
+    let _backup_sched_handle = backup_scheduler::spawn_backup_scheduler(
+        (*state.pool).clone(),
+        state.deployment_service.clone(),
+        state.agent_registry.clone(),
+        state.signing_key.clone(),
+        backup_shutdown_rx,
+    );
+    info!("Backup scheduler started (60s interval)");
 
     // CORS for local dev UI (apps/web on :3001). In prod this is behind reverse proxy with proper origin allowlist.
     let cors = CorsLayer::new()
@@ -258,6 +328,17 @@ async fn main() {
         .route("/applications/{id}", get(get_application))
         .route("/applications/{id}/deployments", post(create_deployment))
         .route("/applications/{id}/deployments", get(list_deployments))
+        // Phase B: source-to-deploy builds
+        .route("/applications/{id}/builds", post(create_build_handler))
+        .route("/applications/{id}/builds", get(list_builds_handler))
+        .route(
+            "/applications/{id}/builds/{build_id}",
+            get(get_build_handler),
+        )
+        .route(
+            "/applications/{id}/builds/{build_id}/logs/ws",
+            get(build_logs_ws_handler),
+        )
         .route(
             "/applications/{app_id}/deployments/{dep_id}",
             get(get_deployment),
@@ -308,15 +389,59 @@ async fn main() {
             "/deployments/{dep_id}/notifications/test",
             post(test_notification_trigger),
         )
+        // Monitoring threshold alerts (rule CRUD + fired-event feed). Mutations are
+        // RBAC-gated on `alerts:write`; reads are open to authenticated admins.
+        .route("/alert-rules", get(list_alert_rules))
+        .route("/alert-rules", post(create_alert_rule))
+        .route("/alert-rules/{id}", get(get_alert_rule))
+        .route("/alert-rules/{id}", put(update_alert_rule))
+        .route("/alert-rules/{id}", delete(delete_alert_rule))
+        .route("/alert-events", get(list_alert_events))
         // Feature 2: Service Catalog
         .route("/catalog", get(list_catalog))
         .route(
             "/applications/{app_id}/deploy-from-catalog",
             post(deploy_from_catalog),
         )
-        // A0-4 (first slice): Hetzner provider - minimal one-click server creation
+        // Phase A.2: unified cloud provisioning surface (all gated on RBAC cloud:provision).
+        .route("/admin/providers", get(list_providers))
+        .route("/admin/providers/{provider}/catalog", get(provider_catalog))
         .route(
-            "/admin/providers/hetzner/servers",
+            "/admin/providers/{provider}/servers",
+            post(provision_server),
+        )
+        .route(
+            "/admin/providers/{provider}/firewalls",
+            post(provision_firewall),
+        )
+        .route(
+            "/admin/providers/{provider}/networks",
+            post(provision_network),
+        )
+        .route(
+            "/admin/providers/{provider}/volumes",
+            post(provision_volume),
+        )
+        .route(
+            "/admin/providers/{provider}/load-balancers",
+            post(provision_load_balancer),
+        )
+        .route("/admin/providers/{provider}/ips", post(provision_ip))
+        .route(
+            "/admin/providers/{provider}/dns-records",
+            post(provision_dns_record),
+        )
+        .route(
+            "/admin/providers/{provider}/resources",
+            get(list_provider_resources),
+        )
+        .route(
+            "/admin/providers/{provider}/resources/{id}",
+            delete(delete_provider_resource),
+        )
+        // Backward-compatible alias for the original one-click Hetzner endpoint.
+        .route(
+            "/admin/providers/hetzner/servers/batch",
             post(create_hetzner_server),
         )
         // Dedicated Hetzner credential management (control-plane decryptable tokens)
@@ -349,6 +474,10 @@ async fn main() {
         .route(
             "/applications/{app_id}/deployments/{dep_id}/backups",
             get(list_backup_executions),
+        )
+        .route(
+            "/applications/{app_id}/deployments/{dep_id}/backups/{execution_id}/restore",
+            post(restore_backup),
         )
         // Feature 5: Git Sources (admin)
         .route("/git-sources", get(list_git_sources))
@@ -388,6 +517,7 @@ async fn main() {
         .route("/roles", post(create_role))
         .route("/principals", get(list_principals))
         .route("/principals", post(create_principal))
+        .route("/principals/{id}/roles", post(assign_principal_role))
         .route("/admin-tokens", get(list_admin_tokens))
         .route("/admin-tokens", post(create_admin_token))
         .route("/admin-tokens/{prefix}", delete(revoke_admin_token))
@@ -533,6 +663,31 @@ async fn main() {
 /// to agents at enrollment, so a per-restart key would invalidate every enrollment and
 /// make signed jobs unverifiable (OWASP A08/A04). When we have to generate-and-persist
 /// we log a loud warning so operators know to provision a managed secret instead.
+/// Resolve the control plane's supply-chain enforcement policy (Phase C).
+///
+/// Precedence:
+/// 1. `FORGE_SUPPLY_CHAIN_POLICY` env (`disabled` | `sign` | `sign-and-require-verify`) — an
+///    explicit operator override. An unknown value fails closed to the strict default rather
+///    than silently disabling enforcement.
+/// 2. Otherwise the default: strict (`sign-and-require-verify`) when a cosign signing key is
+///    configured (`FORGE_COSIGN_KEY`), else `disabled` (the caller emits a loud warning).
+///
+/// The policy is threaded onto every dispatched `Job::Build` (governs signing) and onto the
+/// `DeploymentSpec` of every `Job::Deploy` (governs verify-before-run on the agent).
+fn resolve_supply_chain_policy() -> forge_core::supplychain::SupplyChainPolicy {
+    use forge_core::supplychain::SupplyChainPolicy;
+    if let Ok(explicit) = std::env::var("FORGE_SUPPLY_CHAIN_POLICY") {
+        let explicit = explicit.trim();
+        if !explicit.is_empty() {
+            return SupplyChainPolicy::from_str_or_strict(explicit);
+        }
+    }
+    let has_key = std::env::var(forge_agent::supplychain::COSIGN_KEY_ENV)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    SupplyChainPolicy::resolve_default(has_key)
+}
+
 fn load_or_create_signing_key() -> ed25519_dalek::SigningKey {
     use base64::Engine as _;
 
@@ -627,8 +782,48 @@ fn load_static_rustls_config(
 }
 
 // =============================================================================
-// Admin auth (function-level + simple constant-time token check)
+// Admin auth (function-level + constant-time bootstrap check + issued-token lookup)
 // =============================================================================
+
+/// The authenticated principal for an `/admin/*` request, resolved by `require_admin_auth`
+/// and carried in request extensions for handlers to extract.
+///
+/// - `AuthPrincipal(None)` = the bootstrap `FORGE_ADMIN_TOKEN` superuser. It is NOT subject
+///   to per-action RBAC (it predates the role system and is the break-glass operator). It is
+///   the ONLY value that maps to an unconstrained `None` principal downstream.
+/// - `AuthPrincipal(Some(pid))` = an issued admin token resolved to a real principal. Every
+///   mutating action is gated by that principal's roles via `enforce_action` (default-deny).
+#[derive(Debug, Clone, Copy)]
+struct AuthPrincipal(Option<Uuid>);
+
+impl AuthPrincipal {
+    /// The principal id to thread into RBAC checks. Bootstrap → `None` (allowed everywhere);
+    /// a real principal → `Some(pid)` (must hold the action).
+    fn principal_id(self) -> Option<Uuid> {
+        self.0
+    }
+}
+
+#[axum::async_trait]
+impl<S> axum::extract::FromRequestParts<S> for AuthPrincipal
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        // Set unconditionally by `require_admin_auth` before the handler runs. Its absence
+        // means the route was reached without the auth middleware — fail closed.
+        parts
+            .extensions
+            .get::<AuthPrincipal>()
+            .copied()
+            .ok_or(ApiError::Unauthorized)
+    }
+}
 
 // Uses ring's (now-deprecated) constant_time compare for the bootstrap admin token.
 // The migration to `subtle` is owned by the security pass; behavior is unchanged.
@@ -636,7 +831,7 @@ fn load_static_rustls_config(
 async fn require_admin_auth(
     State(state): State<AppState>,
     headers: HeaderMap,
-    request: axum::http::Request<axum::body::Body>,
+    mut request: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Result<Response, ApiError> {
     let provided = headers
@@ -644,17 +839,41 @@ async fn require_admin_auth(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let expected = state.admin_token.as_bytes();
     let provided_bytes = provided.as_bytes();
+    let expected = state.admin_token.as_bytes();
 
-    let ok = verify_slices_are_equal(provided_bytes, expected).is_ok();
-
-    if !ok {
-        warn!("Admin auth failed: invalid or missing X-Admin-Token");
-        return Err(ApiError::Unauthorized);
+    // 1. Bootstrap superuser: constant-time compare against FORGE_ADMIN_TOKEN.
+    //    Match → principal = None (unconstrained). This path is unchanged and fast.
+    if verify_slices_are_equal(provided_bytes, expected).is_ok() {
+        request.extensions_mut().insert(AuthPrincipal(None));
+        return Ok(next.run(request).await);
     }
 
-    Ok(next.run(request).await)
+    // 2. Issued admin token: hash + DB lookup → its principal id. Rejected (401) if the
+    //    token is empty, unknown, revoked, or expired — a single enumeration-resistant error.
+    if !provided.is_empty() {
+        match state
+            .rbac_service
+            .lookup_principal_for_token(provided)
+            .await
+        {
+            Ok(Some(principal_id)) => {
+                request
+                    .extensions_mut()
+                    .insert(AuthPrincipal(Some(principal_id)));
+                return Ok(next.run(request).await);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                // Fail closed on any RBAC/DB error — never fall through to allow.
+                warn!("Admin auth: token lookup failed; denying");
+                return Err(ApiError::Unauthorized);
+            }
+        }
+    }
+
+    warn!("Admin auth failed: invalid or missing X-Admin-Token");
+    Err(ApiError::Unauthorized)
 }
 
 // =============================================================================
@@ -845,13 +1064,74 @@ struct ProblemDetail {
 enum ApiError {
     Unauthorized,
     Forbidden,
-    Validation { field: String, message: String },
+    Validation {
+        field: String,
+        message: String,
+    },
     BadRequest(String),
     Internal,
+    /// 404 — a tracked resource (or upstream resource) was not found.
+    NotFound,
+    /// 409 — a conflict; `detail` is a sanitized, operator-safe message.
+    Conflict(String),
+    /// 429 — upstream/provider rate limit. `retry_after_secs` becomes a Retry-After header.
+    RateLimited {
+        retry_after_secs: Option<u64>,
+    },
+    /// 501 — the selected provider does not implement this operation.
+    NotImplemented,
+    /// 502 — upstream provider returned an error we forward (sanitized) to the caller.
+    BadGateway {
+        detail: String,
+    },
+    /// 207 — a multi-step provision partially succeeded. The body carries the IDs that
+    /// were created and the subset that cleanup could not remove, so an operator can finish.
+    PartialFailure {
+        message: String,
+        created_resource_ids: Vec<String>,
+        leftover_resource_ids: Vec<String>,
+    },
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // 207 carries a richer body (the leftover IDs an operator needs); handle it first.
+        if let ApiError::PartialFailure {
+            message,
+            created_resource_ids,
+            leftover_resource_ids,
+        } = self
+        {
+            let status = StatusCode::MULTI_STATUS;
+            let body = serde_json::json!({
+                "title": "Partial failure",
+                "status": status.as_u16(),
+                "detail": message,
+                "created_resource_ids": created_resource_ids,
+                "leftover_resource_ids": leftover_resource_ids,
+            });
+            return (status, Json(body)).into_response();
+        }
+
+        // 429 needs a Retry-After header when the provider supplied one.
+        if let ApiError::RateLimited { retry_after_secs } = self {
+            let status = StatusCode::TOO_MANY_REQUESTS;
+            let body = ProblemDetail {
+                title: Some("Rate limited".to_string()),
+                status: status.as_u16(),
+                detail: Some("Upstream provider rate limit; retry later".to_string()),
+                field: None,
+            };
+            let mut resp = (status, Json(body)).into_response();
+            if let Some(secs) = retry_after_secs {
+                if let Ok(val) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                    resp.headers_mut()
+                        .insert(axum::http::header::RETRY_AFTER, val);
+                }
+            }
+            return resp;
+        }
+
         let (status, title, detail, field) = match self {
             ApiError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
@@ -872,7 +1152,28 @@ impl IntoResponse for ApiError {
                 Some(field),
             ),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "Bad request", Some(msg), None),
+            ApiError::NotFound => (StatusCode::NOT_FOUND, "Not found", None, None),
+            ApiError::Conflict(msg) => (StatusCode::CONFLICT, "Conflict", Some(msg), None),
+            ApiError::NotImplemented => (
+                StatusCode::NOT_IMPLEMENTED,
+                "Not implemented",
+                Some("This provider does not support the requested operation".to_string()),
+                None,
+            ),
+            ApiError::BadGateway { detail } => (
+                StatusCode::BAD_GATEWAY,
+                "Upstream provider error",
+                Some(detail),
+                None,
+            ),
             ApiError::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error",
+                None,
+                None,
+            ),
+            // Handled above; unreachable but keeps the match total.
+            ApiError::RateLimited { .. } | ApiError::PartialFailure { .. } => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal server error",
                 None,
@@ -888,6 +1189,71 @@ impl IntoResponse for ApiError {
         };
 
         (status, Json(body)).into_response()
+    }
+}
+
+/// Map a `ProvisionError` to an `ApiError`, never leaking tokens or raw upstream text beyond
+/// what the typed provider error already sanitizes. Logs internally for diagnosis.
+impl From<provisioning::ProvisionError> for ApiError {
+    fn from(e: provisioning::ProvisionError) -> Self {
+        use forge_providers::ProviderError as PE;
+        use provisioning::ProvisionError as ProvE;
+        match e {
+            ProvE::UnknownProvider => ApiError::BadRequest("unknown provider".into()),
+            ProvE::CredentialUnavailable(msg) => ApiError::Validation {
+                field: "credential".into(),
+                message: msg,
+            },
+            ProvE::InvalidInput(msg) => ApiError::Validation {
+                field: "input".into(),
+                message: msg,
+            },
+            ProvE::NotFound => ApiError::NotFound,
+            ProvE::Conflict(msg) => ApiError::Conflict(msg),
+            ProvE::Provider(pe) => match pe {
+                PE::NotImplemented => ApiError::NotImplemented,
+                PE::NotFound(_) => ApiError::NotFound,
+                PE::InvalidRequest(msg) => ApiError::Validation {
+                    field: "request".into(),
+                    message: msg,
+                },
+                PE::RateLimited { retry_after_secs } => ApiError::RateLimited { retry_after_secs },
+                PE::Api { status, code, .. } => {
+                    // Forward the upstream HTTP status when it is a usable client/server code;
+                    // otherwise 502. Never echo the provider's raw message (may carry detail).
+                    warn!(upstream_status = status, upstream_code = %code, "provider API error");
+                    match StatusCode::from_u16(status) {
+                        Ok(s) if s.is_client_error() || s.is_server_error() => {
+                            ApiError::BadGateway {
+                                detail: format!("upstream provider returned {status}"),
+                            }
+                        }
+                        _ => ApiError::BadGateway {
+                            detail: "upstream provider error".into(),
+                        },
+                    }
+                }
+                PE::PartialFailure {
+                    message,
+                    created_resource_ids,
+                    leftover_resource_ids,
+                } => ApiError::PartialFailure {
+                    message,
+                    created_resource_ids,
+                    leftover_resource_ids,
+                },
+                PE::Http(_) | PE::Timeout(_) | PE::ActionFailed(_) => {
+                    warn!("provider transport/timeout/action error");
+                    ApiError::BadGateway {
+                        detail: "upstream provider unavailable".into(),
+                    }
+                }
+            },
+            ProvE::Internal(err) => {
+                warn!(error = %err, "provisioning internal error");
+                ApiError::Internal
+            }
+        }
     }
 }
 
@@ -920,14 +1286,18 @@ struct CreateDeploymentRequest {
 
 async fn create_application(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Json(req): Json<CreateApplicationRequest>,
 ) -> Result<(StatusCode, Json<forge_core::Application>), ApiError> {
-    // principal_id=None: bootstrap X-Admin-Token path (FORGE_ADMIN_TOKEN constant-time).
-    // Future: middleware will resolve issued admin_token -> principal_id and pass Some(pid)
-    // so RbacService.principal_can("applications:create") + audit attribution works for operators.
+    // Bootstrap (None) is allowed; an issued principal must hold applications:create.
+    // create_application enforces this via the threaded principal_id (default-deny).
     match state
         .deployment_service
-        .create_application(&req.name, req.description.as_deref(), None)
+        .create_application(
+            &req.name,
+            req.description.as_deref(),
+            principal.principal_id(),
+        )
         .await
     {
         Ok(app) => Ok((StatusCode::CREATED, Json(app))),
@@ -976,11 +1346,18 @@ async fn get_application(
 // Phase 0 Services handlers (minimal foundation, same RBAC/audit contract as applications)
 async fn create_service(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Json(req): Json<CreateServiceRequest>,
 ) -> Result<(StatusCode, Json<deployment::Service>), ApiError> {
     match state
         .deployment_service
-        .create_service(req.project_id, &req.name, &req.engine, req.spec, None)
+        .create_service(
+            req.project_id,
+            &req.name,
+            &req.engine,
+            req.spec,
+            principal.principal_id(),
+        )
         .await
     {
         Ok(svc) => Ok((StatusCode::CREATED, Json(svc))),
@@ -1105,9 +1482,18 @@ async fn dispatch_deployment(
 #[axum::debug_handler]
 async fn create_deployment(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(app_id): Path<Uuid>,
     Json(req): Json<CreateDeploymentRequest>,
 ) -> Result<(StatusCode, Json<forge_core::Deployment>), ApiError> {
+    // RBAC default-deny: creating a deployment requires deployments:write. Bootstrap (None)
+    // is allowed; an issued principal without the action is rejected 403 before any dispatch.
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "deployments:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     // 1. Persist the desired state and dispatch to connected agents.
     let deployment = match state
         .deployment_service
@@ -1227,6 +1613,348 @@ async fn create_deployment(
         .inc();
 
     Ok((StatusCode::CREATED, Json(deployment)))
+}
+
+// =============================================================================
+// Phase B: Source-to-deploy builds
+// =============================================================================
+
+#[derive(Debug, Deserialize)]
+struct CreateBuildRequest {
+    /// Optional git source this build is associated with (for traceability + webhook linking).
+    #[serde(default)]
+    git_source_id: Option<Uuid>,
+    /// Git URL to fetch (https or git@). Required.
+    repo_url: String,
+    /// Pinned commit SHA the build is fetched at. Required (40/64-hex). We never build a
+    /// floating ref (threat-model Tampering mitigation).
+    commit_sha: String,
+    /// Human-facing branch/tag the SHA was resolved from.
+    #[serde(default)]
+    git_ref: Option<String>,
+    /// Optional subdirectory within the repo to treat as the build root.
+    #[serde(default)]
+    subdir: Option<String>,
+    /// The builder to run, as the tagged `Builder` enum
+    /// (e.g. `{"type":"dockerfile","dockerfile_path":"Dockerfile"}`).
+    builder: forge_agent::job::Builder,
+    /// Output image repository/name.
+    image_name: String,
+    /// Output image tag (defaults to the short commit SHA when omitted).
+    #[serde(default)]
+    image_tag: Option<String>,
+    /// Optional registry to push to.
+    #[serde(default)]
+    registry: Option<String>,
+    /// Non-secret build args (visible in docker history — never secrets).
+    #[serde(default)]
+    build_args: std::collections::HashMap<String, String>,
+    /// Names of stored secrets (from the `secrets` table) to inject as BuildKit build
+    /// secrets. Each is re-encrypted to the agents' recipients and exposed only via
+    /// `--secret` (never as a build ARG/ENV).
+    #[serde(default)]
+    build_secret_names: Vec<String>,
+}
+
+/// Shared build trigger used by both the admin endpoint and deploy-on-push. Creates the
+/// build record, assembles the (secret-bearing) `BuildSpec`, signs a `Job::Build`, and
+/// dispatches it to a connected agent (or durably queues it). Returns the build record.
+async fn trigger_build(
+    state: &AppState,
+    app_id: Uuid,
+    req: CreateBuildRequest,
+    principal_id: Option<Uuid>,
+) -> Result<deployment::BuildRecord, ApiError> {
+    use forge_agent::job::{BuildSpec, GitCheckout, Job, SecretRef};
+
+    // Derive the builder discriminant for the DB CHECK constraint.
+    let builder_tag = match &req.builder {
+        forge_agent::job::Builder::Dockerfile { .. } => "dockerfile",
+        forge_agent::job::Builder::Nixpacks { .. } => "nixpacks",
+        forge_agent::job::Builder::Compose { .. } => "compose",
+        forge_agent::job::Builder::Buildpack { .. } => "buildpack",
+    };
+
+    let image_tag = req
+        .image_tag
+        .clone()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| req.commit_sha.chars().take(12).collect());
+
+    // Build the target image reference up front for the record.
+    let tmp_spec = BuildSpec {
+        source: GitCheckout::default(),
+        builder: req.builder.clone(),
+        image_name: req.image_name.clone(),
+        image_tag: image_tag.clone(),
+        registry: req.registry.clone(),
+        build_args: req.build_args.clone(),
+        build_secrets: vec![],
+    };
+    let target_image = tmp_spec.target_image();
+
+    // 1. Persist the build record (RBAC builds:create enforced inside).
+    let record = state
+        .deployment_service
+        .create_build(
+            app_id,
+            req.git_source_id,
+            &req.commit_sha,
+            req.git_ref.as_deref(),
+            builder_tag,
+            &target_image,
+            principal_id,
+        )
+        .await
+        .map_err(|e| match e {
+            deployment::DeploymentError::Forbidden => ApiError::Forbidden,
+            deployment::DeploymentError::InvalidInput(m) => ApiError::Validation {
+                field: "build".into(),
+                message: m,
+            },
+            deployment::DeploymentError::ApplicationNotFound => {
+                ApiError::BadRequest("application not found".into())
+            }
+            other => {
+                warn!(error = %other, "create_build failed");
+                ApiError::Internal
+            }
+        })?;
+
+    // 2. Resolve requested build secrets from the secret store, re-encrypting to the
+    //    agents' recipients so whichever agent runs the build can decrypt them.
+    let mut build_secrets: Vec<SecretRef> = Vec::new();
+    if !req.build_secret_names.is_empty() {
+        // RBAC gate (A01): embedding a decryptable secret into a BuildSpec requires the
+        // caller to hold `secrets:use`. `principal_id == None` is the already-authenticated
+        // bootstrap X-Admin-Token path, consistent with `create_build`/`enforce`.
+        state
+            .deployment_service
+            .enforce_action(principal_id, "secrets:use")
+            .await
+            .map_err(|e| match e {
+                deployment::DeploymentError::Forbidden => ApiError::Forbidden,
+                _ => ApiError::Internal,
+            })?;
+
+        let recipients = state
+            .deployment_service
+            .agent_age_recipients()
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        for name in &req.build_secret_names {
+            // The named secret is already an age envelope; we reference it directly. Each
+            // secret becomes a BuildKit secret whose id is the secret name. Resolution is
+            // scoped to this application — a secret owned by another application never
+            // resolves here (cross-tenant IDOR is rejected as `unknown` below, fail-closed).
+            match state
+                .deployment_service
+                .get_build_secret_ref(name, app_id)
+                .await
+            {
+                Ok(Some(ct)) => build_secrets.push(SecretRef {
+                    name: name.clone(),
+                    target: forge_agent::job::SecretTarget::File {
+                        path: format!("/run/secrets/{name}"),
+                        mode: Some(0o400),
+                    },
+                    ciphertext: ct,
+                }),
+                Ok(None) => {
+                    return Err(ApiError::Validation {
+                        field: "build_secret_names".into(),
+                        message: format!("unknown build secret: {name}"),
+                    });
+                }
+                Err(_) => return Err(ApiError::Internal),
+            }
+        }
+        // Defense in depth: if no agent can decrypt, fail rather than ship undecryptable secrets.
+        if recipients.is_empty() && !build_secrets.is_empty() {
+            return Err(ApiError::BadRequest(
+                "no enrolled agent can receive build secrets yet".into(),
+            ));
+        }
+    }
+
+    // 3. Assemble the full BuildSpec.
+    let spec = BuildSpec {
+        source: GitCheckout {
+            url: req.repo_url.clone(),
+            r#ref: req.git_ref.clone().unwrap_or_default(),
+            ssh_key_secret_name: None,
+            commit_sha: Some(req.commit_sha.clone()),
+            subdir: req.subdir.clone(),
+        },
+        builder: req.builder.clone(),
+        image_name: req.image_name.clone(),
+        image_tag,
+        registry: req.registry.clone(),
+        build_args: req.build_args.clone(),
+        build_secrets,
+    };
+
+    // 4. Sign + dispatch the Build job to a connected agent (best effort: pick the first).
+    let signer = crate::agent_ws::JobSigner::new((*state.signing_key).clone());
+    let job = Job::Build {
+        build_id: record.id,
+        spec,
+        target_image,
+        registry_auth: None,
+        supply_chain_policy: resolve_supply_chain_policy(),
+    };
+    let signed = signer.sign(job);
+
+    let connected = state.agent_registry.connected_agents().await;
+    let mut dispatched = false;
+    for agent_id in connected {
+        if state
+            .agent_registry
+            .send_job(agent_id, signed.clone())
+            .await
+        {
+            dispatched = true;
+            let _ = state.deployment_service.mark_build_running(record.id).await;
+            info!(build_id = %record.id, agent_id = %agent_id, "Dispatched Build job to agent");
+            break;
+        }
+    }
+    if !dispatched {
+        warn!(build_id = %record.id, "No connected agent to run the build; build stays pending");
+    }
+
+    state
+        .metrics
+        .jobs_dispatched_total
+        .with_label_values(&["build"])
+        .inc();
+
+    // Re-read so the returned record reflects the running status if dispatched.
+    state
+        .deployment_service
+        .get_build(record.id)
+        .await
+        .ok()
+        .flatten()
+        .map_or(Ok(record), Ok)
+}
+
+/// Reconstruct a default `Builder` from its persisted discriminant. Used by the webhook
+/// dispatch path, where only the builder tag was stored on the build record. Builder-specific
+/// options (dockerfile path, compose file) default to the conventional values.
+fn builder_from_tag(tag: &str) -> forge_agent::job::Builder {
+    use forge_agent::job::Builder;
+    match tag {
+        "nixpacks" => Builder::Nixpacks {
+            context: None,
+            start_cmd: None,
+        },
+        "compose" => Builder::Compose {
+            file: "docker-compose.yml".into(),
+        },
+        "buildpack" => Builder::Buildpack {
+            builder_image: None,
+        },
+        // Default and explicit "dockerfile".
+        _ => Builder::Dockerfile {
+            dockerfile_path: None,
+            context: None,
+            target: None,
+        },
+    }
+}
+
+/// POST /admin/applications/{id}/builds — trigger a build. RBAC `builds:create` (default-deny).
+async fn create_build_handler(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Path(app_id): Path<Uuid>,
+    Json(req): Json<CreateBuildRequest>,
+) -> Result<(StatusCode, Json<deployment::BuildRecord>), ApiError> {
+    // Bootstrap (None) is allowed; an issued principal must hold builds:create (and
+    // secrets:use if the build embeds named secrets) — both enforced inside trigger_build.
+    let record = trigger_build(&state, app_id, req, principal.principal_id()).await?;
+    Ok((StatusCode::CREATED, Json(record)))
+}
+
+/// GET /admin/applications/{id}/builds
+async fn list_builds_handler(
+    State(state): State<AppState>,
+    Path(app_id): Path<Uuid>,
+) -> Result<Json<Vec<deployment::BuildRecord>>, ApiError> {
+    state
+        .deployment_service
+        .list_builds(app_id)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            warn!(error = %e, "list_builds failed");
+            ApiError::Internal
+        })
+}
+
+/// GET /admin/applications/{id}/builds/{build_id}
+async fn get_build_handler(
+    State(state): State<AppState>,
+    Path((app_id, build_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<deployment::BuildRecord>, ApiError> {
+    match state.deployment_service.get_build(build_id).await {
+        Ok(Some(b)) if b.application_id == app_id => Ok(Json(b)),
+        Ok(_) => Err(ApiError::BadRequest("build not found".into())),
+        Err(e) => {
+            warn!(error = %e, "get_build failed");
+            Err(ApiError::Internal)
+        }
+    }
+}
+
+/// WS: stream live build logs for a build. Reuses the LOG_BROADCASTERS map keyed by the
+/// build id (the agent forwards redacted log lines as ExecOutput frames, which agent_ws
+/// publishes here).
+async fn build_logs_ws_handler(
+    ws: WebSocketUpgrade,
+    State(_state): State<AppState>,
+    Path((_app_id, build_id)): Path<(Uuid, Uuid)>,
+) -> Response {
+    ws.on_upgrade(move |mut socket| async move {
+        let _ = socket
+            .send(axum::extract::ws::Message::Text(
+                serde_json::json!({ "type": "build_logs_started", "build_id": build_id })
+                    .to_string(),
+            ))
+            .await;
+
+        let rx = {
+            let mut guard = LOG_BROADCASTERS.lock().unwrap();
+            guard
+                .entry(build_id)
+                .or_insert_with(|| {
+                    let (tx, _) = broadcast::channel(1024);
+                    tx
+                })
+                .subscribe()
+        };
+
+        let mut rx = rx;
+        loop {
+            tokio::select! {
+                line = rx.recv() => {
+                    match line {
+                        Ok(line) => {
+                            if socket.send(axum::extract::ws::Message::Text(line)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                Some(msg) = socket.recv() => {
+                    if msg.is_err() { break; }
+                }
+                else => break,
+            }
+        }
+    })
 }
 
 async fn list_deployments(
@@ -2059,6 +2787,132 @@ async fn test_notification_trigger(
 }
 
 // =====================================================================
+// Monitoring threshold alerts (rule CRUD + event feed)
+// =====================================================================
+
+/// Map an `AlertError` to an HTTP error without leaking internals. Invalid input → 422,
+/// not-found → 404, everything else → 500 (logged at the call site). Authorization (403)
+/// is enforced at the handler boundary via `enforce_action`, before the service is called.
+fn map_alert_err(e: alerts::AlertError) -> ApiError {
+    use alerts::AlertError as E;
+    match e {
+        E::InvalidInput(msg) => ApiError::Validation {
+            field: "alert_rule".into(),
+            message: msg,
+        },
+        E::NotFound => ApiError::NotFound,
+        E::Internal(err) => {
+            warn!(error = %err, "alert service error");
+            ApiError::Internal
+        }
+    }
+}
+
+async fn create_alert_rule(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Json(input): Json<alerts::AlertRuleInput>,
+) -> Result<(StatusCode, Json<alerts::AlertRule>), ApiError> {
+    // RBAC default-deny: mutating alert rules requires alerts:write. Bootstrap (None) is
+    // allowed; an issued principal without the action is rejected 403 before any write.
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "alerts:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
+    match state
+        .alert_service
+        .create_rule(&input, principal.principal_id())
+        .await
+    {
+        Ok(rule) => Ok((StatusCode::CREATED, Json(rule))),
+        Err(e) => Err(map_alert_err(e)),
+    }
+}
+
+async fn list_alert_rules(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<alerts::AlertRule>>, ApiError> {
+    state
+        .alert_service
+        .list_rules()
+        .await
+        .map(Json)
+        .map_err(map_alert_err)
+}
+
+async fn get_alert_rule(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<alerts::AlertRule>, ApiError> {
+    state
+        .alert_service
+        .get_rule(id)
+        .await
+        .map(Json)
+        .map_err(map_alert_err)
+}
+
+async fn update_alert_rule(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Path(id): Path<Uuid>,
+    Json(input): Json<alerts::AlertRuleInput>,
+) -> Result<Json<alerts::AlertRule>, ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "alerts:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
+    state
+        .alert_service
+        .update_rule(id, &input)
+        .await
+        .map(Json)
+        .map_err(map_alert_err)
+}
+
+async fn delete_alert_rule(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "alerts:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
+    state
+        .alert_service
+        .delete_rule(id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(map_alert_err)
+}
+
+async fn list_alert_events(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let state_filter = params.get("state").map(String::as_str);
+    let severity_filter = params.get("severity").map(String::as_str);
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(100);
+
+    state
+        .alert_service
+        .list_events(state_filter, severity_filter, limit)
+        .await
+        .map(Json)
+        .map_err(map_alert_err)
+}
+
+// =====================================================================
 // Feature 2: Service Catalog handlers
 // =====================================================================
 
@@ -2084,9 +2938,17 @@ async fn list_catalog(
 
 async fn deploy_from_catalog(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(app_id): Path<Uuid>,
     Json(req): Json<DeployFromCatalogRequest>,
 ) -> Result<(StatusCode, Json<forge_core::Deployment>), ApiError> {
+    // Catalog deploy creates a real deployment → gate on deployments:write (default-deny).
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "deployments:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     match state
         .deployment_service
         .deploy_from_catalog(
@@ -2113,6 +2975,347 @@ async fn deploy_from_catalog(
             })
         }
     }
+}
+
+// =====================================================================
+// Phase A.2: Unified cloud provisioning handlers
+//
+// All routes are mounted under the /admin router (bootstrap X-Admin-Token gate) AND
+// individually enforce RBAC `cloud:provision` (default-deny via enforce_action). The
+// bootstrap path passes principal_id=None and is allowed; an issued operator token that
+// resolves to a real principal without the permission is rejected with 403.
+// =====================================================================
+
+/// Default-deny gate shared by every provisioning handler. Bootstrap (`None`) is allowed; an
+/// issued principal must hold `cloud:provision`. The resolved principal flows from the auth
+/// layer — there is no hardcoded bypass.
+async fn require_cloud_provision(
+    state: &AppState,
+    principal: AuthPrincipal,
+) -> Result<(), ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "cloud:provision")
+        .await
+        .map_err(|_| ApiError::Forbidden)
+}
+
+async fn list_providers(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_cloud_provision(&state, principal).await?;
+    Ok(Json(serde_json::json!({
+        "providers": state.provisioning_service.list_providers(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct CatalogQuery {
+    #[serde(default)]
+    credential_id: Option<Uuid>,
+}
+
+async fn provider_catalog(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Path(provider): Path<String>,
+    Query(q): Query<CatalogQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_cloud_provision(&state, principal).await?;
+    let catalog = state
+        .provisioning_service
+        .catalog(&provider, q.credential_id)
+        .await?;
+    Ok(Json(catalog))
+}
+
+#[derive(Deserialize)]
+struct ProvisionServerBody {
+    #[serde(default)]
+    credential_id: Option<Uuid>,
+    #[serde(flatten)]
+    spec: provisioning::ServerProvisionInput,
+    /// Control-plane URL injected into the agent enrollment cloud-init. Defaults to the
+    /// local CP. When `spec.user_data` is supplied it is used verbatim instead.
+    #[serde(default)]
+    control_plane_url: Option<String>,
+    #[serde(default)]
+    token_description: Option<String>,
+}
+
+async fn provision_server(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Path(provider): Path<String>,
+    Json(body): Json<ProvisionServerBody>,
+) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
+    require_cloud_provision(&state, principal).await?;
+
+    let mut spec = body.spec;
+
+    // When the caller did not supply explicit user-data, generate a one-time enrollment
+    // token and embed the agent cloud-init so the provisioned server auto-enrolls.
+    if spec.user_data.is_none() {
+        let cp_url = body
+            .control_plane_url
+            .unwrap_or_else(|| "http://localhost:3000".to_string());
+        let token_desc = body
+            .token_description
+            .unwrap_or_else(|| format!("Auto-generated for {provider} server {}", spec.name));
+        let enrollment = state
+            .enrollment_service
+            .create_enrollment_token(Some(token_desc), Some(7), Some(1))
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        spec.user_data = Some(forge_provider_hetzner::build_agent_cloud_init(
+            &cp_url,
+            &enrollment.raw_token,
+            Some(&spec.name),
+        ));
+    }
+
+    let resource = state
+        .provisioning_service
+        .provision_server(
+            &provider,
+            body.credential_id,
+            spec,
+            principal.principal_id(),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(resource)))
+}
+
+#[derive(Deserialize)]
+struct ProvisionFirewallBody {
+    #[serde(default)]
+    credential_id: Option<Uuid>,
+    name: String,
+    #[serde(default)]
+    rules: Vec<provisioning::FirewallRuleInput>,
+    #[serde(default)]
+    application_id: Option<Uuid>,
+}
+
+async fn provision_firewall(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Path(provider): Path<String>,
+    Json(body): Json<ProvisionFirewallBody>,
+) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
+    require_cloud_provision(&state, principal).await?;
+    let resource = state
+        .provisioning_service
+        .create_firewall(
+            &provider,
+            body.credential_id,
+            &body.name,
+            body.rules,
+            body.application_id,
+            principal.principal_id(),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(resource)))
+}
+
+#[derive(Deserialize)]
+struct ProvisionNetworkBody {
+    #[serde(default)]
+    credential_id: Option<Uuid>,
+    name: String,
+    ip_range: String,
+    #[serde(default)]
+    application_id: Option<Uuid>,
+}
+
+async fn provision_network(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Path(provider): Path<String>,
+    Json(body): Json<ProvisionNetworkBody>,
+) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
+    require_cloud_provision(&state, principal).await?;
+    let resource = state
+        .provisioning_service
+        .create_network(
+            &provider,
+            body.credential_id,
+            &body.name,
+            &body.ip_range,
+            body.application_id,
+            principal.principal_id(),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(resource)))
+}
+
+#[derive(Deserialize)]
+struct ProvisionVolumeBody {
+    #[serde(default)]
+    credential_id: Option<Uuid>,
+    name: String,
+    size_gb: u64,
+    region: String,
+    #[serde(default)]
+    application_id: Option<Uuid>,
+}
+
+async fn provision_volume(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Path(provider): Path<String>,
+    Json(body): Json<ProvisionVolumeBody>,
+) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
+    require_cloud_provision(&state, principal).await?;
+    let resource = state
+        .provisioning_service
+        .create_volume(
+            &provider,
+            body.credential_id,
+            &body.name,
+            body.size_gb,
+            &body.region,
+            body.application_id,
+            principal.principal_id(),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(resource)))
+}
+
+#[derive(Deserialize)]
+struct ProvisionLoadBalancerBody {
+    #[serde(default)]
+    credential_id: Option<Uuid>,
+    name: String,
+    region: String,
+    #[serde(default)]
+    services: Vec<forge_providers::LbService>,
+    #[serde(default)]
+    application_id: Option<Uuid>,
+}
+
+async fn provision_load_balancer(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Path(provider): Path<String>,
+    Json(body): Json<ProvisionLoadBalancerBody>,
+) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
+    require_cloud_provision(&state, principal).await?;
+    let resource = state
+        .provisioning_service
+        .create_load_balancer(
+            &provider,
+            body.credential_id,
+            &body.name,
+            &body.region,
+            body.services,
+            body.application_id,
+            principal.principal_id(),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(resource)))
+}
+
+#[derive(Deserialize)]
+struct ProvisionIpBody {
+    #[serde(default)]
+    credential_id: Option<Uuid>,
+    region: String,
+    #[serde(default)]
+    ipv6: bool,
+    #[serde(default)]
+    application_id: Option<Uuid>,
+}
+
+async fn provision_ip(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Path(provider): Path<String>,
+    Json(body): Json<ProvisionIpBody>,
+) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
+    require_cloud_provision(&state, principal).await?;
+    let resource = state
+        .provisioning_service
+        .allocate_ip(
+            &provider,
+            body.credential_id,
+            &body.region,
+            body.ipv6,
+            body.application_id,
+            principal.principal_id(),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(resource)))
+}
+
+#[derive(Deserialize)]
+struct ProvisionDnsBody {
+    #[serde(default)]
+    credential_id: Option<Uuid>,
+    /// Zone id or domain (a value containing a dot is resolved via `dns_ensure_zone`).
+    zone: String,
+    record_type: forge_providers::DnsRecordType,
+    name: String,
+    value: String,
+    #[serde(default)]
+    ttl: Option<u32>,
+    #[serde(default)]
+    application_id: Option<Uuid>,
+}
+
+async fn provision_dns_record(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Path(provider): Path<String>,
+    Json(body): Json<ProvisionDnsBody>,
+) -> Result<(StatusCode, Json<provisioning::ProvisionedResource>), ApiError> {
+    require_cloud_provision(&state, principal).await?;
+    let resource = state
+        .provisioning_service
+        .dns_upsert(
+            &provider,
+            body.credential_id,
+            &body.zone,
+            body.record_type,
+            &body.name,
+            &body.value,
+            body.ttl,
+            body.application_id,
+            principal.principal_id(),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(resource)))
+}
+
+async fn list_provider_resources(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Path(provider): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_cloud_provision(&state, principal).await?;
+    let resources = state.provisioning_service.list_resources(&provider).await?;
+    Ok(Json(serde_json::json!({ "resources": resources })))
+}
+
+#[derive(Deserialize)]
+struct DeleteResourceQuery {
+    #[serde(default)]
+    credential_id: Option<Uuid>,
+}
+
+async fn delete_provider_resource(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Path((provider, id)): Path<(String, Uuid)>,
+    Query(q): Query<DeleteResourceQuery>,
+) -> Result<Json<provisioning::ProvisionedResource>, ApiError> {
+    require_cloud_provision(&state, principal).await?;
+    let resource = state
+        .provisioning_service
+        .delete_resource(&provider, id, q.credential_id)
+        .await?;
+    Ok(Json(resource))
 }
 
 // =====================================================================
@@ -2157,8 +3360,18 @@ fn decrypt_hetzner_credential(
 
 async fn create_hetzner_server(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Json(req): Json<CreateHetznerServerRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // RBAC default-deny: provisioning infra requires `cloud:provision`. Bootstrap (None) is
+    // allowed; an issued principal without the action is rejected 403. The principal is the
+    // resolved actor from the auth layer — no hardcoded bypass.
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "cloud:provision")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     let count = req.count.unwrap_or(1).clamp(1, 20); // safety cap
     let cp_url = req
         .control_plane_url
@@ -2214,13 +3427,35 @@ async fn create_hetzner_server(
         });
     };
 
-    let provider =
-        forge_provider_hetzner::HetznerProvider::new(forge_provider_hetzner::HetznerConfig {
+    use forge_providers::{CloudProvider, ServerSpec};
+
+    let provider = forge_provider_hetzner::HetznerProvider::from_config(
+        forge_provider_hetzner::HetznerConfig {
             api_token: effective_hetzner_token,
-            default_location: req.location.clone(),
-            default_server_type: req.server_type.clone(),
-            default_image: None,
-        });
+            dns_token: None,
+        },
+    );
+
+    let server_type = req
+        .server_type
+        .clone()
+        .unwrap_or_else(|| "cx22".to_string());
+    let location = req.location.clone().unwrap_or_else(|| "fsn1".to_string());
+
+    // If a private network was requested, ensure it exists once for this batch.
+    let mut network_ids: Vec<String> = Vec::new();
+    if let Some(net_name) = req.private_network_name.as_deref() {
+        let ip_range = req
+            .private_network_ip_range
+            .as_deref()
+            .unwrap_or("10.0.0.0/16");
+        match provider.create_network(net_name, ip_range).await {
+            Ok(net) => network_ids.push(net.id),
+            Err(e) => {
+                warn!(error = %e, network = %net_name, "Failed to create private network; servers will be created without it")
+            }
+        }
+    }
 
     let mut created_servers = vec![];
 
@@ -2243,21 +3478,25 @@ async fn create_hetzner_server(
             .await
             .map_err(|_| ApiError::Internal)?;
 
-        let user_data =
-            provider.build_agent_cloud_init(&cp_url, &enrollment.raw_token, Some(&server_name));
+        let user_data = forge_provider_hetzner::build_agent_cloud_init(
+            &cp_url,
+            &enrollment.raw_token,
+            Some(&server_name),
+        );
 
-        match provider
-            .create_server(
-                &server_name,
-                req.server_type.as_deref(),
-                None,
-                req.location.as_deref(),
-                Some(&user_data),
-                req.private_network_name.as_deref(),
-                req.private_network_ip_range.as_deref(),
-            )
-            .await
-        {
+        let spec = ServerSpec {
+            name: server_name.clone(),
+            size: server_type.clone(),
+            image: "ubuntu-24.04".to_string(),
+            region: location.clone(),
+            user_data: Some(user_data),
+            ssh_key_ids: Vec::new(),
+            network_ids: network_ids.clone(),
+            firewall_ids: Vec::new(),
+            labels: std::collections::BTreeMap::new(),
+        };
+
+        match provider.provision_server(&spec).await {
             Ok(server) => {
                 created_servers.push(serde_json::json!({
                     "server": server,
@@ -2428,16 +3667,32 @@ struct CreateBackupScheduleBody {
     schedule_type: String,  // "interval" or "cron"
     schedule_value: String, // seconds or cron string
     retention_days: Option<i32>,
+    retention_count: Option<i32>,
     s3_endpoint: Option<String>,
     s3_bucket: Option<String>,
     s3_key_prefix: Option<String>,
+    s3_region: Option<String>,
+    /// Non-secret S3 access-key id. The matching secret KEY must be stored separately via the
+    /// secret store and referenced by `s3_secret_id` (never sent as plaintext here).
+    s3_access_key_id: Option<String>,
+    s3_secret_id: Option<Uuid>,
+    /// Container the scheduled dump runs against (defaults to the deployment's first container).
+    target_container: Option<String>,
 }
 
 async fn create_backup_schedule(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(dep_id): Path<Uuid>,
     Json(body): Json<CreateBackupScheduleBody>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // RBAC default-deny: managing backup schedules requires backups:write.
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "backups:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     match state
         .deployment_service
         .create_backup_schedule(
@@ -2448,13 +3703,23 @@ async fn create_backup_schedule(
             &body.schedule_type,
             &body.schedule_value,
             body.retention_days.unwrap_or(30),
+            body.retention_count,
             body.s3_endpoint.as_deref(),
             body.s3_bucket.as_deref(),
             body.s3_key_prefix.as_deref(),
+            body.s3_region.as_deref(),
+            body.s3_access_key_id.as_deref(),
+            body.s3_secret_id,
+            body.target_container.as_deref(),
         )
         .await
     {
         Ok(sch) => Ok((StatusCode::CREATED, Json(sch))),
+        Err(deployment::DeploymentError::InvalidInput(msg)) => Err(ApiError::Validation {
+            field: "schedule".into(),
+            message: msg,
+        }),
+        Err(deployment::DeploymentError::Forbidden) => Err(ApiError::Forbidden),
         Err(e) => {
             warn!(error = %e, "create_backup_schedule failed");
             Err(ApiError::Internal)
@@ -2534,6 +3799,163 @@ async fn list_backup_executions(
     }
 }
 
+#[derive(Deserialize)]
+struct RestoreBody {
+    /// Confirm-required: a restore is destructive (it overwrites the target database). The
+    /// client MUST pass `confirm: true` to proceed — surfaced as a 422 otherwise so a UI can
+    /// force an explicit acknowledgement.
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// Restore a previously-captured backup into its deployment's database container.
+///
+/// DESTRUCTIVE. RBAC default-deny on `backups:write`. The restore command is built argv-only
+/// on the agent (engine + database validated against an allowlist; no host shell), and the
+/// dump is fetched from S3 using credentials resolved from the age secret store.
+async fn restore_backup(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Path((_app_id, dep_id, execution_id)): Path<(Uuid, Uuid, Uuid)>,
+    Json(body): Json<RestoreBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // RBAC default-deny: restore requires backups:write (fail fast before any dispatch).
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "backups:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
+    if !body.confirm {
+        return Err(ApiError::Validation {
+            field: "confirm".into(),
+            message: "restore is destructive; set confirm=true to proceed".into(),
+        });
+    }
+
+    // Create the pending restore execution (validates the source backup belongs to this
+    // deployment, is successful, and has a stored location) and resolve its source details.
+    let (restore_id, source) = match state
+        .deployment_service
+        .create_restore_execution(dep_id, execution_id, principal.principal_id())
+        .await
+    {
+        Ok(v) => v,
+        Err(deployment::DeploymentError::InvalidInput(msg)) => {
+            return Err(ApiError::Validation {
+                field: "execution_id".into(),
+                message: msg,
+            });
+        }
+        Err(deployment::DeploymentError::DeploymentNotFound) => return Err(ApiError::NotFound),
+        Err(e) => {
+            warn!(error = %e, "create_restore_execution failed");
+            return Err(ApiError::Internal);
+        }
+    };
+
+    // An S3 source is required to fetch the dump back (volume-local restore is out of scope).
+    let (Some(endpoint), Some(bucket)) = (source.s3_endpoint.clone(), source.s3_bucket.clone())
+    else {
+        return Err(ApiError::Validation {
+            field: "source".into(),
+            message: "this backup has no S3 source to restore from".into(),
+        });
+    };
+    if source.target_container.is_empty() {
+        return Err(ApiError::Validation {
+            field: "source".into(),
+            message: "could not resolve the target container for this restore".into(),
+        });
+    }
+
+    // Resolve the S3 secret KEY as an age SecretRef (never plaintext in the control plane).
+    let mut secrets = Vec::new();
+    if let Some(secret_id) = source.s3_secret_id {
+        match state
+            .deployment_service
+            .secret_ref_for(secret_id, "s3_secret_key", "S3_SECRET_KEY")
+            .await
+        {
+            Ok(Some(sr)) => secrets.push(sr),
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, "failed to resolve s3 secret for restore");
+                return Err(ApiError::Internal);
+            }
+        }
+    }
+
+    // Look up the source backup's db_type + an agent target for this deployment.
+    let targets = state
+        .deployment_service
+        .get_targets_for_deployment(dep_id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let Some(target) = targets.first() else {
+        return Err(ApiError::Validation {
+            field: "deployment".into(),
+            message: "deployment has no agent targets".into(),
+        });
+    };
+
+    let s3 = forge_core::spec::S3BackupConfig {
+        endpoint,
+        bucket,
+        key: source.s3_key.clone(),
+        access_key: source.s3_access_key_id.clone(),
+        secret_key: None, // travels age-encrypted in `secrets`
+        region: source.s3_region.clone(),
+    };
+
+    let db_type = state
+        .deployment_service
+        .restore_db_type(execution_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .unwrap_or_else(|| "postgres".to_string());
+
+    let job = Job::Restore {
+        restore_id,
+        deployment_id: dep_id,
+        target_container: source.target_container.clone(),
+        db_type,
+        database: None,
+        s3,
+        secrets,
+    };
+    let signer = crate::agent_ws::JobSigner::new((*state.signing_key).clone());
+    let signed = signer.sign(job);
+
+    let agent_id = target.agent_id;
+    let queued = if state
+        .agent_registry
+        .send_job(agent_id, signed.clone())
+        .await
+    {
+        info!(%restore_id, %agent_id, "dispatched Job::Restore to agent");
+        false
+    } else {
+        if let Err(e) = state
+            .deployment_service
+            .queue_pending_dispatch(dep_id, agent_id, &signed)
+            .await
+        {
+            warn!(error = %e, "failed to queue pending restore dispatch");
+        }
+        true
+    };
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "restore_execution_id": restore_id,
+            "queued_offline": queued,
+            "destructive": true,
+        })),
+    ))
+}
+
 // Interactive terminal WS (Feature 4)
 // v1: Starts a tty exec on the container and streams output.
 // Full bidirectional stdin + resize will be completed in the immediate follow-up by enhancing the agent Exec path.
@@ -2588,6 +4010,65 @@ async fn git_webhook_handler(
                 ApiError::BadRequest("Webhook processing failed".into())
             }
         })?;
+
+    // Phase B deploy-on-push: if the webhook created a BUILD, sign + dispatch the Build job
+    // to a connected agent. On success the agent's Build JobResult creates + dispatches the
+    // Deploy (fail-closed). The signed Build job carries the pinned commit + builder spec.
+    if let Some(build_id) = result
+        .get("created_build_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
+        if let Ok(Some(record)) = state.deployment_service.get_build(build_id).await {
+            // Reconstruct the build request from the source config + record to dispatch it.
+            let repo_url = result
+                .get("repo_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let builder = builder_from_tag(&record.builder);
+            // Re-use trigger_build's dispatch by issuing the Build job directly here, since the
+            // record already exists. We mark it running and send to the first connected agent.
+            let signer = crate::agent_ws::JobSigner::new((*state.signing_key).clone());
+            if let Some(image) = record.image.clone() {
+                let spec = forge_agent::job::BuildSpec {
+                    source: forge_agent::job::GitCheckout {
+                        url: repo_url,
+                        r#ref: record.git_ref.clone().unwrap_or_default(),
+                        ssh_key_secret_name: None,
+                        commit_sha: Some(record.commit_sha.clone()),
+                        subdir: None,
+                    },
+                    builder,
+                    image_name: record.image.clone().unwrap_or_default(),
+                    image_tag: String::new(),
+                    registry: None,
+                    build_args: std::collections::HashMap::new(),
+                    build_secrets: vec![],
+                };
+                let job = forge_agent::job::Job::Build {
+                    build_id: record.id,
+                    spec,
+                    target_image: image,
+                    registry_auth: None,
+                    supply_chain_policy: resolve_supply_chain_policy(),
+                };
+                let signed = signer.sign(job);
+                for agent_id in state.agent_registry.connected_agents().await {
+                    if state
+                        .agent_registry
+                        .send_job(agent_id, signed.clone())
+                        .await
+                    {
+                        let _ = state.deployment_service.mark_build_running(record.id).await;
+                        info!(build_id = %record.id, "Dispatched deploy-on-push Build job to agent");
+                        break;
+                    }
+                }
+            }
+        }
+        return Ok(Json(result));
+    }
 
     // Quick fix for e2e testability (item 6): if a preview deployment was created, immediately dispatch
     // the Deploy job to all currently connected agents so containers actually start without waiting for
@@ -3085,8 +4566,16 @@ struct CreateSecretBody {
 
 async fn create_secret(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Json(body): Json<CreateSecretBody>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // Creating named secret material is gated on secrets:use (default-deny). Bootstrap allowed.
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "secrets:use")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     if body.plaintext.is_empty() {
         return Err(ApiError::BadRequest("plaintext is required".into()));
     }
@@ -3136,9 +4625,17 @@ struct RotateSecretBody {
 
 async fn rotate_secret(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(secret_id): Path<Uuid>,
     Json(body): Json<RotateSecretBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Rotating secret material is gated on secrets:use (default-deny). Bootstrap allowed.
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "secrets:use")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     if body.plaintext.is_empty() {
         return Err(ApiError::BadRequest("plaintext is required".into()));
     }
@@ -3157,8 +4654,16 @@ async fn rotate_secret(
 
 async fn delete_secret(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(secret_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    // Deleting secret material is gated on secrets:use (default-deny). Bootstrap allowed.
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "secrets:use")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     match state.deployment_service.delete_secret(secret_id).await {
         Ok(()) => Ok(StatusCode::NO_CONTENT),
         Err(e) => {
@@ -3172,8 +4677,16 @@ async fn delete_secret(
 /// Private key is stored encrypted via the secret system. Only public key is returned.
 async fn generate_ssh_key(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Json(body): Json<CreateSecretBody>, // reuse name + description
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // Generating + storing a private key is secret material → gated on secrets:use (default-deny).
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "secrets:use")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     match state
         .deployment_service
         .generate_ssh_key(&body.name, body.description.as_deref())
@@ -3244,8 +4757,14 @@ async fn list_roles(State(state): State<AppState>) -> Result<Json<Vec<rbac::Role
 
 async fn create_role(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Json(body): Json<CreateRoleRequest>,
 ) -> Result<(StatusCode, Json<rbac::Role>), ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "iam:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
     if body.name.len() > 64 {
         return Err(ApiError::Validation {
             field: "name".into(),
@@ -3284,8 +4803,14 @@ async fn list_principals(
 
 async fn create_principal(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Json(body): Json<CreatePrincipalRequest>,
 ) -> Result<(StatusCode, Json<rbac::Principal>), ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "iam:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
     match state
         .rbac_service
         .create_principal(&body.name, &body.principal_type, None)
@@ -3306,6 +4831,43 @@ async fn create_principal(
     }
 }
 
+#[derive(Deserialize)]
+struct AssignRoleRequest {
+    role_id: Uuid,
+}
+
+/// POST /admin/principals/{id}/roles — grant a role to a principal. Without this an issued
+/// admin token's principal would hold no permissions and be denied every action (default-deny),
+/// so this is the operator path that makes per-principal RBAC usable.
+async fn assign_principal_role(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    Path(principal_id): Path<Uuid>,
+    Json(body): Json<AssignRoleRequest>,
+) -> Result<StatusCode, ApiError> {
+    // CRITICAL: gate role assignment behind iam:write so an issued token cannot
+    // self-grant privileges. Bootstrap (None) is allowed; everyone else default-deny.
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "iam:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+    match state
+        .rbac_service
+        .assign_role(principal_id, body.role_id, None)
+        .await
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(rbac::RbacError::NotFound) => Err(ApiError::BadRequest(
+            "principal or role does not exist".into(),
+        )),
+        Err(e) => {
+            warn!(error = %e, "assign_role failed");
+            Err(ApiError::Internal)
+        }
+    }
+}
+
 async fn list_admin_tokens(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<rbac::AdminTokenSummary>>, ApiError> {
@@ -3320,8 +4882,14 @@ async fn list_admin_tokens(
 
 async fn create_admin_token(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Json(body): Json<CreateAdminTokenRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "iam:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
     match state
         .rbac_service
         .create_admin_token(
@@ -3358,8 +4926,14 @@ async fn create_admin_token(
 
 async fn revoke_admin_token(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(prefix): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "iam:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
     if prefix.len() < 4 {
         return Err(ApiError::Validation {
             field: "prefix".into(),
@@ -3426,8 +5000,15 @@ async fn list_git_sources(
 // Phase 2 manual promote (for any deployment, including Canary full promotion)
 async fn promote_deployment(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(dep_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "deployments:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     let dep = state
         .deployment_service
         .promote_deployment(dep_id)
@@ -3463,8 +5044,15 @@ async fn promote_deployment(
 // Phase 2 manual rollback — restores the previous version's spec as a new deployment.
 async fn rollback_deployment(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(dep_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "deployments:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     let new_dep = state
         .deployment_service
         .rollback_deployment(dep_id)
@@ -3484,8 +5072,15 @@ async fn rollback_deployment(
 // Slice D criterion 6: first-class redeploy — re-ship the current spec as a new version.
 async fn redeploy_deployment(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(dep_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "deployments:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     let new_dep = state
         .deployment_service
         .redeploy_deployment(dep_id)
@@ -3504,8 +5099,15 @@ async fn redeploy_deployment(
 
 async fn promote_preview_deployment(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(dep_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "deployments:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     let preview = state
         .deployment_service
         .get_deployment(dep_id)
@@ -3581,8 +5183,15 @@ async fn promote_preview_deployment(
 /// then mark the deployment destroyed. Real cleanup of containers on the agent side.
 async fn destroy_preview_deployment(
     State(state): State<AppState>,
+    principal: AuthPrincipal,
     Path(dep_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    state
+        .deployment_service
+        .enforce_action(principal.principal_id(), "deployments:write")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
+
     let preview = state
         .deployment_service
         .get_deployment(dep_id)
